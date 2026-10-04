@@ -37,6 +37,8 @@ The project uses [Task](https://taskfile.dev) (`Taskfile.yaml`):
   needs the terraform CLI, 1.11 or later, on `PATH`
 - `task testacc`: the same tests against a live AutoPilot (`TF_ACC=1`,
   `AUTOPILOT_ENDPOINT`, `AUTOPILOT_TOKEN`, optional `AUTOPILOT_ACC_REPOS`)
+- `task sweep`: removes the `tfacc-` apps and senders a failed live run left
+  behind (the sweepers in `internal/provider/sweep_test.go`)
 - `task generate`: regenerates `docs/` with tfplugindocs. CI fails when the
   result differs from what is committed, so run it after any schema,
   description or example change and commit the output.

@@ -2,17 +2,19 @@ name: acceptance
 
 # Acceptance tests run the provider's test suite against a LIVE AutoPilot
 # instead of the in-process fake API that `ci.yml` uses. They make real
-# senders and apps (each with a random name) and remove them again.
+# senders and apps (each with a random tfacc- name) and remove them again.
 #
 # This workflow never runs on pull_request or push. It runs:
 #
-#   * weekly on Monday at 13:00 UTC, to catch drift between the provider and
-#     the deployed API that the fake cannot see.
+#   * weekly on Monday at 18:00 UTC (the afternoon in the Americas, when a
+#     test AutoPilot that sleeps at night is awake), to catch drift between
+#     the provider and the deployed API that the fake cannot see.
 #   * on demand via workflow_dispatch (use this when an admin API change the
 #     provider depends on has just shipped).
 #
-# Point it at an AutoPilot that is awake at that time, and that is not the
-# one real senders and apps live on.
+# Point it at an AutoPilot that is not the one real senders and apps live
+# on. A probe asks it first. If it doesn't answer (asleep, or down), the run
+# says "target asleep" and skips the tests instead of failing.
 #
 # Requires these repository secrets:
 #
@@ -28,7 +30,7 @@ name: acceptance
 
 on:
   schedule:
-    - cron: '0 13 * * 1'
+    - cron: '0 18 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -41,8 +43,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  probe:
+    name: probe the target
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      awake: ${{ steps.probe.outputs.awake }}
+    steps:
+      - name: Ask the target AutoPilot's admin API
+        id: probe
+        env:
+          AUTOPILOT_ENDPOINT: ${{ secrets.AUTOPILOT_ENDPOINT }}
+          AUTOPILOT_TOKEN: ${{ secrets.AUTOPILOT_TOKEN }}
+        run: |
+          if [ -z "$AUTOPILOT_ENDPOINT" ] || [ -z "$AUTOPILOT_TOKEN" ]; then
+            echo "::error::Set the AUTOPILOT_ENDPOINT and AUTOPILOT_TOKEN repository secrets."
+            exit 1
+          fi
+          # -s keeps curl quiet, so neither the endpoint nor the token is
+          # printed; a failed connection reports status 000.
+          status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+            -H "Authorization: Bearer $AUTOPILOT_TOKEN" -H "Accept: application/json" \
+            "${AUTOPILOT_ENDPOINT%/}/v1/admin/senders" || true)
+          case "$status" in
+            200)
+              echo "awake=true" >> "$GITHUB_OUTPUT"
+              ;;
+            000|502|503|504)
+              echo "awake=false" >> "$GITHUB_OUTPUT"
+              msg="Target asleep: the AutoPilot at AUTOPILOT_ENDPOINT did not answer (HTTP $status), so the acceptance tests were skipped, not failed. Run this workflow again when it is awake."
+              echo "::warning::$msg"
+              printf '### Target asleep\n\n%s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            401)
+              echo "::error::The target AutoPilot refused AUTOPILOT_TOKEN (HTTP 401). Check that it is that AutoPilot's current admin token."
+              exit 1
+              ;;
+            *)
+              echo "::error::The target AutoPilot's admin API answered HTTP $status. Check AUTOPILOT_ENDPOINT."
+              exit 1
+              ;;
+          esac
+
   acceptance:
     name: acceptance (terraform ${{ matrix.terraform }})
+    needs: probe
+    if: needs.probe.outputs.awake == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -73,6 +119,15 @@ jobs:
           terraform_version: ${{ matrix.terraform }}
           terraform_wrapper: false
 
+      # Removes the tfacc- apps and senders an earlier run that failed part
+      # way left behind (internal/provider/sweep_test.go). Never touches a
+      # record without that prefix.
+      - name: Sweep leftover test records
+        env:
+          AUTOPILOT_ENDPOINT: ${{ secrets.AUTOPILOT_ENDPOINT }}
+          AUTOPILOT_TOKEN: ${{ secrets.AUTOPILOT_TOKEN }}
+        run: go test -count=1 -timeout 10m ./internal/provider/ -sweep=live
+
       - name: Run acceptance tests
         env:
           TF_ACC: "1"
@@ -83,13 +138,29 @@ jobs:
 
   # Aggregator job. Branch protection cannot require an individual matrix leg
   # by name (the names change as the matrix changes, and skipped legs report
-  # as missing). This single job succeeds only if every leg succeeded.
+  # as missing). This single job succeeds when every leg succeeded, or when
+  # the probe found the target asleep and the legs were skipped on purpose.
   acceptance-matrix:
     name: acceptance matrix
     runs-on: ubuntu-latest
-    needs: acceptance
+    needs: [probe, acceptance]
     if: always()
     steps:
       - name: Check matrix status
-        if: ${{ needs.acceptance.result != 'success' }}
-        run: exit 1
+        env:
+          PROBE: ${{ needs.probe.result }}
+          AWAKE: ${{ needs.probe.outputs.awake }}
+          RESULT: ${{ needs.acceptance.result }}
+        run: |
+          if [ "$PROBE" != "success" ]; then
+            echo "The probe failed; see its job."
+            exit 1
+          fi
+          if [ "$AWAKE" != "true" ]; then
+            echo "Target asleep: the tests were skipped."
+            exit 0
+          fi
+          if [ "$RESULT" != "success" ]; then
+            echo "Acceptance tests: $RESULT."
+            exit 1
+          fi

@@ -115,6 +115,11 @@ func (s AppSpec) reflectedIn(app *App) bool {
 
 const appsPath = "/apps"
 
+// ListApps lists the apps, by name.
+func (c *Client) ListApps(ctx context.Context) ([]App, error) {
+	return listRecords[App](ctx, c, appsPath)
+}
+
 // GetApp reads an app. An app that doesn't exist answers 404.
 func (c *Client) GetApp(ctx context.Context, name string) (*App, error) {
 	return getRecord[*App](ctx, c, recordPath(appsPath, name))

@@ -95,6 +95,11 @@ func (s SenderSpec) reflectedIn(sender *Sender) bool {
 
 const sendersPath = "/senders"
 
+// ListSenders lists the senders that aren't retired, by name.
+func (c *Client) ListSenders(ctx context.Context) ([]Sender, error) {
+	return listRecords[Sender](ctx, c, sendersPath)
+}
+
 // GetSender reads a sender. A sender that doesn't exist, or that is retired,
 // answers 404.
 func (c *Client) GetSender(ctx context.Context, name string) (*Sender, error) {

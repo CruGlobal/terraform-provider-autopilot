@@ -61,6 +61,17 @@ func createRecord[T record](ctx context.Context, c *Client, collection, name str
 	return out, outcome, nil
 }
 
+// listRecords GETs a collection: {"results": [...]}.
+func listRecords[T any](ctx context.Context, c *Client, collection string) ([]T, error) {
+	var out struct {
+		Results []T `json:"results"`
+	}
+	if err := c.Get(ctx, collection, &out); err != nil {
+		return nil, err
+	}
+	return out.Results, nil
+}
+
 // getRecord GETs one record.
 func getRecord[T record](ctx context.Context, c *Client, path string) (T, error) {
 	var zero T

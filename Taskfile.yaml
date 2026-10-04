@@ -104,6 +104,16 @@ tasks:
     cmds:
       - go test -v -cover -count=1 -timeout 30m ./internal/provider/...
 
+  sweep:
+    desc: Remove the tfacc- apps and senders a failed live run left behind
+    preconditions:
+      - sh: test -n "$AUTOPILOT_ENDPOINT"
+        msg: "AUTOPILOT_ENDPOINT must be set"
+      - sh: test -n "$AUTOPILOT_TOKEN"
+        msg: "AUTOPILOT_TOKEN must be set"
+    cmds:
+      - go test -count=1 -timeout 10m ./internal/provider/ -sweep=live
+
   release:snapshot:
     desc: Build a local snapshot release with goreleaser
     cmds:

@@ -204,6 +204,7 @@ task test        # run the test suite against the in-process fake API
 task lint        # golangci-lint
 task generate    # regenerate docs from schema (needs terraform on PATH)
 task testacc     # run the test suite against a live AutoPilot
+task sweep       # remove the tfacc- records a failed live run left behind
 ```
 
 ### Testing
@@ -218,8 +219,11 @@ AutoPilot. The terraform CLI (1.11 or later) must be on `PATH`.
 
 The same tests run against a live AutoPilot when `TF_ACC=1` and
 `AUTOPILOT_ENDPOINT` / `AUTOPILOT_TOKEN` point at one that is not the one
-real senders and apps live on. Every record they make has a random name and
-is removed when the test ends. An AutoPilot used for tests may limit the
+real senders and apps live on. Every record they make has a random name
+starting with `tfacc-` and is removed when the test ends; `task sweep`
+removes any a failed run left behind. The scheduled acceptance workflow
+probes the target first, and skips the run (with a "target asleep" note)
+when it doesn't answer. An AutoPilot used for tests may limit the
 repositories an app can own; set `AUTOPILOT_ACC_REPOS` to a comma-separated
 list of `owner/name` repositories it allows, or the app tests run without
 repositories.

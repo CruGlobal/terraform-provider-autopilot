@@ -107,10 +107,19 @@ func randSecret(t *testing.T) string {
 // liveTestsRun counts tests that actually ran against a live AutoPilot.
 var liveTestsRun atomic.Int32
 
-// TestMain makes an acceptance run that asserted nothing fail loudly, rather
-// than report green.
+// TestMain runs the sweepers when asked (-sweep, see sweep_test.go), and
+// otherwise the tests. It makes an acceptance run that asserted nothing fail
+// loudly, rather than report green.
 func TestMain(m *testing.M) {
-	code := m.Run()
+	resource.TestMain(liveCountingRun{m})
+}
+
+// liveCountingRun runs the tests and reports how many reached a live
+// AutoPilot.
+type liveCountingRun struct{ m *testing.M }
+
+func (r liveCountingRun) Run() int {
+	code := r.m.Run()
 	if os.Getenv(resource.EnvTfAcc) != "" && os.Getenv(envEndpoint) != "" {
 		n := liveTestsRun.Load()
 		summary := fmt.Sprintf("Acceptance run: %d test(s) exercised the live API.", n)
@@ -128,5 +137,5 @@ func TestMain(m *testing.M) {
 			}
 		}
 	}
-	os.Exit(code)
+	return code
 }
