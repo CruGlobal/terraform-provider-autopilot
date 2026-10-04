@@ -178,14 +178,17 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				},
 			},
 			"branch_prefix": schema.StringAttribute{
-				MarkdownDescription: "What the sender's branches start with: a lowercase word and a `/`. No two senders " +
+				MarkdownDescription: "What the sender's branches start with: a lowercase word and a `/` (`^[a-z][a-z0-9-]*/$`), " +
+					"at most 41 characters. No two senders " +
 					"share one. AutoPilot's default on a new sender is the name and a `/`. When unset, the current value " +
 					"is kept, so set it for Terraform to own it.",
 				Optional:      true,
 				Computed:      true,
 				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
-				Validators: []validator.String{stringvalidator.RegexMatches(branchPrefixPattern,
-					"must be a lowercase word and a /, such as tracker/")},
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(branchPrefixPattern, "must be a lowercase word and a /, such as tracker/"),
+					stringvalidator.LengthAtMost(41),
+				},
 			},
 			"request_secret_wo": schema.StringAttribute{
 				MarkdownDescription: "The secret the sender signs its calls to AutoPilot with. At least 32 characters, " +
@@ -194,7 +197,7 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Required:   true,
 				WriteOnly:  true,
 				Sensitive:  true,
-				Validators: []validator.String{stringvalidator.LengthAtLeast(32)},
+				Validators: []validator.String{minCharactersValidator{min: 32}},
 			},
 			"callback_secret_wo": schema.StringAttribute{
 				MarkdownDescription: "The secret AutoPilot signs its callbacks to the sender with. At least 32 " +
@@ -203,7 +206,7 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Required:   true,
 				WriteOnly:  true,
 				Sensitive:  true,
-				Validators: []validator.String{stringvalidator.LengthAtLeast(32)},
+				Validators: []validator.String{minCharactersValidator{min: 32}},
 			},
 			"secrets_wo_version": schema.Int64Attribute{
 				MarkdownDescription: "A number you change to send both secrets again, whatever their fingerprints say. " +

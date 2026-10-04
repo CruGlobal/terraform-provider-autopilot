@@ -77,13 +77,18 @@ func getRecord[T record](ctx context.Context, c *Client, path string) (T, error)
 
 // patchRecord PATCHes fields under If-Match: "<lockVersion>".
 //
-// The client sends a PATCH again when an attempt's answer is lost. If that
-// attempt was applied, the second copy meets the version it made and is
-// refused with stale_object. So a stale_object after an unanswered send is
-// checked: when the record now stands exactly one version past lockVersion,
-// and holds what this PATCH sent (applied), the change is this call's own
-// and the record is returned. Any other stale_object is returned as it is,
-// for the caller to report without overwriting anything.
+// The client sends a PATCH again when an attempt's answer is lost. AutoPilot
+// answers a PATCH that names the version just before the record's, when the
+// record already holds exactly what it sends, with 200: that is the same
+// change, applied by the attempt whose answer was lost. So the repeat simply
+// succeeds.
+//
+// The rest is a fallback for an AutoPilot that answers such a repeat with
+// stale_object instead. A stale_object after an unanswered send is checked:
+// when the record now stands exactly one version past lockVersion and holds
+// what this PATCH sent (applied), the change is this call's own and the
+// record is returned. Any other stale_object is returned as it is, for the
+// caller to report without overwriting anything.
 func patchRecord[T record](ctx context.Context, c *Client, path string, fields Fields, lockVersion int64, applied func(T) bool) (T, error) {
 	var zero T
 	var raw json.RawMessage

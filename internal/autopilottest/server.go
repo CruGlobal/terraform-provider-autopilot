@@ -362,9 +362,31 @@ func ifMatch(r *http.Request, lockVersion int64, required bool) *refusal {
 	}
 	v, err := strconv.Unquote(h)
 	if err != nil || v != strconv.FormatInt(lockVersion, 10) {
-		return &refusal{http.StatusConflict, "stale_object", "the record changed since you read it; read it again", ""}
+		return staleRefusal()
 	}
 	return nil
+}
+
+// changePrecondition checks a PATCH's If-Match against a record's
+// lock_version. It names the current version (behind is false), or the one
+// just before it (behind is true): the contract's safe repeat of a change
+// whose answer was lost, which the caller answers with 200 only when the
+// record already holds exactly what the PATCH sends.
+func changePrecondition(r *http.Request, lockVersion int64) (behind bool, ref *refusal) {
+	if ref := ifMatch(r, lockVersion, true); ref == nil {
+		return false, nil
+	} else if ref.code != "stale_object" {
+		return false, ref
+	}
+	v, err := strconv.Unquote(r.Header.Get("If-Match"))
+	if err == nil && lockVersion > 1 && v == strconv.FormatInt(lockVersion-1, 10) {
+		return true, nil
+	}
+	return false, staleRefusal()
+}
+
+func staleRefusal() *refusal {
+	return &refusal{http.StatusConflict, "stale_object", "the record changed since you read it; read it again", ""}
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -392,6 +414,13 @@ func sortedUnique(values []string) []string {
 	}
 	slices.Sort(out)
 	return slices.Compact(out)
+}
+
+// sortedUniqueFold is sortedUnique for values compared without regard to
+// case: of values that differ only in case, the first in sorted order is
+// kept, as sent.
+func sortedUniqueFold(values []string) []string {
+	return slices.CompactFunc(sortedUnique(values), strings.EqualFold)
 }
 
 func timestamp(t time.Time) string {

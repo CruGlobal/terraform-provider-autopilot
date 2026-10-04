@@ -465,8 +465,8 @@ func TestApp_lostChangeAnswerIsRecognised(t *testing.T) {
 					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
 					func(*terraform.State) error {
 						patches := env.fake.RequestsMatching(http.MethodPatch, path)
-						if len(patches) != 2 || patches[1].Status != http.StatusConflict {
-							return fmt.Errorf("want a change whose answer was lost, then a stale copy; got %d changes", len(patches))
+						if len(patches) != 2 || patches[1].Status != http.StatusOK {
+							return fmt.Errorf("want a change whose answer was lost, then the same change answered 200; got %d changes", len(patches))
 						}
 						return nil
 					},
@@ -540,14 +540,52 @@ func TestApp_planTimeValidation(t *testing.T) {
 		{`  accepts = [{ sender = "Tracker", kinds = ["research"] }]`, "must be a sender's name"},
 		{`  repos = ["example-org/billing", "Example-Org/Billing"]`, "Repeated repositories"},
 		{`  repos = ["billing"]`, "must be owner/name"},
-		{`  developers = ["someone@example.com", "Someone@Example.com"]`, "Repeated developers"},
+		{`  developers = ["Someone@example.com"]`, "must be an email address in lowercase ASCII"},
+		{`  developers = ["someoné@example.com"]`, "must be an email address in lowercase ASCII"},
 		{`  developers = ["someone"]`, "must be an email address"},
 	}
 	steps := make([]resource.TestStep, 0, len(cases)+1)
 	for _, c := range cases {
 		steps = append(steps, resource.TestStep{Config: appConfig(env, name, c.body), PlanOnly: true, ExpectError: expectErr(c.want)})
 	}
-	steps = append(steps, resource.TestStep{Config: appConfig(env, "Billing", ""), PlanOnly: true,
-		ExpectError: expectErr("lowercase letter or digit")})
+	steps = append(steps,
+		resource.TestStep{Config: appConfig(env, "Billing", ""), PlanOnly: true, ExpectError: expectErr("lowercase letter or digit")},
+		resource.TestStep{Config: appConfig(env, strings.Repeat("a", 65), ""), PlanOnly: true, ExpectError: expectErr("at most 64")},
+	)
 	runTest(t, resource.TestCase{Steps: steps})
+}
+
+// A PATCH replaces a list as sent, so changing only the case of a repository
+// is a change: planned, sent, and held.
+func TestApp_caseOnlyChangeIsApplied(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, name, `  repos = ["Example-Org/Billing"]`)},
+			{
+				Config: appConfig(env, name, `  repos = ["example-org/billing"]`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckTypeSetElemAttr(appRes, "repos.*", "example-org/billing"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(name); !slices.Equal(v.Repos, []string{"example-org/billing"}) {
+							return fmt.Errorf("repos = %v", v.Repos)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: appConfig(env, name, `  repos = ["example-org/billing"]`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
 }

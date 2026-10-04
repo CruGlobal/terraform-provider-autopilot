@@ -55,8 +55,10 @@ type Error struct {
 	// EarlierSendUnanswered records that an earlier attempt at this same
 	// request may have reached the server but got no usable response back (a
 	// timeout, a dropped connection, a gateway 5xx) before the attempt that
-	// produced this error. A PATCH that meets stale_object after such an
-	// attempt may be meeting its own change.
+	// produced this error. AutoPilot answers the repeat of a change it just
+	// made with 200; on one that answers stale_object instead, a PATCH that
+	// meets stale_object after such an attempt may be meeting its own change
+	// (see patchRecord).
 	EarlierSendUnanswered bool
 }
 

@@ -319,8 +319,8 @@ func readSenderFields(obj map[string]json.RawMessage) (senderFields, *refusal) {
 		if ref != nil {
 			return f, ref
 		}
-		if !branchPrefixPattern.MatchString(prefix) {
-			return f, invalid("/branch_prefix", "a branch prefix is a lowercase word and a /")
+		if !branchPrefixPattern.MatchString(prefix) || len(prefix) > 41 {
+			return f, invalid("/branch_prefix", "a branch prefix is ^[a-z][a-z0-9-]*/$, at most 41 characters")
 		}
 		f.branchPrefix = &prefix
 	}
@@ -347,12 +347,31 @@ func readSenderFields(obj map[string]json.RawMessage) (senderFields, *refusal) {
 		if f.callbackSecret == nil {
 			missing = "/callback_secret"
 		}
-		return f, invalid(missing, "send both secrets, to set or rotate them")
+		return f, invalid(missing, "send both secrets together; one alone is refused")
 	}
 	if f.requestSecret != nil && *f.requestSecret == *f.callbackSecret {
 		return f, invalid("/callback_secret", "the two secrets must differ")
 	}
 	return f, nil
+}
+
+// holds reports whether the sender already holds everything f sends,
+// secrets compared by fingerprint.
+func (rec *senderRecord) holds(f senderFields) bool {
+	if f.callbackHosts != nil && !slices.Equal(f.callbackHosts, rec.callbackHosts) {
+		return false
+	}
+	if f.kinds != nil && !slices.Equal(f.kinds, rec.kinds) {
+		return false
+	}
+	if f.branchPrefix != nil && *f.branchPrefix != rec.branchPrefix {
+		return false
+	}
+	if f.requestSecret != nil && (Fingerprint(*f.requestSecret) != Fingerprint(rec.requestSecret) ||
+		Fingerprint(*f.callbackSecret) != Fingerprint(rec.callbackSecret)) {
+		return false
+	}
+	return true
 }
 
 func validCallbackHost(h string) bool {
@@ -452,7 +471,8 @@ func (s *Server) patchSender(r *http.Request) (map[string]any, *refusal) {
 		ref := notFound("sender")
 		return nil, &ref
 	}
-	if ref := ifMatch(r, rec.lockVersion, true); ref != nil {
+	behind, ref := changePrecondition(r, rec.lockVersion)
+	if ref != nil {
 		return nil, ref
 	}
 	obj, ref := readObject(r)
@@ -474,11 +494,17 @@ func (s *Server) patchSender(r *http.Request) (map[string]any, *refusal) {
 	if ref != nil {
 		return nil, ref
 	}
+	now := time.Now()
+	if behind {
+		if rec.holds(f) {
+			return rec.json(now), nil
+		}
+		return nil, staleRefusal()
+	}
 	if f.branchPrefix != nil && s.prefixTaken(*f.branchPrefix, name) {
 		return nil, &refusal{http.StatusConflict, "branch_prefix_taken", "another sender has this branch prefix", "/branch_prefix"}
 	}
 
-	now := time.Now()
 	changed := false
 	if f.callbackHosts != nil && !slices.Equal(f.callbackHosts, rec.callbackHosts) {
 		rec.callbackHosts, changed = f.callbackHosts, true

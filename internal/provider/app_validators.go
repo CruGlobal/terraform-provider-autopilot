@@ -20,8 +20,10 @@ var (
 	appNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 	// A repository: owner/name.
 	repoPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$`)
-	// A developer's login, which is an email address.
-	loginPattern = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
+	// A developer's login: an email address in lowercase ASCII, which is all
+	// AutoPilot takes. Printable ASCII but uppercase, @ and space, then @,
+	// then a domain with a dot.
+	loginPattern = regexp.MustCompile(`^[\x21-\x3f\x5b-\x7e]+@[\x21-\x3f\x5b-\x7e]+\.[\x21-\x3f\x5b-\x7e]+$`)
 )
 
 // setOrNull maps a list AutoPilot answered with to state. An optional
@@ -36,9 +38,9 @@ func setOrNull(values []string, prior types.Set) types.Set {
 }
 
 // noCaseRepeatsValidator refuses a set holding two values that differ only in
-// case. AutoPilot matches repositories and developers without regard to case
-// and keeps its lists without repeats, so it would keep only one of them and
-// the configuration would differ from it on every plan.
+// case. AutoPilot matches repositories without regard to case and keeps them
+// unique that way, so it would keep only one of them and the configuration
+// would differ from it on every plan.
 type noCaseRepeatsValidator struct{ what string }
 
 func (v noCaseRepeatsValidator) Description(context.Context) string {

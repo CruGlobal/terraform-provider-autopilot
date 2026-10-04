@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/CruGlobal/terraform-provider-autopilot/internal/autopilottest"
@@ -603,8 +604,8 @@ func TestSender_staleUpdateIsReportedAndDeleteRereads(t *testing.T) {
 }
 
 // The first copy of a change is applied but its answer is lost. The client
-// sends it again, meets the version its own change made, and recognises the
-// change as its own.
+// sends it again, one version behind, and AutoPilot answers the repeat of the
+// change it just made with 200.
 func TestSender_lostChangeAnswerIsRecognised(t *testing.T) {
 	env := newTestEnv(t)
 	env.requireFake(t)
@@ -622,8 +623,8 @@ func TestSender_lostChangeAnswerIsRecognised(t *testing.T) {
 					resource.TestCheckTypeSetElemAttr(senderRes, "kinds.*", "research"),
 					func(*terraform.State) error {
 						patches := env.fake.RequestsMatching(http.MethodPatch, path)
-						if len(patches) != 2 || patches[1].Status != http.StatusConflict {
-							return fmt.Errorf("want a change whose answer was lost, then a stale copy; got %d changes", len(patches))
+						if len(patches) != 2 || patches[1].Status != http.StatusOK || patches[1].Header.Get("If-Match") != `"1"` {
+							return fmt.Errorf("want a change whose answer was lost, then the same change answered 200; got %d changes", len(patches))
 						}
 						return nil
 					},
@@ -769,6 +770,9 @@ func TestSender_planTimeValidation(t *testing.T) {
 		{senderConfig(env, name, secrets, `  callback_hosts = ["intranet"]`), "has no dot"},
 		{senderConfig(env, name, secrets, `  kinds = []`), "at least 1"},
 		{senderConfig(env, name, secrets, `  branch_prefix = "Bots"`), "lowercase word and a /"},
+		{senderConfig(env, name, secrets, `  branch_prefix = "`+strings.Repeat("a", 41)+`/"`), "at most 41"},
+		// 16 characters in 32 bytes: AutoPilot counts characters.
+		{senderConfig(env, name, secretPair{request: strings.Repeat("é", 16), callback: secrets.callback}, ""), "at least 32 characters, got 16"},
 		{senderConfig(env, "Tracker", secrets, ""), "lowercase letter, then lowercase letters"},
 		{senderConfig(env, name, secretPair{request: secrets.request, callback: secrets.request}, ""), "The two secrets are the same"},
 		{senderConfig(env, name, secretPair{request: "too-short", callback: secrets.callback}, ""), "at least 32"},

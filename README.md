@@ -128,9 +128,13 @@ the same fingerprints from the configuration:
   overwriting; run `terraform plan` again to see the change. A delete is not
   an overwrite, so a stale delete reads the current version once and deletes
   with that.
-- A change whose answer was lost is sent again. If the first copy was
-  applied, the second meets its own new version; the provider reads the
-  record, finds its change there, and carries on.
+- A change is safe to retry too. AutoPilot answers a change that names the
+  version just before the record's, when the record already holds exactly
+  what it sends, with `200`: it is the same change, whose answer was lost.
+  So a change whose answer was lost is simply sent again. (Should an older
+  AutoPilot answer that repeat with `stale_object`, the provider reads the
+  record, and takes the change as its own only when the record is one
+  version on and holds exactly what it sent.)
 - `503 unavailable`, a gateway's `502` or `504`, an attempt that timed out,
   an answer cut off on the way, and a dropped connection are retried with
   backoff, and so is `429` (honouring `Retry-After`) should AutoPilot ever

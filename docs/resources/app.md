@@ -56,12 +56,12 @@ resource "autopilot_app" "billing" {
 
 ### Required
 
-- `name` (String) The app's name, which is its key and the `billing.app` of the work it pays for: a lowercase letter or digit, then lowercase letters, digits, `_` and `-`. Changing it replaces the app.
+- `name` (String) The app's name, which is its key and the `billing.app` of the work it pays for: a lowercase letter or digit, then lowercase letters, digits, `_` and `-`, at most 64 characters. Changing it replaces the app: Terraform deletes the old one, which stops its queued and running work at once, then creates the new one.
 
 ### Optional
 
 - `accepts` (Attributes Set) The senders this app accepts work from, each at most once, with the kinds of task it accepts from each. At most 20. (see [below for nested schema](#nestedatt--accepts))
-- `developers` (Set of String) The people who may start work for this app themselves, through AutoPilot's MCP server: their sign-in logins, which are email addresses. AutoPilot matches them without regard to case, so no two may differ only in case. At most 100.
+- `developers` (Set of String) The people who may start work for this app themselves, through AutoPilot's MCP server: their sign-in logins, which are email addresses, written in lowercase ASCII (AutoPilot refuses anything else). At most 100.
 - `repos` (Set of String) The repositories this app **owns**, as `owner/name`. A repository belongs to at most one app. AutoPilot matches them without regard to case, so no two may differ only in case. At most 50.
 
 ### Read-Only

@@ -87,7 +87,7 @@ resource "autopilot_sender" "tracker" {
 
 ### Optional
 
-- `branch_prefix` (String) What the sender's branches start with: a lowercase word and a `/`. No two senders share one. AutoPilot's default on a new sender is the name and a `/`. When unset, the current value is kept, so set it for Terraform to own it.
+- `branch_prefix` (String) What the sender's branches start with: a lowercase word and a `/` (`^[a-z][a-z0-9-]*/$`), at most 41 characters. No two senders share one. AutoPilot's default on a new sender is the name and a `/`. When unset, the current value is kept, so set it for Terraform to own it.
 - `callback_hosts` (Set of String) Host names the sender's callbacks may go to (over https on port 443): lowercase DNS names with at least one dot, not IP addresses and not `localhost`. At most 10. Empty (the default) for a sender that only polls.
 - `kinds` (Set of String) The kinds of task the sender may send, such as `implement-work-item`, `fix-error`, `review-pr` or `research`. Each must be one AutoPilot knows. At least one. AutoPilot's default on a new sender is `implement-work-item`. When unset, the current value is kept, so set it for Terraform to own it.
 - `secrets_wo_version` (Number) A number you change to send both secrets again, whatever their fingerprints say. Rarely needed, since a changed secret already shows as a changed fingerprint.

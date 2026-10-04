@@ -75,14 +75,21 @@ the examples, and the generated docs. Things worth knowing:
   own lost send can't explain, and the resource warns about it.
 - Every `PATCH` and `DELETE` carries `If-Match: "<lock_version>"`. A stale
   update is reported, never retried over. A stale delete re-reads once.
-  `patchRecord` recognises its own change when a lost answer made the retry
-  stale.
+- A change is safe to retry: AutoPilot answers a `PATCH` one version behind,
+  whose body the record already holds, with `200`. So a change whose answer
+  was lost is simply sent again. `patchRecord` keeps a fallback for an
+  AutoPilot that answers such a repeat with `stale_object`: it reads the
+  record and takes the change as its own only when the record is one version
+  on and holds what it sent.
 - The API refuses fields it doesn't know. Send only what is set
   (`SenderSpec` and `AppSpec`: a nil list is not sent, an empty one is sent
   as `[]`), so the provider keeps working against an AutoPilot that predates
   a newer optional field.
 - Lists are sets in the schema; the client sends them sorted and without
-  repeats, which is how the API keeps them.
+  repeats, which is how the API keeps them. Values are kept as sent, and a
+  `PATCH` replaces a list as sent, so a change of case alone is a change.
+  Where a rule says "without regard to case" (repositories), that is how
+  AutoPilot compares values and keeps them unique.
 - A sender's secrets are write-only (`*_wo`). The plan compares
   `client.Fingerprint` of the configured secrets with the stored
   fingerprints; see the comment at the top of `sender_resource.go`.

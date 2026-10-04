@@ -11,9 +11,12 @@ import (
 )
 
 var (
-	appNamePattern  = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
-	repoPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$`)
-	loginPattern    = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
+	appNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+	repoPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$`)
+	// A login in lowercase ASCII: printable ASCII but uppercase, @ and space,
+	// then @, then a domain with a dot.
+	loginPattern    = regexp.MustCompile(`^[\x21-\x3f\x5b-\x7e]+@[\x21-\x3f\x5b-\x7e]+\.[\x21-\x3f\x5b-\x7e]+$`)
+	maxAppName      = 64
 	reviewKind      = "review-pr"
 	maxRepos        = 50
 	maxAccepts      = 20
@@ -104,7 +107,7 @@ func (s *Server) SeedApp(v AppView) {
 	defer s.mu.Unlock()
 	now := time.Now()
 	s.apps[v.Name] = &appRecord{
-		name: v.Name, repos: sortedUnique(v.Repos), accepts: sortAccepts(v.Accepts),
+		name: v.Name, repos: sortedUniqueFold(v.Repos), accepts: sortAccepts(v.Accepts),
 		developers: sortedUnique(v.Developers), lockVersion: 1, createdAt: now, updatedAt: now,
 	}
 }
@@ -131,7 +134,7 @@ func (s *Server) ChangeAppOutOfBand(name string, change func(v *AppView)) {
 	}
 	v := rec.view()
 	change(&v)
-	rec.repos, rec.accepts, rec.developers = sortedUnique(v.Repos), sortAccepts(v.Accepts), sortedUnique(v.Developers)
+	rec.repos, rec.accepts, rec.developers = sortedUniqueFold(v.Repos), sortAccepts(v.Accepts), sortedUnique(v.Developers)
 	rec.lockVersion++
 	rec.updatedAt = time.Now()
 }
@@ -235,7 +238,8 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 				return f, invalid("/repos/"+itoa(i), "a repository is owner/name")
 			}
 		}
-		f.repos = sortedUnique(repos)
+		// Matched without regard to case, and kept unique that way, as sent.
+		f.repos = sortedUniqueFold(repos)
 	}
 	if raw, ok := obj["accepts"]; ok {
 		var entries []map[string]json.RawMessage
@@ -306,12 +310,19 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 		}
 		for i, d := range devs {
 			if !loginPattern.MatchString(d) {
-				return f, invalid("/developers/"+itoa(i), "a developer is their login, an email address")
+				return f, invalid("/developers/"+itoa(i), "a developer is their login: an email address in lowercase ASCII")
 			}
 		}
 		f.developers = sortedUnique(devs)
 	}
 	return f, nil
+}
+
+// holds reports whether the app already holds everything f sends.
+func (rec *appRecord) holds(f appFields) bool {
+	return (f.repos == nil || slices.Equal(f.repos, rec.repos)) &&
+		(f.accepts == nil || acceptsEqual(f.accepts, rec.accepts)) &&
+		(f.developers == nil || slices.Equal(f.developers, rec.developers))
 }
 
 // repoOwner names the app other than except that owns repo, matched without
@@ -355,8 +366,8 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 	if ref != nil {
 		return 0, nil, ref
 	}
-	if !appNamePattern.MatchString(name) {
-		return 0, nil, invalid("/name", "an app's name is a lowercase letter or digit, then lowercase letters, digits, _ and -")
+	if !appNamePattern.MatchString(name) || len(name) > maxAppName {
+		return 0, nil, invalid("/name", "an app's name is a lowercase letter or digit, then lowercase letters, digits, _ and -, at most 64 characters")
 	}
 	f, ref := readAppFields(obj)
 	if ref != nil {
@@ -389,7 +400,8 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 		ref := notFound("app")
 		return nil, &ref
 	}
-	if ref := ifMatch(r, rec.lockVersion, true); ref != nil {
+	behind, ref := changePrecondition(r, rec.lockVersion)
+	if ref != nil {
 		return nil, ref
 	}
 	obj, ref := readObject(r)
@@ -411,9 +423,17 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 	if ref != nil {
 		return nil, ref
 	}
+	if behind {
+		if rec.holds(f) {
+			return rec.json(), nil
+		}
+		return nil, staleRefusal()
+	}
 	if ref := s.refuseTakenRepos(f.repos, name); ref != nil {
 		return nil, ref
 	}
+	// A PATCH replaces a list with the one it sends, as sent, so a change of
+	// case alone is a change.
 	changed := false
 	if f.repos != nil && !slices.Equal(f.repos, rec.repos) {
 		rec.repos, changed = f.repos, true

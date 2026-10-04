@@ -132,11 +132,15 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 		Attributes: map[string]schema.Attribute{
 			"name": schema.StringAttribute{
 				MarkdownDescription: "The app's name, which is its key and the `billing.app` of the work it pays for: a " +
-					"lowercase letter or digit, then lowercase letters, digits, `_` and `-`. Changing it replaces the app.",
+					"lowercase letter or digit, then lowercase letters, digits, `_` and `-`, at most 64 characters. Changing it " +
+					"replaces the app: Terraform deletes the old one, which stops its queued and running work at once, then " +
+					"creates the new one.",
 				Required:      true,
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
-				Validators: []validator.String{stringvalidator.RegexMatches(appNamePattern,
-					"must be a lowercase letter or digit, then lowercase letters, digits, _ and -")},
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(appNamePattern, "must be a lowercase letter or digit, then lowercase letters, digits, _ and -"),
+					stringvalidator.LengthAtMost(64),
+				},
 			},
 			"repos": schema.SetAttribute{
 				MarkdownDescription: "The repositories this app **owns**, as `owner/name`. A repository belongs to at most " +
@@ -188,14 +192,13 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			},
 			"developers": schema.SetAttribute{
 				MarkdownDescription: "The people who may start work for this app themselves, through AutoPilot's MCP " +
-					"server: their sign-in logins, which are email addresses. AutoPilot matches them without regard to " +
-					"case, so no two may differ only in case. At most 100.",
+					"server: their sign-in logins, which are email addresses, written in lowercase ASCII (AutoPilot refuses " +
+					"anything else). At most 100.",
 				ElementType: types.StringType,
 				Optional:    true,
 				Validators: []validator.Set{
 					setvalidator.SizeAtMost(100),
-					setvalidator.ValueStringsAre(stringvalidator.RegexMatches(loginPattern, "must be an email address")),
-					noCaseRepeatsValidator{what: "developers"},
+					setvalidator.ValueStringsAre(stringvalidator.RegexMatches(loginPattern, "must be an email address in lowercase ASCII")),
 				},
 			},
 			"lock_version": schema.Int64Attribute{

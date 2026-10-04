@@ -6,6 +6,7 @@ import (
 	"net"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 )
@@ -25,6 +26,29 @@ var (
 	// One label of a DNS name, in lowercase.
 	hostLabelPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 )
+
+// minCharactersValidator is stringvalidator.LengthAtLeast counted in
+// characters, as AutoPilot counts them, rather than bytes. It never repeats
+// the value, which is a secret.
+type minCharactersValidator struct{ min int }
+
+func (v minCharactersValidator) Description(context.Context) string {
+	return fmt.Sprintf("at least %d characters", v.min)
+}
+
+func (v minCharactersValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (v minCharactersValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if n := utf8.RuneCountInString(req.ConfigValue.ValueString()); n < v.min {
+		resp.Diagnostics.AddAttributeError(req.Path, "Too short",
+			fmt.Sprintf("must be at least %d characters, got %d", v.min, n))
+	}
+}
 
 // callbackHostReason is AutoPilot's own rule for a callback host.
 const callbackHostReason = "AutoPilot takes a callback host as a lowercase DNS name with at least one dot, " +

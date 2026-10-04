@@ -204,8 +204,10 @@ type request struct {
 	// first attempt may have been processed. For this API that is every
 	// request: GET and DELETE always, POST because a create is keyed by name
 	// and an identical one is answered with the record, and PATCH because it
-	// always carries If-Match (the API refuses one without), so a second copy
-	// of an applied change meets stale_object instead of applying twice.
+	// always carries If-Match (the API refuses one without): AutoPilot answers
+	// a repeat of the change it just made with 200, and any other PATCH that
+	// doesn't name the current version with stale_object, so a change never
+	// applies twice.
 	replayable bool
 	// trace, when set, is told how the request's attempts went (see sendTrace).
 	trace *sendTrace
