@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # Every pull request, whatever its base and whatever it touches. No path
+  # filters: `build (vet + lint + unit)` is a required check, and a required
+  # check that never reports blocks the merge.
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Build, lint, unit tests, and drift checks. setup-go reads the
+  # `golang` line from .tool-versions so the local toolchain (asdf)
+  # and CI cannot drift.
+  build:
+    name: build (vet + lint + unit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: .tool-versions
+          cache: true
+
+      # tfplugindocs (run via `go generate`) launches a local terraform
+      # binary to read the provider's schema, main.go has a
+      # `//go:generate terraform fmt` directive, and the unit tests drive
+      # real plans and applies. All three need the CLI on PATH. The
+      # resources use write-only arguments, which need Terraform 1.11 or
+      # later; the latest release is well past that.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12
+
+      - name: Build
+        run: go build ./...
+
+      - name: Unit tests
+        run: go test -count=1 -cover ./...
+
+      # Fails the build when a dependency has a known vulnerability that this
+      # module's code can reach (govulncheck's default, symbol-level scan).
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+      - name: Verify generated docs are up to date
+        run: |
+          go generate ./...
+          git diff --exit-code docs/ examples/

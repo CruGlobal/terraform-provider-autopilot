@@ -1,0 +1,95 @@
+name: acceptance
+
+# Acceptance tests run the provider's test suite against a LIVE AutoPilot
+# instead of the in-process fake API that `ci.yml` uses. They make real
+# senders and apps (each with a random name) and remove them again.
+#
+# This workflow never runs on pull_request or push. It runs:
+#
+#   * weekly on Monday at 13:00 UTC, to catch drift between the provider and
+#     the deployed API that the fake cannot see.
+#   * on demand via workflow_dispatch (use this when an admin API change the
+#     provider depends on has just shipped).
+#
+# Point it at an AutoPilot that is awake at that time, and that is not the
+# one real senders and apps live on.
+#
+# Requires these repository secrets:
+#
+#   AUTOPILOT_ENDPOINT   base URL of the target AutoPilot, for example
+#                        https://autopilot.example.com
+#   AUTOPILOT_TOKEN      an admin token for that AutoPilot
+#
+# and, optionally, this repository variable:
+#
+#   AUTOPILOT_ACC_REPOS  comma-separated owner/name repositories the target
+#                        AutoPilot lets an app own. Without it the app tests
+#                        run without repositories.
+
+on:
+  schedule:
+    - cron: '0 13 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One acceptance run at a time. Names are random, but the repositories in
+  # AUTOPILOT_ACC_REPOS can belong to only one app at a time.
+  group: acceptance
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: acceptance (terraform ${{ matrix.terraform }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Legs share the repositories in AUTOPILOT_ACC_REPOS, so they run one
+      # at a time.
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        terraform:
+          # 1.11 is the first release with write-only arguments, which
+          # autopilot_sender's secrets are.
+          - "1.11.*"
+          - "1.14.*"
+          - "1.15.*"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: .tool-versions
+          cache: true
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ matrix.terraform }}
+          terraform_wrapper: false
+
+      - name: Run acceptance tests
+        env:
+          TF_ACC: "1"
+          AUTOPILOT_ENDPOINT: ${{ secrets.AUTOPILOT_ENDPOINT }}
+          AUTOPILOT_TOKEN: ${{ secrets.AUTOPILOT_TOKEN }}
+          AUTOPILOT_ACC_REPOS: ${{ vars.AUTOPILOT_ACC_REPOS }}
+        run: go test -v -cover -count=1 -timeout 30m ./internal/provider/...
+
+  # Aggregator job. Branch protection cannot require an individual matrix leg
+  # by name (the names change as the matrix changes, and skipped legs report
+  # as missing). This single job succeeds only if every leg succeeded.
+  acceptance-matrix:
+    name: acceptance matrix
+    runs-on: ubuntu-latest
+    needs: acceptance
+    if: always()
+    steps:
+      - name: Check matrix status
+        if: ${{ needs.acceptance.result != 'success' }}
+        run: exit 1
