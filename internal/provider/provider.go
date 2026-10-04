@@ -157,6 +157,7 @@ func (p *autopilotProvider) Configure(ctx context.Context, req provider.Configur
 func (p *autopilotProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewSenderResource,
+		NewAppResource,
 	}
 }
 
