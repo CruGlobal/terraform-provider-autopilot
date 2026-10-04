@@ -136,9 +136,14 @@ Two cautions:
 - A record is keyed by its name. A create AutoPilot already holds with the
   same fields is answered with that record, so a create whose answer was lost
   is simply sent again; no `Idempotency-Key` is needed. When the name was
-  already taken with exactly these values by something else, the apply says
-  so in a warning, and Terraform manages that record from then on. When it was
-  taken with other values, the apply fails and says how to import it.
+  already taken by something else:
+  - with other values, the apply fails and says how to import it;
+  - with exactly these values, an `autopilot_app` fails the same way, since
+    an app is a unit of consent and another configuration may manage it. An
+    `autopilot_sender` is taken over with a warning instead: its values
+    include its secrets, and only a configuration that holds those secrets
+    (in practice this one, after an earlier apply's state was lost) can match
+    them.
 - Every change and delete carries the state's `lock_version` as
   `If-Match`. If something else changed the record in between, AutoPilot
   answers `409 stale_object`, and the provider reports it instead of

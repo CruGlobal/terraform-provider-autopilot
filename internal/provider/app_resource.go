@@ -90,10 +90,16 @@ func acceptsToSet(accepts []client.Accept, prior types.Set) types.Set {
 	return types.SetValueMust(acceptObjectType, elems)
 }
 
-// acceptsFromSet returns a known set's entries. A null set gives nil; a known
-// empty set gives an empty, non-nil slice, which the client sends as [].
+// acceptsFromSet returns a known set's entries. A null set gives nil (not
+// sent); a known empty set gives an empty, non-nil slice, which the client
+// sends as []. An unknown set is an error, never read as empty: an empty
+// accepts sent by mistake would withdraw the app's consent.
 func acceptsFromSet(ctx context.Context, set types.Set, diags *diag.Diagnostics) []client.Accept {
-	if set.IsNull() || set.IsUnknown() {
+	if set.IsUnknown() {
+		unknownAtApply(diags, "accepts")
+		return nil
+	}
+	if set.IsNull() {
 		return nil
 	}
 	var models []acceptModel
@@ -102,7 +108,7 @@ func acceptsFromSet(ctx context.Context, set types.Set, diags *diag.Diagnostics)
 	for _, m := range models {
 		out = append(out, client.Accept{
 			Sender:    m.Sender.ValueString(),
-			Kinds:     stringsFromSet(ctx, m.Kinds, diags),
+			Kinds:     stringsFromSet(ctx, m.Kinds, "accepts", diags),
 			CanDecide: m.CanDecide.ValueBool(),
 		})
 	}
@@ -128,6 +134,8 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"Every argument but `name` is optional and sent only when set. Removing one from the configuration " +
 			"empties it at AutoPilot: an app without `accepts` accepts no sender. Narrowing or deleting an app takes " +
 			"effect at once: AutoPilot stops the queued and running tasks the app no longer accepts.\n\n" +
+			"An app with this name that already exists, made by anything but this resource, is never taken over, " +
+			"even when its values match: the create fails and says to import it.\n\n" +
 			"Import by name: `terraform import autopilot_app.billing billing`.",
 		Attributes: map[string]schema.Attribute{
 			"name": schema.StringAttribute{
@@ -219,9 +227,9 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 	name := plan.Name.ValueString()
 	// Only what is set is sent; the rest takes AutoPilot's defaults (empty).
 	spec := client.AppSpec{
-		Repos:      stringsFromSet(ctx, plan.Repos, &resp.Diagnostics),
+		Repos:      stringsFromSet(ctx, plan.Repos, "repos", &resp.Diagnostics),
 		Accepts:    acceptsFromSet(ctx, plan.Accepts, &resp.Diagnostics),
-		Developers: stringsFromSet(ctx, plan.Developers, &resp.Diagnostics),
+		Developers: stringsFromSet(ctx, plan.Developers, "developers", &resp.Diagnostics),
 	}
 	if resp.Diagnostics.HasError() {
 		return
@@ -231,10 +239,18 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 		addAppWriteError(&resp.Diagnostics, "Error creating AutoPilot app", name, err)
 		return
 	}
+	// An app is a unit of consent, and nothing in an identical create proves
+	// whose it is: another configuration may declare the same app. So an app
+	// this create didn't make is not taken over; the user imports it if this
+	// configuration should own it. (A sender's create proves more; see
+	// senderResource.Create.)
 	if outcome == client.Adopted {
-		resp.Diagnostics.AddWarning("App already existed",
-			fmt.Sprintf("AutoPilot already had an app named %q with exactly these values, so Terraform now manages "+
-				"that app. If another configuration also declares it, keep it in one of them only.", name))
+		resp.Diagnostics.AddAttributeError(path.Root("name"), "An app with this name already exists",
+			fmt.Sprintf("AutoPilot already has an app named %q, with exactly these values, which this apply did not "+
+				"make: another configuration may manage it, or an earlier apply's state was lost. Terraform doesn't "+
+				"take over an app's consent unasked, so nothing was changed. If this configuration should manage "+
+				"it, import it (terraform import autopilot_app.<resource name> %s) and apply.", name, name))
+		return
 	}
 	state := appToModel(created, plan)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
@@ -288,7 +304,7 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 
 	var spec client.AppSpec
 	if !plan.Repos.Equal(state.Repos) {
-		spec.Repos = orEmptyStrings(stringsFromSet(ctx, plan.Repos, &resp.Diagnostics))
+		spec.Repos = orEmptyStrings(stringsFromSet(ctx, plan.Repos, "repos", &resp.Diagnostics))
 	}
 	if !plan.Accepts.Equal(state.Accepts) {
 		spec.Accepts = acceptsFromSet(ctx, plan.Accepts, &resp.Diagnostics)
@@ -297,7 +313,7 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 		}
 	}
 	if !plan.Developers.Equal(state.Developers) {
-		spec.Developers = orEmptyStrings(stringsFromSet(ctx, plan.Developers, &resp.Diagnostics))
+		spec.Developers = orEmptyStrings(stringsFromSet(ctx, plan.Developers, "developers", &resp.Diagnostics))
 	}
 	if resp.Diagnostics.HasError() {
 		return

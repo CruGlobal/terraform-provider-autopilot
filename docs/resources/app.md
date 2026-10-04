@@ -6,6 +6,7 @@ description: |-
   An app: a unit of consent. It owns repositories, names the senders it accepts work from with the kinds of task it accepts from each, and names the people who may start work for it themselves.
   AutoPilot takes a sender's task only when the app the task is billed to, and the app that owns each repository the task touches, accept that sender for that kind. An app may accept a sender that doesn't exist yet, so the app and the sender can be applied in either order.
   Every argument but name is optional and sent only when set. Removing one from the configuration empties it at AutoPilot: an app without accepts accepts no sender. Narrowing or deleting an app takes effect at once: AutoPilot stops the queued and running tasks the app no longer accepts.
+  An app with this name that already exists, made by anything but this resource, is never taken over, even when its values match: the create fails and says to import it.
   Import by name: terraform import autopilot_app.billing billing.
 ---
 
@@ -16,6 +17,8 @@ An app: a unit of consent. It owns repositories, names the senders it accepts wo
 AutoPilot takes a sender's task only when the app the task is billed to, and the app that owns each repository the task touches, accept that sender for that kind. An app may accept a sender that doesn't exist yet, so the app and the sender can be applied in either order.
 
 Every argument but `name` is optional and sent only when set. Removing one from the configuration empties it at AutoPilot: an app without `accepts` accepts no sender. Narrowing or deleting an app takes effect at once: AutoPilot stops the queued and running tasks the app no longer accepts.
+
+An app with this name that already exists, made by anything but this resource, is never taken over, even when its values match: the create fails and says to import it.
 
 Import by name: `terraform import autopilot_app.billing billing`.
 

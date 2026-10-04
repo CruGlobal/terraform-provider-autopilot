@@ -72,7 +72,8 @@ the examples, and the generated docs. Things worth knowing:
 - Records are keyed by name. A `POST` for a name that already holds the same
   fields answers `200` with the record, so creates are retried freely and no
   `Idempotency-Key` is sent. `client.Adopted` marks a `200` the provider's
-  own lost send can't explain, and the resource warns about it.
+  own lost send can't explain. `autopilot_app` refuses it and says to
+  import; `autopilot_sender` warns, since its secrets matched too.
 - Every `PATCH` and `DELETE` carries `If-Match: "<lock_version>"`. A stale
   update is reported, never retried over. A stale delete re-reads once.
 - A change is safe to retry: AutoPilot answers a `PATCH` one version behind,

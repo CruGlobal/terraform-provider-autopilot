@@ -11,6 +11,8 @@ import (
 
 	"github.com/CruGlobal/terraform-provider-autopilot/internal/autopilottest"
 	"github.com/CruGlobal/terraform-provider-autopilot/internal/client"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
@@ -320,18 +322,24 @@ func TestApp_lostCreateAnswerIsSentAgain(t *testing.T) {
 	}
 }
 
-func TestApp_adoptsAnIdenticalRecordWithAWarning(t *testing.T) {
+// An app this create didn't make is not taken over, even with identical
+// values: another configuration may manage it. The apply says to import it,
+// and changes nothing.
+func TestApp_identicalExistingAppIsRefused(t *testing.T) {
 	env := newTestEnv(t)
 	env.requireFake(t)
 	name := randName()
 	env.fake.SeedApp(autopilottest.AppView{Name: name, Developers: []string{"someone@example.com"}})
-	diags := runTestRecordingDiagnostics(t, resource.TestCase{
+	runTest(t, resource.TestCase{
 		Steps: []resource.TestStep{
-			{Config: appConfig(env, name, `  developers = ["someone@example.com"]`)},
+			{
+				Config:      appConfig(env, name, `  developers = ["someone@example.com"]`),
+				ExpectError: expectErr("An app with this name already exists ... this apply did not make ... terraform import autopilot_app"),
+			},
 		},
 	})
-	if !diags.hasWarning("App already existed") {
-		t.Error("adopting an existing app should warn")
+	if v, _ := env.fake.App(name); v.LockVersion != 1 {
+		t.Errorf("the existing app was changed: lock_version %d", v.LockVersion)
 	}
 }
 
@@ -588,4 +596,209 @@ func TestApp_caseOnlyChangeIsApplied(t *testing.T) {
 			},
 		},
 	})
+}
+
+// Removing accepts alone sends only accepts, as []: the app accepts no
+// sender, and keeps the rest.
+func TestApp_removingAcceptsAlone(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	path := "/v1/admin/apps/" + name
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, name, fmt.Sprintf(`
+  repos      = ["example-org/billing"]
+  accepts    = [{ sender = %q, kinds = ["research"] }]
+  developers = ["someone@example.com"]`, randName()))},
+			{
+				Config: appConfig(env, name, `
+  repos      = ["example-org/billing"]
+  developers = ["someone@example.com"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "accepts.#"),
+					resource.TestCheckResourceAttr(appRes, "repos.#", "1"),
+					func(*terraform.State) error {
+						patches := env.fake.RequestsMatching(http.MethodPatch, path)
+						if len(patches) != 1 {
+							return fmt.Errorf("%d changes, want 1", len(patches))
+						}
+						body := requestBody(t, patches[0])
+						if got := keysOf(body); !slices.Equal(got, []string{"accepts"}) {
+							return fmt.Errorf("the change sent %v, want only accepts", got)
+						}
+						if a, _ := body["accepts"].([]any); a == nil || len(a) != 0 {
+							return fmt.Errorf("accepts sent as %v, want []", body["accepts"])
+						}
+						v, _ := env.fake.App(name)
+						if len(v.Accepts) != 0 || len(v.Repos) != 1 || len(v.Developers) != 1 {
+							return fmt.Errorf("AutoPilot holds %+v", v)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// accepts = [] is an empty set in state (not null), with no change planned
+// after.
+func TestApp_acceptsEmptyList(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, `  accepts = []`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "accepts.#", "0"),
+					func(*terraform.State) error {
+						if env.live() {
+							return nil
+						}
+						post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0]
+						if got := keysOf(requestBody(t, post)); !slices.Equal(got, []string{"accepts", "name"}) {
+							return fmt.Errorf("the create sent %v", got)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: appConfig(env, name, `  accepts = []`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// can_decide turned on outside Terraform shows as a change, and the apply
+// turns it off again.
+func TestApp_canDecideWidenedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name, sender := randName(), randName()
+	config := appConfig(env, name, fmt.Sprintf(`  accepts = [{ sender = %q, kinds = ["review-pr"] }]`, sender))
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config},
+			{
+				PreConfig: func() {
+					env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) { v.Accepts[0].CanDecide = true })
+				},
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					if v, _ := env.fake.App(name); len(v.Accepts) != 1 || v.Accepts[0].CanDecide {
+						return fmt.Errorf("accepts = %+v, want can_decide off again", v.Accepts)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// An imported app's empty lists read as unset. A configuration that says []
+// plans one update, which changes nothing at AutoPilot, and then nothing.
+func TestApp_importThenEmptyLists(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{Name: name})
+	config := appConfig(env, name, `
+  repos      = []
+  accepts    = []
+  developers = []`)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             config,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "repos.#", "0"),
+					resource.TestCheckResourceAttr(appRes, "accepts.#", "0"),
+					resource.TestCheckResourceAttr(appRes, "developers.#", "0"),
+					// Sending [] for what is already empty changes nothing.
+					resource.TestCheckResourceAttr(appRes, "lock_version", "1"),
+				),
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// Only AutoPilot's not_found refusal means an app is gone; a plain 404 fails
+// the refresh or the delete.
+func TestApp_onlyTheNotFoundRefusalMeansGone(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	path := "/v1/admin/apps/" + name
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, name, "")},
+			{
+				PreConfig: func() {
+					env.fake.RespondNext(http.MethodGet, path, http.StatusNotFound, "text/plain", "404 page not found")
+				},
+				Config:      appConfig(env, name, ""),
+				ExpectError: expectErr("Error reading AutoPilot app ... this 404 is not one"),
+			},
+			{
+				PreConfig: func() {
+					env.fake.RespondNext(http.MethodDelete, path, http.StatusNotFound, "text/plain", "404 page not found")
+				},
+				Config:      appConfig(env, name, ""),
+				Destroy:     true,
+				ExpectError: expectErr("Error deleting AutoPilot app ... this 404 is not one"),
+			},
+			{
+				PreConfig: func() {
+					env.fake.OnNextRequest(http.MethodDelete, path, func() { env.fake.RemoveApp(name) })
+				},
+				Config:  appConfig(env, name, ""),
+				Destroy: true,
+			},
+		},
+	})
+}
+
+// A list that is somehow still unknown at apply is an error, never sent as
+// []: an empty accepts or repos sent by mistake would take away the app's
+// consent or its repositories.
+func TestUnknownListIsAnErrorNotEmpty(t *testing.T) {
+	ctx := context.Background()
+	var diags diag.Diagnostics
+	if got := acceptsFromSet(ctx, types.SetUnknown(acceptObjectType), &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown accepts gave %v, %v", got, diags)
+	}
+	diags = nil
+	if got := stringsFromSet(ctx, types.SetUnknown(types.StringType), "repos", &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown repos gave %v, %v", got, diags)
+	}
+	diags = nil
+	if got := stringsFromSet(ctx, types.SetNull(types.StringType), "repos", &diags); got != nil || diags.HasError() {
+		t.Errorf("null repos gave %v, %v; null is simply not sent", got, diags)
+	}
 }

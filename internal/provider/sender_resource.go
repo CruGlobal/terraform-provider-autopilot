@@ -339,12 +339,12 @@ func (r *senderResource) Create(ctx context.Context, req resource.CreateRequest,
 	// the plan said.
 	spec := client.SenderSpec{
 		Secrets:      &client.SenderSecrets{Request: config.RequestSecretWO.ValueString(), Callback: config.CallbackSecretWO.ValueString()},
-		Kinds:        stringsFromSet(ctx, plan.Kinds, &resp.Diagnostics),
+		Kinds:        stringsFromSet(ctx, plan.Kinds, "kinds", &resp.Diagnostics),
 		BranchPrefix: plan.BranchPrefix.ValueStringPointer(),
 	}
 	// callback_hosts defaults to empty, which is AutoPilot's default too, so
 	// it is sent only when it holds something.
-	if hosts := stringsFromSet(ctx, plan.CallbackHosts, &resp.Diagnostics); len(hosts) > 0 {
+	if hosts := stringsFromSet(ctx, plan.CallbackHosts, "callback_hosts", &resp.Diagnostics); len(hosts) > 0 {
 		spec.CallbackHosts = hosts
 	}
 	if resp.Diagnostics.HasError() {
@@ -466,10 +466,10 @@ func (r *senderResource) Update(ctx context.Context, req resource.UpdateRequest,
 
 	var spec client.SenderSpec
 	if !plan.CallbackHosts.Equal(state.CallbackHosts) {
-		spec.CallbackHosts = stringsFromSet(ctx, plan.CallbackHosts, &resp.Diagnostics)
+		spec.CallbackHosts = stringsFromSet(ctx, plan.CallbackHosts, "callback_hosts", &resp.Diagnostics)
 	}
 	if !plan.Kinds.IsUnknown() && !plan.Kinds.IsNull() && !plan.Kinds.Equal(state.Kinds) {
-		spec.Kinds = stringsFromSet(ctx, plan.Kinds, &resp.Diagnostics)
+		spec.Kinds = stringsFromSet(ctx, plan.Kinds, "kinds", &resp.Diagnostics)
 	}
 	if known(plan.BranchPrefix) && !plan.BranchPrefix.Equal(state.BranchPrefix) {
 		spec.BranchPrefix = plan.BranchPrefix.ValueStringPointer()
