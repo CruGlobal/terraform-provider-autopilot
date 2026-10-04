@@ -130,6 +130,12 @@ func parseEndpoint(endpoint string) (*url.URL, error) {
 	if u.Host == "" {
 		return nil, fmt.Errorf("invalid endpoint %q: missing host", endpoint)
 	}
+	// The admin token travels in every request, so plain http is only for a
+	// server on this machine (a local AutoPilot, or the tests' fake).
+	if u.Scheme == "http" && !isLoopback(u.Hostname()) {
+		return nil, fmt.Errorf("invalid endpoint %q: plain http is allowed only for a loopback host "+
+			"(localhost, 127.0.0.1 or ::1); use https", endpoint)
+	}
 	if u.User != nil {
 		return nil, fmt.Errorf("invalid endpoint %q: credentials belong in the token, not the URL", u.Redacted())
 	}
@@ -139,6 +145,15 @@ func parseEndpoint(endpoint string) (*url.URL, error) {
 	// slash), so a URL copied out of the API's docs works either way.
 	u.Path = strings.TrimSuffix(strings.TrimSuffix(u.Path, "/"), APIPath) + APIPath
 	return u, nil
+}
+
+// isLoopback reports whether host is this machine.
+func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // New builds a client for the AutoPilot at endpoint (scheme and host,
@@ -313,7 +328,10 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any, opt
 			unanswered = true
 		}
 		if err != nil {
-			if !req.replayable || !isTransient(err) || attempt >= c.maxRetries {
+			// Whether the caller gave up is the caller's context's to say. A
+			// deadline from the http.Client's own Timeout is one attempt timing
+			// out, which is worth another.
+			if ctx.Err() != nil || !req.replayable || !isTransient(err) || attempt >= c.maxRetries {
 				return &Error{Method: method, Path: path, Message: err.Error(), Err: err,
 					Preconditioned: req.ifMatch != nil, EarlierSendUnanswered: unanswered}
 			}
@@ -329,8 +347,17 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any, opt
 		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		_ = resp.Body.Close()
 		if readErr != nil {
+			// The server answered, so it had the request, but the answer was
+			// lost on the way (a timeout or a dropped connection mid-body).
+			if ctx.Err() == nil && req.replayable && attempt < c.maxRetries {
+				unanswered = true
+				if werr := c.sleep(ctx, c.backoff(attempt, 0)); werr != nil {
+					return werr
+				}
+				continue
+			}
 			return &Error{Method: method, Path: path, Status: resp.StatusCode, Message: readErr.Error(), Err: readErr,
-				Preconditioned: req.ifMatch != nil, EarlierSendUnanswered: unanswered}
+				Preconditioned: req.ifMatch != nil, EarlierSendUnanswered: true}
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -489,12 +516,17 @@ func isGatewayStatus(status int) bool {
 }
 
 // isTransient reports whether a transport-level error is worth retrying: a
-// timeout, a refused or reset connection, or a torn-down response. Context
-// cancellation, TLS failures, DNS failures that are not timeouts, and malformed
-// requests are permanent and are never retried.
+// timeout (including the http.Client's own Timeout, which net/http reports as
+// a deadline), a refused or reset connection, or a torn-down response.
+// Cancellation, TLS failures, DNS failures that are not timeouts, and
+// malformed requests are permanent and are never retried. The caller's own
+// context is checked before this is asked.
 func isTransient(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
 		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
 	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
 		return true

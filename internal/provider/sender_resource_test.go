@@ -779,3 +779,58 @@ func TestSender_planTimeValidation(t *testing.T) {
 	}
 	runTest(t, resource.TestCase{Steps: steps})
 }
+
+// Only AutoPilot's not_found refusal means a sender is gone. A plain 404 (a
+// proxy, a page that isn't AutoPilot's, a wrong path) fails the refresh or
+// the delete, instead of dropping the sender from state or calling it deleted.
+func TestSender_onlyTheNotFoundRefusalMeansGone(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	path := "/v1/admin/senders/" + name
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: senderConfig(env, name, secrets, "")},
+			{
+				PreConfig: func() {
+					env.fake.RespondNext(http.MethodGet, path, http.StatusNotFound, "text/html", "<html>Not Found</html>")
+				},
+				Config:      senderConfig(env, name, secrets, ""),
+				ExpectError: expectErr("Error reading AutoPilot sender ... this 404 is not one"),
+			},
+			{
+				PreConfig: func() {
+					env.fake.RespondNext(http.MethodDelete, path, http.StatusNotFound, "text/html", "<html>Not Found</html>")
+				},
+				Config:      senderConfig(env, name, secrets, ""),
+				Destroy:     true,
+				ExpectError: expectErr("Error deleting AutoPilot sender ... this 404 is not one"),
+			},
+			{
+				// Gone by the time the delete arrives: AutoPilot's not_found
+				// refusal, which is success.
+				PreConfig: func() {
+					env.fake.OnNextRequest(http.MethodDelete, path, func() { env.fake.RemoveSender(name) })
+				},
+				Config:  senderConfig(env, name, secrets, ""),
+				Destroy: true,
+			},
+		},
+	})
+}
+
+func TestSender_wrongTokenIsReported(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	wrong := *env
+	wrong.token = "wrong-" + env.token
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:      senderConfig(&wrong, randName(), newSecretPair(t), ""),
+				ExpectError: expectErr("HTTP 401 (unauthorized) ... AutoPilot refused the admin token"),
+			},
+		},
+	})
+}

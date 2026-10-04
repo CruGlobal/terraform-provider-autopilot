@@ -96,7 +96,8 @@ func TestConfigure_ConfigWinsOverEnvironment(t *testing.T) {
 func TestConfigure_InvalidEndpoint(t *testing.T) {
 	t.Setenv(envEndpoint, "")
 	t.Setenv(envToken, "")
-	for _, endpoint := range []string{"autopilot.example.com", "ftp://autopilot.example.com", "https://", "https://user:pw@autopilot.example.com"} {
+	for _, endpoint := range []string{"autopilot.example.com", "ftp://autopilot.example.com", "https://",
+		"https://user:pw@autopilot.example.com", "http://autopilot.example.com"} {
 		resp := configure(t, ptr(endpoint), ptr("admin-token"))
 		if got := summaries(resp); got != "Invalid AutoPilot endpoint" {
 			t.Errorf("endpoint %q: diagnostics = %q", endpoint, got)
@@ -142,5 +143,21 @@ func TestConfigure_UnknownValues(t *testing.T) {
 	got := summaries(resp)
 	if !strings.Contains(got, "Unknown AutoPilot endpoint") || !strings.Contains(got, "Unknown AutoPilot token") {
 		t.Errorf("diagnostics = %q", got)
+	}
+}
+
+// Plain http carries the admin token in the clear, so it is only for a server
+// on this machine.
+func TestConfigure_PlainHTTPOnlyForLoopback(t *testing.T) {
+	t.Setenv(envEndpoint, "")
+	t.Setenv(envToken, "")
+	for _, endpoint := range []string{"http://localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080"} {
+		if resp := configure(t, ptr(endpoint), ptr("admin-token")); resp.Diagnostics.HasError() {
+			t.Errorf("%s: %v", endpoint, resp.Diagnostics)
+		}
+	}
+	resp := configure(t, ptr("http://autopilot.example.com"), ptr("admin-token"))
+	if !resp.Diagnostics.HasError() || !strings.Contains(resp.Diagnostics.Errors()[0].Detail(), "loopback") {
+		t.Errorf("plain http to another host: %v", resp.Diagnostics)
 	}
 }

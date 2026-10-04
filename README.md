@@ -88,8 +88,10 @@ resource "autopilot_app" "billing" {
 | `token` | Admin token, sent as a bearer token. Sensitive. Falls back to `AUTOPILOT_TOKEN`. |
 
 Both are checked when the provider is configured: a missing value, an
-endpoint that isn't an http or https URL with a host, or a token with spaces
-in it fails the plan with an error that says which and where it came from.
+endpoint that isn't an https URL with a host, or a token with spaces in it
+fails the plan with an error that says which and where it came from. Plain
+`http://` is allowed only for a loopback host (`localhost`, `127.0.0.1`,
+`::1`), because the admin token travels in every request.
 
 Full reference docs (generated from the provider schema) live in
 [`docs/`](./docs/) and on the
@@ -129,10 +131,15 @@ the same fingerprints from the configuration:
 - A change whose answer was lost is sent again. If the first copy was
   applied, the second meets its own new version; the provider reads the
   record, finds its change there, and carries on.
-- `429` (honouring `Retry-After`), `503 unavailable` and dropped connections
-  are retried with backoff.
-- A `404` means the record is gone (a deleted sender reads as `404` while
-  AutoPilot finishes its tasks), and removes it from state.
+- `503 unavailable`, a gateway's `502` or `504`, an attempt that timed out,
+  an answer cut off on the way, and a dropped connection are retried with
+  backoff, and so is `429` (honouring `Retry-After`) should AutoPilot ever
+  send it. The caller's own cancellation is not retried.
+- AutoPilot's `404 not_found` refusal means the record is gone (a deleted
+  sender reads that way while AutoPilot finishes its tasks), and removes it
+  from state. Any other `404` (a proxy, a page that isn't AutoPilot's, an
+  endpoint with the wrong path) is an error, so a misconfigured endpoint can
+  never make Terraform forget a record.
 - An argument left out of an `autopilot_app` is not sent on create; removing
   one later sends it as `[]`, so the app holds what the configuration says.
 

@@ -88,9 +88,15 @@ func (e *Error) Retryable() bool {
 	return e.Status == http.StatusTooManyRequests || isGatewayStatus(e.Status)
 }
 
-// IsNotFound reports a 404. A retired sender reads as 404 too, so a 404
-// always means "gone" and never "try again".
-func IsNotFound(err error) bool { return hasStatus(err, http.StatusNotFound) }
+// IsNotFound reports AutoPilot's own answer for a missing record: a 404 whose
+// refusal carries the not_found code. A retired sender reads that way too, so
+// it means "gone" and never "try again". Any other 404 (an HTML page, a proxy,
+// an endpoint with the wrong path) is not AutoPilot saying a record is gone,
+// and is left to be reported.
+func IsNotFound(err error) bool {
+	e, ok := asError(err)
+	return ok && e.Status == http.StatusNotFound && e.Code == CodeNotFound
+}
 
 // IsStale reports a lost optimistic-locking race: 409 stale_object.
 func IsStale(err error) bool { return HasCode(err, CodeStaleObject) }

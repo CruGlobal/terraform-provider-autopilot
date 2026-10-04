@@ -61,7 +61,16 @@ type Server struct {
 	unavailableNext int
 	beforeRequest   []requestHook
 	dropResponses   []requestHook
+	canned          []cannedResponse
 	requests        []RecordedRequest
+}
+
+// cannedResponse is a raw answer that stands in for AutoPilot's.
+type cannedResponse struct {
+	method, path string
+	status       int
+	contentType  string
+	body         string
 }
 
 // requestHook runs once, just before the first request matching method and
@@ -84,9 +93,9 @@ func New(t testing.TB) *Server {
 	mux := http.NewServeMux()
 	s.senderRoutes(mux)
 	s.appRoutes(mux)
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		writeError(w, refusal{http.StatusNotFound, "not_found", "no such route", ""})
-	})
+	// A path AutoPilot has no route for gets a plain 404, not the not_found
+	// refusal that means a record is gone.
+	mux.HandleFunc("/", http.NotFound)
 	s.Server = httptest.NewServer(s.middleware(mux))
 	t.Cleanup(s.Close)
 	return s
@@ -143,6 +152,15 @@ func (s *Server) DropNextResponse(method, pathSuffix string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropResponses = append(s.dropResponses, requestHook{method: method, path: pathSuffix})
+}
+
+// RespondNext answers the next request with the given method whose path ends
+// in pathSuffix with this raw response, without AutoPilot seeing it, as a
+// proxy in front of AutoPilot, or a page that isn't AutoPilot's, would.
+func (s *Server) RespondNext(method, pathSuffix string, status int, contentType, body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.canned = append(s.canned, cannedResponse{method: method, path: pathSuffix, status: status, contentType: contentType, body: body})
 }
 
 // Requests returns every request served so far.
@@ -215,6 +233,16 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			}
 			writeError(rec, refusal{http.StatusTooManyRequests, "rate_limited", "too many requests", ""})
 			return
+		}
+		for i, c := range s.canned {
+			if c.method == r.Method && strings.HasSuffix(r.URL.Path, c.path) {
+				s.canned = append(s.canned[:i], s.canned[i+1:]...)
+				s.mu.Unlock()
+				rec.Header().Set("Content-Type", c.contentType)
+				rec.WriteHeader(c.status)
+				_, _ = io.WriteString(rec, c.body)
+				return
+			}
 		}
 		if s.unavailableNext > 0 {
 			s.unavailableNext--

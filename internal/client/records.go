@@ -102,8 +102,8 @@ func patchRecord[T record](ctx context.Context, c *Client, path string, fields F
 	return decodeRecord[T](http.MethodPatch, path, http.StatusOK, raw)
 }
 
-// deleteRecord DELETEs a record under If-Match. A record that is already gone
-// is success.
+// deleteRecord DELETEs a record under If-Match. A record AutoPilot says is
+// already gone (not_found) is success.
 func deleteRecord(ctx context.Context, c *Client, path string, lockVersion int64) error {
 	err := c.Delete(ctx, path, nil, WithIfMatch(lockVersion))
 	if err != nil && !IsNotFound(err) {

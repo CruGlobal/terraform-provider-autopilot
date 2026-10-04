@@ -65,8 +65,9 @@ func (p *autopilotProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 		Attributes: map[string]schema.Attribute{
 			"endpoint": schema.StringAttribute{
 				MarkdownDescription: "Base URL of the AutoPilot, for example `https://autopilot.example.com`. " +
-					"The `/v1/admin` path is appended automatically. Falls back to the `AUTOPILOT_ENDPOINT` " +
-					"environment variable.",
+					"The `/v1/admin` path is appended automatically. It must be https; plain `http://` is allowed " +
+					"only for a loopback host (`localhost`, `127.0.0.1`, `::1`), because the admin token travels in " +
+					"every request. Falls back to the `AUTOPILOT_ENDPOINT` environment variable.",
 				Optional: true,
 			},
 			"token": schema.StringAttribute{
@@ -120,7 +121,7 @@ func (p *autopilotProvider) Configure(ctx context.Context, req provider.Configur
 		resp.Diagnostics.AddAttributeError(
 			path.Root("endpoint"),
 			"Invalid AutoPilot endpoint",
-			"The endpoint (from "+endpointFrom+") must be an http or https URL with a host, such as "+
+			"The endpoint (from "+endpointFrom+") must be an https URL with a host, such as "+
 				"https://autopilot.example.com: "+err.Error(),
 		)
 	}
