@@ -13,7 +13,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setdefault"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -120,6 +119,10 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"**Terraform 1.11 or later**. Make them in the sender's own configuration with a plain `random_password` " +
 			"(not an ephemeral value, which changes on every run), pass them here, and store them where the sender " +
 			"reads its secrets.\n\n" +
+			"This resource never stores the secrets, but the `random_password` resources that make them keep them in " +
+			"that configuration's state, so protect that state as you would the secrets. And make them random: a " +
+			"fingerprint is an unsalted SHA-256, quick to compute and shown in plans and state, so a secret someone " +
+			"could guess could be found from its fingerprint.\n\n" +
 			"AutoPilot never sends a secret back. It reports a fingerprint of each one instead, and the provider " +
 			"works out the same fingerprints from the configuration. So:\n\n" +
 			"- **Rotating.** Change a secret in configuration. Its fingerprint changes, so the provider plans an " +
@@ -129,12 +132,17 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"- **Changed outside Terraform.** The next refresh reads a different fingerprint, and the next apply puts " +
 			"the configured secrets back.\n" +
 			"- **`secrets_wo_version`.** Change it to send the secrets whatever the fingerprints say. Sending the " +
-			"secrets AutoPilot already holds changes nothing.\n\n" +
+			"secrets AutoPilot already holds changes nothing.\n" +
+			"- **A secret that changes between plan and apply** (an ephemeral value, say) is not sent. Terraform " +
+			"stops the apply with \"Provider produced inconsistent final plan\", naming the secret's fingerprint. Use " +
+			"a stable value.\n\n" +
 			"## Deleting\n\n" +
 			"Deleting a sender retires it: it can send no new tasks, while the tasks it already sent run on and " +
 			"their events are still delivered. AutoPilot removes it for good once none is left. Until then the name " +
-			"can't be used again, so replacing a sender (`-replace`, or a new `name`) with work still running under " +
-			"the old name fails until that work is done.\n\n" +
+			"can't be used again, so replacing a sender with `-replace` while work is still running under its name " +
+			"fails until that work is done. The retired sender keeps its branch prefix until then too, so renaming a " +
+			"sender that sets `branch_prefix` and keeps it fails the same way (`branch_prefix_taken`); give the " +
+			"renamed sender a new prefix, or wait.\n\n" +
 			"## Import\n\n" +
 			"Import by name: `terraform import autopilot_sender.tracker tracker`. The secrets can't be imported. Put " +
 			"them in configuration: when their fingerprints match the stored ones the next plan is empty, and when " +
@@ -144,7 +152,7 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"name": schema.StringAttribute{
 				MarkdownDescription: "The sender's name, which is its key and the `sender.system` of its tasks: a lowercase " +
 					"letter, then lowercase letters, digits and `-`, at most 40 characters. AutoPilot reserves some names " +
-					"(such as `autopilot`). Changing it replaces the sender.",
+					"(such as `autopilot`). Changing it replaces the sender; see Deleting, above.",
 				Required:      true,
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 				Validators: []validator.String{stringvalidator.RegexMatches(senderNamePattern,
@@ -165,13 +173,13 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			},
 			"kinds": schema.SetAttribute{
 				MarkdownDescription: "The kinds of task the sender may send, such as `implement-work-item`, `fix-error`, " +
-					"`review-pr` or `research`. Each must be one AutoPilot knows. At least one. AutoPilot's default on " +
-					"a new sender is `implement-work-item`. When unset, the current value is kept, so set it for " +
-					"Terraform to own it.",
-				ElementType:   types.StringType,
-				Optional:      true,
-				Computed:      true,
-				PlanModifiers: []planmodifier.Set{setplanmodifier.UseStateForUnknown()},
+					"`review-pr` or `research`. Each must be one AutoPilot knows. At least one. Defaults to " +
+					"`[\"implement-work-item\"]`, AutoPilot's own default, so removing it from the configuration puts " +
+					"that back, and a change made outside Terraform shows in the plan.",
+				ElementType: types.StringType,
+				Optional:    true,
+				Computed:    true,
+				Default:     setdefault.StaticValue(setFromStrings([]string{"implement-work-item"})),
 				Validators: []validator.Set{
 					setvalidator.SizeAtLeast(1),
 					setvalidator.ValueStringsAre(stringvalidator.RegexMatches(kindPattern, "must be a kind of task, such as implement-work-item")),
@@ -179,12 +187,11 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			},
 			"branch_prefix": schema.StringAttribute{
 				MarkdownDescription: "What the sender's branches start with: a lowercase word and a `/` (`^[a-z][a-z0-9-]*/$`), " +
-					"at most 41 characters. No two senders " +
-					"share one. AutoPilot's default on a new sender is the name and a `/`. When unset, the current value " +
-					"is kept, so set it for Terraform to own it.",
-				Optional:      true,
-				Computed:      true,
-				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+					"at most 41 characters. No two senders share one. Defaults to the name and a `/`, AutoPilot's own " +
+					"default, so removing it from the configuration puts that back, and a change made outside Terraform " +
+					"shows in the plan.",
+				Optional: true,
+				Computed: true,
 				Validators: []validator.String{
 					stringvalidator.RegexMatches(branchPrefixPattern, "must be a lowercase word and a /, such as tracker/"),
 					stringvalidator.LengthAtMost(41),
@@ -273,6 +280,15 @@ func (r *senderResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	// branch_prefix left out of the configuration is AutoPilot's default,
+	// which depends on the name, so it can't be a static Default.
+	if config.BranchPrefix.IsNull() {
+		if known(plan.Name) {
+			plan.BranchPrefix = types.StringValue(plan.Name.ValueString() + "/")
+		} else {
+			plan.BranchPrefix = types.StringUnknown()
+		}
+	}
 	secretsKnown := known(config.RequestSecretWO) && known(config.CallbackSecretWO)
 	if secretsKnown {
 		plan.RequestSecretFingerprint = types.StringValue(client.Fingerprint(config.RequestSecretWO.ValueString()))
@@ -287,13 +303,17 @@ func (r *senderResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 		if resp.Diagnostics.HasError() {
 			return
 		}
-		if !secretsKnown || !plan.RequestSecretFingerprint.Equal(state.RequestSecretFingerprint) ||
-			!plan.CallbackSecretFingerprint.Equal(state.CallbackSecretFingerprint) {
-			// Marking what the rotation changes as unknown is what turns this
-			// into a planned update. lock_version goes with them: a computed
-			// attribute left at its prior value would make the apply an
-			// inconsistent result.
+		rotating := !secretsKnown || !plan.RequestSecretFingerprint.Equal(state.RequestSecretFingerprint) ||
+			!plan.CallbackSecretFingerprint.Equal(state.CallbackSecretFingerprint)
+		if rotating {
 			plan.SecretsChangedAt = types.StringUnknown()
+		}
+		// A rotation, or a branch prefix put back to its default, is a change
+		// the framework could not see when it planned. Marking what the change
+		// moves as unknown is what turns it into a planned update; a computed
+		// attribute left at its prior value would make the apply an
+		// inconsistent result.
+		if rotating || !plan.BranchPrefix.Equal(state.BranchPrefix) {
 			plan.PreviousSecretsUntil = types.StringUnknown()
 			plan.LockVersion = types.Int64Unknown()
 		}
@@ -311,17 +331,21 @@ func (r *senderResource) Create(ctx context.Context, req resource.CreateRequest,
 		return
 	}
 	name := plan.Name.ValueString()
+	if !secretsMatchPlan(&resp.Diagnostics, plan, config) {
+		return
+	}
+	// kinds and branch_prefix are always planned (their defaults are
+	// AutoPilot's), so they are always sent, and what AutoPilot holds is what
+	// the plan said.
 	spec := client.SenderSpec{
-		Secrets: &client.SenderSecrets{Request: config.RequestSecretWO.ValueString(), Callback: config.CallbackSecretWO.ValueString()},
-		Kinds:   stringsFromSet(ctx, plan.Kinds, &resp.Diagnostics),
+		Secrets:      &client.SenderSecrets{Request: config.RequestSecretWO.ValueString(), Callback: config.CallbackSecretWO.ValueString()},
+		Kinds:        stringsFromSet(ctx, plan.Kinds, &resp.Diagnostics),
+		BranchPrefix: plan.BranchPrefix.ValueStringPointer(),
 	}
 	// callback_hosts defaults to empty, which is AutoPilot's default too, so
 	// it is sent only when it holds something.
 	if hosts := stringsFromSet(ctx, plan.CallbackHosts, &resp.Diagnostics); len(hosts) > 0 {
 		spec.CallbackHosts = hosts
-	}
-	if known(plan.BranchPrefix) {
-		spec.BranchPrefix = plan.BranchPrefix.ValueStringPointer()
 	}
 	if resp.Diagnostics.HasError() {
 		return
@@ -332,6 +356,11 @@ func (r *senderResource) Create(ctx context.Context, req resource.CreateRequest,
 		addSenderCreateError(&resp.Diagnostics, name, err)
 		return
 	}
+	// An identical create matches the secrets too, and only a configuration
+	// holding these very secrets can make that match: in practice this one,
+	// after an earlier apply whose state was lost. So taking the sender over is
+	// safe, and a warning is enough. (An app has no such proof; see
+	// appResource.Create.)
 	if outcome == client.Adopted {
 		resp.Diagnostics.AddWarning("Sender already existed",
 			fmt.Sprintf("AutoPilot already had a sender named %q with exactly these values, so Terraform now manages "+
@@ -341,6 +370,37 @@ func (r *senderResource) Create(ctx context.Context, req resource.CreateRequest,
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
+// secretsMatchPlan stops an apply whose secrets are not the ones the plan was
+// made with, before anything is sent. A plan made with known secrets shows
+// their fingerprints; were different secrets sent, AutoPilot would hold them
+// and the apply would end in an inconsistent result. That happens when a
+// secret comes from a value that changes on every run, such as an ephemeral
+// resource.
+func secretsMatchPlan(diags *diag.Diagnostics, plan, config senderModel) bool {
+	ok := true
+	for _, s := range []struct {
+		attr    string
+		planned types.String
+		secret  types.String
+	}{
+		{"request_secret_wo", plan.RequestSecretFingerprint, config.RequestSecretWO},
+		{"callback_secret_wo", plan.CallbackSecretFingerprint, config.CallbackSecretWO},
+	} {
+		if !known(s.planned) || !known(s.secret) {
+			continue
+		}
+		if got := client.Fingerprint(s.secret.ValueString()); got != s.planned.ValueString() {
+			diags.AddAttributeError(path.Root(s.attr), "The secret changed after the plan",
+				fmt.Sprintf("The plan was made with a secret whose fingerprint is %s, but at apply the configuration "+
+					"gives one whose fingerprint is %s. Nothing was sent to AutoPilot. This happens when a secret comes "+
+					"from a value that changes on every run, such as an ephemeral resource. Use a stable value, such as "+
+					"a random_password, then plan and apply again.", s.planned.ValueString(), got))
+			ok = false
+		}
+	}
+	return ok
+}
+
 func addSenderCreateError(diags *diag.Diagnostics, name string, err error) {
 	summary := "Error creating AutoPilot sender"
 	switch {
@@ -348,7 +408,9 @@ func addSenderCreateError(diags *diag.Diagnostics, name string, err error) {
 		diags.AddAttributeError(path.Root("name"), "A sender with this name already exists",
 			fmt.Sprintf("AutoPilot already has a sender named %q, with values that differ from this configuration. "+
 				"To manage it here, import it (terraform import autopilot_sender.<resource name> %s) and apply. "+
-				"Otherwise choose another name.\n\nAutoPilot said: %s", name, name, apiMessage(err)))
+				"Be careful if another configuration manages it: applying here sends this configuration's secrets, "+
+				"which replaces that sender's secrets and breaks it until it takes up the new ones. Otherwise "+
+				"choose another name.\n\nAutoPilot said: %s", name, name, apiMessage(err)))
 	case client.HasCode(err, client.CodeNameRetired):
 		diags.AddAttributeError(path.Root("name"), "This sender name is retired",
 			fmt.Sprintf("A sender named %q was deleted, and AutoPilot is still finishing the tasks it sent or "+
@@ -398,6 +460,9 @@ func (r *senderResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 	name := state.Name.ValueString()
+	if !secretsMatchPlan(&resp.Diagnostics, plan, config) {
+		return
+	}
 
 	var spec client.SenderSpec
 	if !plan.CallbackHosts.Equal(state.CallbackHosts) {

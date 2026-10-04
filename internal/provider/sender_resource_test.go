@@ -11,6 +11,10 @@ import (
 
 	"github.com/CruGlobal/terraform-provider-autopilot/internal/autopilottest"
 	"github.com/CruGlobal/terraform-provider-autopilot/internal/client"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/providerserver"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
@@ -219,8 +223,10 @@ func TestSender_defaults(t *testing.T) {
 							return nil
 						}
 						post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/senders")[0]
-						if got := keysOf(requestBody(t, post)); !slices.Equal(got, []string{"callback_secret", "name", "request_secret"}) {
-							return fmt.Errorf("the create sent %v; unset fields take AutoPilot's defaults", got)
+						// kinds and branch_prefix are always planned, so always sent;
+						// an empty callback_hosts is AutoPilot's default and is not.
+						if got := keysOf(requestBody(t, post)); !slices.Equal(got, []string{"branch_prefix", "callback_secret", "kinds", "name", "request_secret"}) {
+							return fmt.Errorf("the create sent %v", got)
 						}
 						return nil
 					},
@@ -837,4 +843,193 @@ func TestSender_wrongTokenIsReported(t *testing.T) {
 			},
 		},
 	})
+}
+
+// kinds and branch_prefix left out of the configuration are AutoPilot's
+// defaults, planned as such: a change made outside Terraform shows in the
+// plan, and the apply puts the defaults back.
+func TestSender_defaultsChangedOutsideTerraformArePutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: senderConfig(env, name, secrets, "")},
+			{
+				PreConfig: func() {
+					env.fake.ChangeSenderOutOfBand(name, func(v *autopilottest.SenderView) {
+						v.Kinds = []string{"research"}
+						v.BranchPrefix = "elsewhere/"
+					})
+				},
+				Config: senderConfig(env, name, secrets, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckTypeSetElemAttr(senderRes, "kinds.*", "implement-work-item"),
+					resource.TestCheckResourceAttr(senderRes, "kinds.#", "1"),
+					resource.TestCheckResourceAttr(senderRes, "branch_prefix", name+"/"),
+					func(*terraform.State) error {
+						v, _ := env.fake.Sender(name)
+						if !slices.Equal(v.Kinds, []string{"implement-work-item"}) || v.BranchPrefix != name+"/" {
+							return fmt.Errorf("AutoPilot holds kinds %v and prefix %q", v.Kinds, v.BranchPrefix)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// Removing kinds or branch_prefix from the configuration puts AutoPilot's
+// defaults back.
+func TestSender_removingKindsAndPrefixPutsDefaultsBack(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkSendersGone(t, env),
+		Steps: []resource.TestStep{
+			{Config: senderConfig(env, name, secrets, fmt.Sprintf(`
+  kinds         = ["research", "fix-error"]
+  branch_prefix = %q`, name+"-bots/"))},
+			{
+				Config: senderConfig(env, name, secrets, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionUpdate),
+						plancheck.ExpectKnownValue(senderRes, tfjsonpath.New("branch_prefix"), knownvalue.StringExact(name+"/")),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "kinds.#", "1"),
+					resource.TestCheckTypeSetElemAttr(senderRes, "kinds.*", "implement-work-item"),
+					resource.TestCheckResourceAttr(senderRes, "branch_prefix", name+"/"),
+				),
+			},
+			{
+				Config: senderConfig(env, name, secrets, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// Removing secrets_wo_version is a change too: it sends the secrets once
+// more, which changes nothing at AutoPilot, and leaves it unset in state.
+func TestSender_removingSecretsVersion(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkSendersGone(t, env),
+		Steps: []resource.TestStep{
+			{Config: senderConfig(env, name, secrets, `  secrets_wo_version = 3`)},
+			{
+				Config: senderConfig(env, name, secrets, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(senderRes, "secrets_wo_version"),
+					resource.TestCheckResourceAttr(senderRes, "lock_version", "1"),
+					func(*terraform.State) error {
+						if env.live() {
+							return nil
+						}
+						patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/senders/"+name)
+						if len(patches) != 1 {
+							return fmt.Errorf("%d changes, want 1", len(patches))
+						}
+						if got := keysOf(requestBody(t, patches[0])); !slices.Equal(got, []string{"callback_secret", "request_secret"}) {
+							return fmt.Errorf("the change sent %v, want both secrets", got)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: senderConfig(env, name, secrets, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A secret from a value that is new every time it is read (an ephemeral
+// resource) differs between plan and apply. Terraform re-plans during the
+// apply, sees the planned fingerprint change, and stops before the provider is
+// asked to apply anything, so AutoPilot keeps the secrets it had. (The
+// provider's own check, secretsMatchPlan, is the second line; see
+// TestSecretsMatchPlan.)
+func TestSender_secretChangedAfterPlanIsNotSent(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	ephemeralConfig := env.providerConfig() + fmt.Sprintf(`
+ephemeral "autopilot_test_random" "secret" {}
+
+resource "autopilot_sender" "test" {
+  name               = %q
+  request_secret_wo  = ephemeral.autopilot_test_random.secret.value
+  callback_secret_wo = %q
+}
+`, name, secrets.callback)
+	runTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: map[string]func() (tfprotov6.ProviderServer, error){
+			"autopilot": providerserver.NewProtocol6WithError(withTestRandom{New("test")()}),
+		},
+		Steps: []resource.TestStep{
+			{Config: senderConfig(env, name, secrets, "")},
+			{
+				Config:      ephemeralConfig,
+				ExpectError: expectErr("inconsistent final plan ... request_secret_fingerprint"),
+			},
+			{
+				// AutoPilot still holds the configured secrets.
+				Config: senderConfig(env, name, secrets, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+				Check: func(*terraform.State) error {
+					if n := len(env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/senders/"+name)); n != 0 {
+						return fmt.Errorf("%d changes were sent, want none", n)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// secretsMatchPlan refuses an apply whose secrets don't match the planned
+// fingerprints, says which, and never repeats a secret.
+func TestSecretsMatchPlan(t *testing.T) {
+	planned, other := randSecret(t), randSecret(t)
+	plan := senderModel{
+		RequestSecretFingerprint:  types.StringValue(client.Fingerprint(planned)),
+		CallbackSecretFingerprint: types.StringUnknown(),
+	}
+	var diags diag.Diagnostics
+	if !secretsMatchPlan(&diags, plan, senderModel{RequestSecretWO: types.StringValue(planned), CallbackSecretWO: types.StringValue(other)}) {
+		t.Fatalf("matching secrets were refused: %v", diags)
+	}
+	if secretsMatchPlan(&diags, plan, senderModel{RequestSecretWO: types.StringValue(other), CallbackSecretWO: types.StringValue(other)}) {
+		t.Fatal("a secret that changed after the plan was let through")
+	}
+	if len(diags) != 1 || diags[0].Summary() != "The secret changed after the plan" {
+		t.Fatalf("diagnostics = %v", diags)
+	}
+	if detail := diags[0].Detail(); strings.Contains(detail, other) || strings.Contains(detail, planned) ||
+		!strings.Contains(detail, "Nothing was sent to AutoPilot") {
+		t.Errorf("detail = %q", detail)
+	}
 }

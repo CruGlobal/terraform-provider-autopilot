@@ -80,7 +80,9 @@ provider "autopilot" {
 // Terraform 1.11 or later for write-only arguments.
 func runTest(t *testing.T, tc resource.TestCase) {
 	t.Helper()
-	tc.ProtoV6ProviderFactories = protoV6ProviderFactories
+	if tc.ProtoV6ProviderFactories == nil {
+		tc.ProtoV6ProviderFactories = protoV6ProviderFactories
+	}
 	tc.TerraformVersionChecks = append(tc.TerraformVersionChecks, tfversion.SkipBelow(tfversion.Version1_11_0))
 	resource.UnitTest(t, tc)
 }

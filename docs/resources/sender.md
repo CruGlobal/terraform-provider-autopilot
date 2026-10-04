@@ -7,10 +7,11 @@ description: |-
   An app must also accept the sender (see autopilot_app) before AutoPilot takes its tasks for that app. The two can be applied in either order.
   The secrets
   request_secret_wo and callback_secret_wo are write-only arguments https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments: Terraform sends them on apply and never writes them to the plan or the state file. They need Terraform 1.11 or later. Make them in the sender's own configuration with a plain random_password (not an ephemeral value, which changes on every run), pass them here, and store them where the sender reads its secrets.
+  This resource never stores the secrets, but the random_password resources that make them keep them in that configuration's state, so protect that state as you would the secrets. And make them random: a fingerprint is an unsalted SHA-256, quick to compute and shown in plans and state, so a secret someone could guess could be found from its fingerprint.
   AutoPilot never sends a secret back. It reports a fingerprint of each one instead, and the provider works out the same fingerprints from the configuration. So:
-  Rotating. Change a secret in configuration. Its fingerprint changes, so the provider plans an update that sends both secrets. AutoPilot keeps the old pair for 24 hours (previous_secrets_until), taking requests signed with either request secret and signing callbacks with both callback secrets, so the sender can take up the new pair at its own pace.Changed outside Terraform. The next refresh reads a different fingerprint, and the next apply puts the configured secrets back.secrets_wo_version. Change it to send the secrets whatever the fingerprints say. Sending the secrets AutoPilot already holds changes nothing.
+  Rotating. Change a secret in configuration. Its fingerprint changes, so the provider plans an update that sends both secrets. AutoPilot keeps the old pair for 24 hours (previous_secrets_until), taking requests signed with either request secret and signing callbacks with both callback secrets, so the sender can take up the new pair at its own pace.Changed outside Terraform. The next refresh reads a different fingerprint, and the next apply puts the configured secrets back.secrets_wo_version. Change it to send the secrets whatever the fingerprints say. Sending the secrets AutoPilot already holds changes nothing.A secret that changes between plan and apply (an ephemeral value, say) is not sent. Terraform stops the apply with "Provider produced inconsistent final plan", naming the secret's fingerprint. Use a stable value.
   Deleting
-  Deleting a sender retires it: it can send no new tasks, while the tasks it already sent run on and their events are still delivered. AutoPilot removes it for good once none is left. Until then the name can't be used again, so replacing a sender (-replace, or a new name) with work still running under the old name fails until that work is done.
+  Deleting a sender retires it: it can send no new tasks, while the tasks it already sent run on and their events are still delivered. AutoPilot removes it for good once none is left. Until then the name can't be used again, so replacing a sender with -replace while work is still running under its name fails until that work is done. The retired sender keeps its branch prefix until then too, so renaming a sender that sets branch_prefix and keeps it fails the same way (branch_prefix_taken); give the renamed sender a new prefix, or wait.
   Import
   Import by name: terraform import autopilot_sender.tracker tracker. The secrets can't be imported. Put them in configuration: when their fingerprints match the stored ones the next plan is empty, and when they don't, the next apply sends them. A secrets_wo_version in the configuration shows as a change on that first plan too; applying it records the number and sends the secrets, which changes nothing when they match.
 ---
@@ -25,15 +26,18 @@ An app must also accept the sender (see `autopilot_app`) before AutoPilot takes 
 
 `request_secret_wo` and `callback_secret_wo` are [write-only arguments](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments): Terraform sends them on apply and never writes them to the plan or the state file. They need **Terraform 1.11 or later**. Make them in the sender's own configuration with a plain `random_password` (not an ephemeral value, which changes on every run), pass them here, and store them where the sender reads its secrets.
 
+This resource never stores the secrets, but the `random_password` resources that make them keep them in that configuration's state, so protect that state as you would the secrets. And make them random: a fingerprint is an unsalted SHA-256, quick to compute and shown in plans and state, so a secret someone could guess could be found from its fingerprint.
+
 AutoPilot never sends a secret back. It reports a fingerprint of each one instead, and the provider works out the same fingerprints from the configuration. So:
 
 - **Rotating.** Change a secret in configuration. Its fingerprint changes, so the provider plans an update that sends both secrets. AutoPilot keeps the old pair for 24 hours (`previous_secrets_until`), taking requests signed with either request secret and signing callbacks with both callback secrets, so the sender can take up the new pair at its own pace.
 - **Changed outside Terraform.** The next refresh reads a different fingerprint, and the next apply puts the configured secrets back.
 - **`secrets_wo_version`.** Change it to send the secrets whatever the fingerprints say. Sending the secrets AutoPilot already holds changes nothing.
+- **A secret that changes between plan and apply** (an ephemeral value, say) is not sent. Terraform stops the apply with "Provider produced inconsistent final plan", naming the secret's fingerprint. Use a stable value.
 
 ## Deleting
 
-Deleting a sender retires it: it can send no new tasks, while the tasks it already sent run on and their events are still delivered. AutoPilot removes it for good once none is left. Until then the name can't be used again, so replacing a sender (`-replace`, or a new `name`) with work still running under the old name fails until that work is done.
+Deleting a sender retires it: it can send no new tasks, while the tasks it already sent run on and their events are still delivered. AutoPilot removes it for good once none is left. Until then the name can't be used again, so replacing a sender with `-replace` while work is still running under its name fails until that work is done. The retired sender keeps its branch prefix until then too, so renaming a sender that sets `branch_prefix` and keeps it fails the same way (`branch_prefix_taken`); give the renamed sender a new prefix, or wait.
 
 ## Import
 
@@ -82,14 +86,14 @@ resource "autopilot_sender" "tracker" {
 > **NOTE**: [Write-only arguments](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments) are supported in Terraform 1.11 and later.
 
 - `callback_secret_wo` (String, Sensitive, [Write-only](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments)) The secret AutoPilot signs its callbacks to the sender with. At least 32 characters, and different from `request_secret_wo`. **Write-only**: sent on apply, never stored in the plan or state.
-- `name` (String) The sender's name, which is its key and the `sender.system` of its tasks: a lowercase letter, then lowercase letters, digits and `-`, at most 40 characters. AutoPilot reserves some names (such as `autopilot`). Changing it replaces the sender.
+- `name` (String) The sender's name, which is its key and the `sender.system` of its tasks: a lowercase letter, then lowercase letters, digits and `-`, at most 40 characters. AutoPilot reserves some names (such as `autopilot`). Changing it replaces the sender; see Deleting, above.
 - `request_secret_wo` (String, Sensitive, [Write-only](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments)) The secret the sender signs its calls to AutoPilot with. At least 32 characters, and different from `callback_secret_wo`. **Write-only**: sent on apply, never stored in the plan or state.
 
 ### Optional
 
-- `branch_prefix` (String) What the sender's branches start with: a lowercase word and a `/` (`^[a-z][a-z0-9-]*/$`), at most 41 characters. No two senders share one. AutoPilot's default on a new sender is the name and a `/`. When unset, the current value is kept, so set it for Terraform to own it.
+- `branch_prefix` (String) What the sender's branches start with: a lowercase word and a `/` (`^[a-z][a-z0-9-]*/$`), at most 41 characters. No two senders share one. Defaults to the name and a `/`, AutoPilot's own default, so removing it from the configuration puts that back, and a change made outside Terraform shows in the plan.
 - `callback_hosts` (Set of String) Host names the sender's callbacks may go to (over https on port 443): lowercase DNS names with at least one dot, not IP addresses and not `localhost`. At most 10. Empty (the default) for a sender that only polls.
-- `kinds` (Set of String) The kinds of task the sender may send, such as `implement-work-item`, `fix-error`, `review-pr` or `research`. Each must be one AutoPilot knows. At least one. AutoPilot's default on a new sender is `implement-work-item`. When unset, the current value is kept, so set it for Terraform to own it.
+- `kinds` (Set of String) The kinds of task the sender may send, such as `implement-work-item`, `fix-error`, `review-pr` or `research`. Each must be one AutoPilot knows. At least one. Defaults to `["implement-work-item"]`, AutoPilot's own default, so removing it from the configuration puts that back, and a change made outside Terraform shows in the plan.
 - `secrets_wo_version` (Number) A number you change to send both secrets again, whatever their fingerprints say. Rarely needed, since a changed secret already shows as a changed fingerprint.
 
 ### Read-Only

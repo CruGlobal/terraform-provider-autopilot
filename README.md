@@ -113,6 +113,23 @@ the same fingerprints from the configuration:
 - A secret that is unknown at plan time (made in the same apply) plans an
   update, and the apply sends it.
 - `secrets_wo_version` sends the secrets again whatever the fingerprints say.
+- An apply whose secrets are not the ones its plan was made with (say, from
+  an ephemeral value that changes on every run) stops before sending them.
+  Terraform itself reports it, as "Provider produced inconsistent final
+  plan" naming `request_secret_fingerprint` or `callback_secret_fingerprint`:
+  the secret changed between plan and apply. Use a stable value, such as a
+  `random_password`.
+
+Two cautions:
+
+- `autopilot_sender` never stores the secrets, but the `random_password`
+  resources that make them keep them in that configuration's state, and so
+  does whatever the sender reads them from. Protect that state as you would
+  the secrets.
+- Make the secrets random: a `random_password` of 32 characters or more. A
+  fingerprint is an unsalted SHA-256, quick to compute and shown in plans and
+  state, so a secret someone could guess could be found from its
+  fingerprint.
 
 ### How the provider talks to the API
 
