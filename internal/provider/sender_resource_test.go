@@ -163,10 +163,9 @@ func TestSender_basicLifecycle(t *testing.T) {
 				},
 			},
 			{
-				Config: senderConfig(env, name, secrets, fmt.Sprintf(`
+				Config: senderConfig(env, name, secrets, `
   callback_hosts = ["callbacks.example.com", "hooks.example.com"]
-  kinds          = ["implement-work-item", "review-pr"]
-  branch_prefix  = %q`, name+"-bots/")),
+  kinds          = ["implement-work-item", "review-pr"]`),
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{
 						plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionUpdate),
@@ -176,7 +175,7 @@ func TestSender_basicLifecycle(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(senderRes, "callback_hosts.#", "2"),
 					resource.TestCheckTypeSetElemAttr(senderRes, "kinds.*", "review-pr"),
-					resource.TestCheckResourceAttr(senderRes, "branch_prefix", name+"-bots/"),
+					resource.TestCheckResourceAttr(senderRes, "branch_prefix", name+"/"),
 					resource.TestCheckResourceAttr(senderRes, "lock_version", "2"),
 					// An update that does not touch the secrets leaves them be.
 					resource.TestCheckNoResourceAttr(senderRes, "previous_secrets_until"),
@@ -193,7 +192,7 @@ func TestSender_basicLifecycle(t *testing.T) {
 							return fmt.Errorf("If-Match = %q, want the state's lock_version, quoted", h)
 						}
 						body := requestBody(t, patches[0])
-						if got := keysOf(body); !slices.Equal(got, []string{"branch_prefix", "callback_hosts", "kinds"}) {
+						if got := keysOf(body); !slices.Equal(got, []string{"callback_hosts", "kinds"}) {
 							return fmt.Errorf("the change sent %v; it should send only what changed, and not the secrets", got)
 						}
 						return nil
@@ -313,29 +312,37 @@ func TestSender_nameTaken(t *testing.T) {
 	})
 }
 
+// A deleted sender keeps its name for good: a create with other secrets gets
+// name_retired, even while its work is still running, and one with its own
+// secrets and prefix brings it back at once.
 func TestSender_nameRetired(t *testing.T) {
 	env := newTestEnv(t)
 	env.requireFake(t)
-	env.fake.RetiredSendersLinger(true)
+	env.fake.RetiredSendersOweWork(true)
 	name := randName()
 	secrets := newSecretPair(t)
 	runTest(t, resource.TestCase{
 		Steps: []resource.TestStep{
 			{Config: senderConfig(env, name, secrets, "")},
 			{
-				// Removing the resource retires the sender; it lingers while
-				// its tasks finish.
+				// Removing the resource retires the sender; it stays retired
+				// while its tasks finish.
 				Config: env.providerConfig(),
 				Check: func(*terraform.State) error {
-					if v, ok := env.fake.Sender(name); !ok || !v.Retired {
-						return fmt.Errorf("the sender should be retired, not removed")
+					if v, ok := env.fake.Sender(name); !ok || !v.Retired || v.Tombstone {
+						return fmt.Errorf("the sender should be retired, still owing work")
 					}
 					return nil
 				},
 			},
 			{
-				Config:      senderConfig(env, name, secrets, ""),
-				ExpectError: expectErr("This sender name is retired"),
+				Config: senderConfig(env, name, newSecretPair(t), ""),
+				ExpectError: expectErr("This sender name is retired ... keeps a deleted sender's name and branch prefix for good " +
+					"... Only a create with the same two secrets and the same branch prefix brings it back"),
+			},
+			{
+				Config: senderConfig(env, name, secrets, ""),
+				Check:  resource.TestCheckResourceAttr(senderRes, "lock_version", "2"),
 			},
 		},
 	})
@@ -651,17 +658,22 @@ func TestSender_deletedOutsideTerraformIsMadeAgain(t *testing.T) {
 		Steps: []resource.TestStep{
 			{Config: senderConfig(env, name, secrets, "")},
 			{
-				PreConfig: func() { env.fake.RemoveSender(name) },
+				// Deleted outside: it drops out of state, and the create, with
+				// the same secrets, revives its tombstone at the next version.
+				PreConfig: func() { env.fake.RetireSenderOutOfBand(name) },
 				Config:    senderConfig(env, name, secrets, ""),
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionCreate)},
 				},
-				Check: func(*terraform.State) error {
-					if _, ok := env.fake.Sender(name); !ok {
-						return fmt.Errorf("the sender was not made again")
-					}
-					return nil
-				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "lock_version", "2"),
+					func(*terraform.State) error {
+						if v, ok := env.fake.Sender(name); !ok || v.Retired {
+							return fmt.Errorf("the sender was not revived")
+						}
+						return nil
+					},
+				),
 			},
 		},
 	})
@@ -821,7 +833,7 @@ func TestSender_onlyTheNotFoundRefusalMeansGone(t *testing.T) {
 				// Gone by the time the delete arrives: AutoPilot's not_found
 				// refusal, which is success.
 				PreConfig: func() {
-					env.fake.OnNextRequest(http.MethodDelete, path, func() { env.fake.RemoveSender(name) })
+					env.fake.OnNextRequest(http.MethodDelete, path, func() { env.fake.RetireSenderOutOfBand(name) })
 				},
 				Config:  senderConfig(env, name, secrets, ""),
 				Destroy: true,
@@ -845,10 +857,10 @@ func TestSender_wrongTokenIsReported(t *testing.T) {
 	})
 }
 
-// kinds and branch_prefix left out of the configuration are AutoPilot's
-// defaults, planned as such: a change made outside Terraform shows in the
-// plan, and the apply puts the defaults back.
-func TestSender_defaultsChangedOutsideTerraformArePutBack(t *testing.T) {
+// kinds left out of the configuration is AutoPilot's default, planned as
+// such: a change made outside Terraform shows in the plan, and the apply puts
+// the default back. (A branch prefix can't change at all.)
+func TestSender_defaultKindsChangedOutsideTerraformArePutBack(t *testing.T) {
 	env := newTestEnv(t)
 	env.requireFake(t)
 	name := randName()
@@ -858,10 +870,7 @@ func TestSender_defaultsChangedOutsideTerraformArePutBack(t *testing.T) {
 			{Config: senderConfig(env, name, secrets, "")},
 			{
 				PreConfig: func() {
-					env.fake.ChangeSenderOutOfBand(name, func(v *autopilottest.SenderView) {
-						v.Kinds = []string{"research"}
-						v.BranchPrefix = "elsewhere/"
-					})
+					env.fake.ChangeSenderOutOfBand(name, func(v *autopilottest.SenderView) { v.Kinds = []string{"research"} })
 				},
 				Config: senderConfig(env, name, secrets, ""),
 				ConfigPlanChecks: resource.ConfigPlanChecks{
@@ -873,8 +882,8 @@ func TestSender_defaultsChangedOutsideTerraformArePutBack(t *testing.T) {
 					resource.TestCheckResourceAttr(senderRes, "branch_prefix", name+"/"),
 					func(*terraform.State) error {
 						v, _ := env.fake.Sender(name)
-						if !slices.Equal(v.Kinds, []string{"implement-work-item"}) || v.BranchPrefix != name+"/" {
-							return fmt.Errorf("AutoPilot holds kinds %v and prefix %q", v.Kinds, v.BranchPrefix)
+						if !slices.Equal(v.Kinds, []string{"implement-work-item"}) {
+							return fmt.Errorf("AutoPilot holds kinds %v", v.Kinds)
 						}
 						return nil
 					},
@@ -884,34 +893,105 @@ func TestSender_defaultsChangedOutsideTerraformArePutBack(t *testing.T) {
 	})
 }
 
-// Removing kinds or branch_prefix from the configuration puts AutoPilot's
-// defaults back.
-func TestSender_removingKindsAndPrefixPutsDefaultsBack(t *testing.T) {
+// Removing kinds from the configuration puts AutoPilot's default back.
+func TestSender_removingKindsPutsTheDefaultBack(t *testing.T) {
 	env := newTestEnv(t)
 	name := randName()
 	secrets := newSecretPair(t)
 	runTest(t, resource.TestCase{
 		CheckDestroy: checkSendersGone(t, env),
 		Steps: []resource.TestStep{
-			{Config: senderConfig(env, name, secrets, fmt.Sprintf(`
-  kinds         = ["research", "fix-error"]
-  branch_prefix = %q`, name+"-bots/"))},
+			{Config: senderConfig(env, name, secrets, `  kinds = ["research", "fix-error"]`)},
 			{
 				Config: senderConfig(env, name, secrets, ""),
 				ConfigPlanChecks: resource.ConfigPlanChecks{
-					PreApply: []plancheck.PlanCheck{
-						plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionUpdate),
-						plancheck.ExpectKnownValue(senderRes, tfjsonpath.New("branch_prefix"), knownvalue.StringExact(name+"/")),
-					},
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionUpdate)},
 				},
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(senderRes, "kinds.#", "1"),
 					resource.TestCheckTypeSetElemAttr(senderRes, "kinds.*", "implement-work-item"),
-					resource.TestCheckResourceAttr(senderRes, "branch_prefix", name+"/"),
 				),
 			},
 			{
 				Config: senderConfig(env, name, secrets, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A branch prefix is set on create and never changes, and a deleted sender's
+// name and prefix stay taken. So a new prefix under the same name is refused
+// at plan, before anything is deleted; with a new name it replaces the sender.
+func TestSender_branchPrefixNeverChanges(t *testing.T) {
+	env := newTestEnv(t)
+	name, renamed := randName(), randName()
+	secrets := newSecretPair(t)
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkSendersGone(t, env),
+		Steps: []resource.TestStep{
+			{Config: senderConfig(env, name, secrets, fmt.Sprintf(`  branch_prefix = %q`, name+"-bots/"))},
+			{
+				Config:      senderConfig(env, name, secrets, fmt.Sprintf(`  branch_prefix = %q`, name+"-agents/")),
+				PlanOnly:    true,
+				ExpectError: expectErr(fmt.Sprintf(`A sender's branch prefix never changes ... Set branch_prefix = %q to keep it`, name+"-bots/")),
+			},
+			{
+				// Left out, it means the default, which is another prefix.
+				Config:      senderConfig(env, name, secrets, ""),
+				PlanOnly:    true,
+				ExpectError: expectErr("A sender's branch prefix never changes"),
+			},
+			{
+				Config: senderConfig(env, renamed, secrets, fmt.Sprintf(`  branch_prefix = %q`, renamed+"-bots/")),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionDestroyBeforeCreate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "name", renamed),
+					resource.TestCheckResourceAttr(senderRes, "branch_prefix", renamed+"-bots/"),
+					func(*terraform.State) error {
+						if env.live() {
+							return nil
+						}
+						if v, _ := env.fake.Sender(name); !v.Retired {
+							return fmt.Errorf("the old sender should be retired")
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// After importing a sender whose prefix isn't the default, the configuration
+// must name that prefix: the plan says which.
+func TestSender_importWithAnotherPrefix(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	env.fake.SeedSender(autopilottest.SenderSeed{Name: name, BranchPrefix: "agent/",
+		RequestSecret: secrets.request, CallbackSecret: secrets.callback})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             senderConfig(env, name, secrets, `  branch_prefix = "agent/"`),
+				ResourceName:       senderRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config:      senderConfig(env, name, secrets, ""),
+				PlanOnly:    true,
+				ExpectError: expectErr(`has the branch prefix "agent/" ... Set branch_prefix = "agent/" to keep it`),
+			},
+			{
+				Config: senderConfig(env, name, secrets, `  branch_prefix = "agent/"`),
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
 				},
@@ -1032,4 +1112,116 @@ func TestSecretsMatchPlan(t *testing.T) {
 		!strings.Contains(detail, "Nothing was sent to AutoPilot") {
 		t.Errorf("detail = %q", detail)
 	}
+}
+
+// terraform apply -replace deletes the sender and creates it again with the
+// same secrets and prefix, which brings it back at once, at the next
+// lock_version.
+func TestSender_replaceRevivesIt(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkSendersGone(t, env),
+		Steps: []resource.TestStep{
+			{Config: senderConfig(env, name, secrets, `  kinds = ["research"]`)},
+			{
+				Taint:  []string{senderRes},
+				Config: senderConfig(env, name, secrets, `  kinds = ["research"]`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionDestroyBeforeCreate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "lock_version", "2"),
+					resource.TestCheckTypeSetElemAttr(senderRes, "kinds.*", "research"),
+					func(*terraform.State) error {
+						if env.live() {
+							return nil
+						}
+						posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/senders")
+						if len(posts) != 2 || posts[1].Status != http.StatusCreated {
+							return fmt.Errorf("want the first create, then the revival; got %d creates", len(posts))
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// Renaming a sender never frees its old branch prefix, so a renamed sender
+// that keeps an explicit prefix is refused.
+func TestSender_renameKeepingThePrefixIsRefused(t *testing.T) {
+	env := newTestEnv(t)
+	first, second := randName(), randName()
+	secrets := newSecretPair(t)
+	prefix := fmt.Sprintf("  branch_prefix = %q", first+"-bots/")
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkSendersGone(t, env),
+		Steps: []resource.TestStep{
+			{Config: senderConfig(env, first, secrets, prefix)},
+			{
+				Config:      senderConfig(env, second, secrets, prefix),
+				ExpectError: expectErr("Another sender has this branch prefix ... AutoPilot never frees a branch prefix"),
+			},
+		},
+	})
+}
+
+// A secret can't be the sender's current secret for the other direction;
+// the plan says so, by fingerprint, before anything is sent.
+func TestSender_secretForTheOtherDirectionIsRefusedAtPlan(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkSendersGone(t, env),
+		Steps: []resource.TestStep{
+			{Config: senderConfig(env, name, secrets, "")},
+			{
+				Config:      senderConfig(env, name, secretPair{request: secrets.callback, callback: randSecret(t)}, ""),
+				PlanOnly:    true,
+				ExpectError: expectErr("A secret can't serve both directions ... request_secret_wo is the sender's current callback secret"),
+			},
+			{
+				Config:      senderConfig(env, name, secretPair{request: randSecret(t), callback: secrets.request}, ""),
+				PlanOnly:    true,
+				ExpectError: expectErr("callback_secret_wo is the sender's current request secret"),
+			},
+		},
+	})
+}
+
+// A rotation's overlap running out leaves the version as it is: the refresh
+// reads previous_secrets_until gone, and nothing is planned.
+func TestSender_overlapEndingIsReadNotFought(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	first, second := newSecretPair(t), newSecretPair(t)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: senderConfig(env, name, first, "")},
+			{
+				Config: senderConfig(env, name, second, ""),
+				Check:  resource.TestCheckResourceAttrSet(senderRes, "previous_secrets_until"),
+			},
+			{
+				PreConfig: func() { env.fake.ExpireOverlap(name) },
+				Config:    senderConfig(env, name, second, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "lock_version", "2"),
+					resource.TestCheckNoResourceAttr(senderRes, "previous_secrets_until"),
+				),
+			},
+			{
+				Config: senderConfig(env, name, second, `  kinds = ["research"]`),
+				Check:  resource.TestCheckResourceAttr(senderRes, "lock_version", "3"),
+			},
+		},
+	})
 }

@@ -3,6 +3,8 @@ name: acceptance
 # Acceptance tests run the provider's test suite against a LIVE AutoPilot
 # instead of the in-process fake API that `ci.yml` uses. They make real
 # senders and apps (each with a random tfacc- name) and remove them again.
+# A deleted sender's name is never freed, so each run leaves its senders as
+# tombstones on the target; the random names never collide.
 #
 # This workflow never runs on pull_request or push. It runs:
 #
@@ -25,8 +27,10 @@ name: acceptance
 # and, optionally, this repository variable:
 #
 #   AUTOPILOT_ACC_REPOS  comma-separated owner/name repositories the target
-#                        AutoPilot lets an app own. Without it the app tests
-#                        run without repositories.
+#                        AutoPilot lets an app own: within its allowed list,
+#                        which also limits what its tasks may reach, so keep
+#                        it to repositories made for testing. Without it the
+#                        app tests run without repositories.
 
 on:
   schedule:

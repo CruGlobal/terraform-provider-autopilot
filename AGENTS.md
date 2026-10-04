@@ -93,6 +93,13 @@ the examples, and the generated docs. Things worth knowing:
   `PATCH` replaces a list as sent, so a change of case alone is a change.
   Where a rule says "without regard to case" (repositories), that is how
   AutoPilot compares values and keeps them unique.
+- A deleted sender's name and branch prefix are never freed (once it owes
+  nothing it is a tombstone). Only a create with the same two secrets and
+  the same prefix revives it, at once, at the next `lock_version`, which is
+  what `terraform apply -replace` sends. A branch prefix never changes, so
+  the sender's `ModifyPlan` replaces the sender for a new prefix only with a
+  new name, and refuses one under the same name. Live test runs leave
+  tombstones behind; that is expected.
 - A sender's secrets are write-only (`*_wo`). The plan compares
   `client.Fingerprint` of the configured secrets with the stored
   fingerprints; see the comment at the top of `sender_resource.go`.

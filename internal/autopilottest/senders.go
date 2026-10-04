@@ -43,7 +43,15 @@ type senderRecord struct {
 	previousSecretsUntil   *time.Time
 	lockVersion            int64
 	createdAt, updatedAt   time.Time
-	retired                bool
+	// retired: deleted; it reads as 404. owesWork: it still has tasks
+	// running or events undelivered. tombstone: it owed nothing on a
+	// dispatcher pass, so its secrets were wiped and only its name, branch
+	// prefix and fingerprints are kept, for good.
+	retired    bool
+	owesWork   bool
+	tombstone  bool
+	requestFP  string
+	callbackFP string
 }
 
 // SenderView is a copy of a stored sender, secrets included, for assertions.
@@ -59,6 +67,7 @@ type SenderView struct {
 	PreviousSecretsUntil   *time.Time
 	LockVersion            int64
 	Retired                bool
+	Tombstone              bool
 }
 
 func (rec *senderRecord) view() SenderView {
@@ -67,6 +76,7 @@ func (rec *senderRecord) view() SenderView {
 		BranchPrefix: rec.branchPrefix, RequestSecret: rec.requestSecret, CallbackSecret: rec.callbackSecret,
 		PreviousRequestSecret: rec.previousRequestSecret, PreviousCallbackSecret: rec.previousCallbackSecret,
 		PreviousSecretsUntil: rec.previousSecretsUntil, LockVersion: rec.lockVersion, Retired: rec.retired,
+		Tombstone: rec.tombstone,
 	}
 }
 
@@ -157,18 +167,89 @@ func (s *Server) ChangeSenderOutOfBand(name string, change func(v *SenderView)) 
 		rec.previousSecretsUntil = &until
 		rec.secretsChangedAt = now
 	}
-	rec.callbackHosts, rec.kinds, rec.branchPrefix = sortedUnique(v.CallbackHosts), sortedUnique(v.Kinds), v.BranchPrefix
+	// A branch prefix never changes, from outside or not.
+	rec.callbackHosts, rec.kinds = sortedUnique(v.CallbackHosts), sortedUnique(v.Kinds)
 	rec.requestSecret, rec.callbackSecret = v.RequestSecret, v.CallbackSecret
 	rec.lockVersion++
 	rec.updatedAt = now
 }
 
-// RemoveSender removes a sender for good, as AutoPilot does once a retired
-// sender's tasks are all finished, or as a delete from outside would.
-func (s *Server) RemoveSender(name string) {
+// RetireSenderOutOfBand retires a sender as a delete from outside this
+// Terraform would.
+func (s *Server) RetireSenderOutOfBand(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.senders, name)
+	if rec, ok := s.senders[name]; ok && !rec.retired {
+		s.retireLocked(rec)
+	}
+}
+
+// FinishRetiredWork ends a retired sender's last work, and runs the
+// dispatcher pass that turns it into a tombstone.
+func (s *Server) FinishRetiredWork(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rec, ok := s.senders[name]; ok && rec.retired {
+		rec.owesWork = false
+		rec.entomb()
+	}
+}
+
+// ExpireOverlap ends a rotation's overlap as AutoPilot does when it runs out
+// on its own, which leaves lock_version as it is.
+func (s *Server) ExpireOverlap(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rec, ok := s.senders[name]; ok && rec.previousSecretsUntil != nil {
+		rec.clearOverlap()
+	}
+}
+
+// retireLocked retires a sender. One that owes nothing becomes a tombstone on
+// AutoPilot's next dispatcher pass, which the fake runs at once.
+func (s *Server) retireLocked(rec *senderRecord) {
+	rec.retired = true
+	rec.owesWork = s.retiredOweWork
+	if !rec.owesWork {
+		rec.entomb()
+	}
+}
+
+// entomb wipes a retired sender's secrets, keeping its name, its branch prefix
+// and its two fingerprints for good.
+func (rec *senderRecord) entomb() {
+	if rec.tombstone {
+		return
+	}
+	rec.requestFP, rec.callbackFP = Fingerprint(rec.requestSecret), Fingerprint(rec.callbackSecret)
+	rec.requestSecret, rec.callbackSecret = "", ""
+	rec.previousRequestSecret, rec.previousCallbackSecret = "", ""
+	rec.previousSecretsUntil = nil
+	rec.tombstone = true
+}
+
+// clearOverlap drops a rotation's old pair.
+func (rec *senderRecord) clearOverlap() {
+	rec.previousRequestSecret, rec.previousCallbackSecret = "", ""
+	rec.previousSecretsUntil = nil
+}
+
+// endExpiredOverlaps ends every overlap that has run out, as AutoPilot does
+// within 30 seconds of the end. That leaves lock_version as it is.
+func (s *Server) endExpiredOverlaps(now time.Time) {
+	for _, rec := range s.senders {
+		if !rec.retired && rec.previousSecretsUntil != nil && !now.Before(*rec.previousSecretsUntil) {
+			rec.clearOverlap()
+		}
+	}
+}
+
+// fingerprints are a sender's secrets' fingerprints, kept by a tombstone.
+func (rec *senderRecord) fingerprints() (request, callback string) {
+	if rec.tombstone {
+		return rec.requestFP, rec.callbackFP
+	}
+	return Fingerprint(rec.requestSecret), Fingerprint(rec.callbackSecret)
 }
 
 // --- routes -------------------------------------------------------------------
@@ -238,11 +319,7 @@ func (s *Server) senderRoutes(mux *http.ServeMux) {
 			writeError(w, *ref)
 			return
 		}
-		if s.retiredLinger {
-			rec.retired = true
-		} else {
-			delete(s.senders, name)
-		}
+		s.retireLocked(rec)
 		w.WriteHeader(http.StatusNoContent)
 	})
 
@@ -254,9 +331,9 @@ func (s *Server) senderRoutes(mux *http.ServeMux) {
 			writeError(w, notFound("sender"))
 			return
 		}
+		// Ending an overlap on request is a recorded change.
 		if rec.previousSecretsUntil != nil {
-			rec.previousRequestSecret, rec.previousCallbackSecret = "", ""
-			rec.previousSecretsUntil = nil
+			rec.clearOverlap()
 			rec.lockVersion++
 			rec.updatedAt = time.Now()
 		}
@@ -364,9 +441,6 @@ func (rec *senderRecord) holds(f senderFields) bool {
 	if f.kinds != nil && !slices.Equal(f.kinds, rec.kinds) {
 		return false
 	}
-	if f.branchPrefix != nil && *f.branchPrefix != rec.branchPrefix {
-		return false
-	}
 	if f.requestSecret != nil && (Fingerprint(*f.requestSecret) != Fingerprint(rec.requestSecret) ||
 		Fingerprint(*f.callbackSecret) != Fingerprint(rec.callbackSecret)) {
 		return false
@@ -404,6 +478,11 @@ func (s *Server) createSender(r *http.Request) (int, map[string]any, *refusal) {
 	if ref != nil {
 		return 0, nil, ref
 	}
+	for _, k := range senderReadOnly {
+		if _, ok := obj[k]; ok {
+			return 0, nil, invalid("/"+k, "this field is read-only")
+		}
+	}
 	if ref := refuseUnknown(obj, "", "name", "callback_hosts", "kinds", "branch_prefix", "request_secret", "callback_secret"); ref != nil {
 		return 0, nil, ref
 	}
@@ -437,13 +516,31 @@ func (s *Server) createSender(r *http.Request) (int, map[string]any, *refusal) {
 		kinds = DefaultKinds
 	}
 	prefix := name + "/"
+	prefixField := "/name" // the default prefix is the name's
 	if f.branchPrefix != nil {
-		prefix = *f.branchPrefix
+		prefix, prefixField = *f.branchPrefix, "/branch_prefix"
 	}
+	prefixTaken := &refusal{http.StatusConflict, "branch_prefix_taken", "another sender, or a tombstone, has this branch prefix", prefixField}
 	now := time.Now()
 	if existing, ok := s.senders[name]; ok {
 		if existing.retired {
-			return 0, nil, &refusal{http.StatusConflict, "name_retired", "this sender is retired and still finishing its tasks", "/name"}
+			// Only the same sender comes back, at once, retired or a
+			// tombstone: a create with both of its secrets and its prefix.
+			requestFP, callbackFP := existing.fingerprints()
+			if Fingerprint(*f.requestSecret) != requestFP || Fingerprint(*f.callbackSecret) != callbackFP ||
+				prefix != existing.branchPrefix {
+				return 0, nil, &refusal{http.StatusConflict, "name_retired", "this name belongs to a deleted sender", "/name"}
+			}
+			if s.prefixTaken(prefix, name) {
+				return 0, nil, prefixTaken
+			}
+			rec := &senderRecord{
+				name: name, callbackHosts: sortedUnique(hosts), kinds: sortedUnique(kinds), branchPrefix: prefix,
+				requestSecret: *f.requestSecret, callbackSecret: *f.callbackSecret,
+				secretsChangedAt: now, lockVersion: existing.lockVersion + 1, createdAt: existing.createdAt, updatedAt: now,
+			}
+			s.senders[name] = rec
+			return http.StatusCreated, rec.json(now), nil
 		}
 		same := slices.Equal(existing.callbackHosts, sortedUnique(hosts)) && slices.Equal(existing.kinds, sortedUnique(kinds)) &&
 			existing.branchPrefix == prefix && existing.requestSecret == *f.requestSecret && existing.callbackSecret == *f.callbackSecret
@@ -453,7 +550,7 @@ func (s *Server) createSender(r *http.Request) (int, map[string]any, *refusal) {
 		return http.StatusOK, existing.json(now), nil
 	}
 	if s.prefixTaken(prefix, name) {
-		return 0, nil, &refusal{http.StatusConflict, "branch_prefix_taken", "another sender has this branch prefix", "/branch_prefix"}
+		return 0, nil, prefixTaken
 	}
 	rec := &senderRecord{
 		name: name, callbackHosts: sortedUnique(hosts), kinds: sortedUnique(kinds), branchPrefix: prefix,
@@ -490,6 +587,9 @@ func (s *Server) patchSender(r *http.Request) (map[string]any, *refusal) {
 	if ref := refuseUnknown(obj, "", "callback_hosts", "kinds", "branch_prefix", "request_secret", "callback_secret"); ref != nil {
 		return nil, ref
 	}
+	if _, ok := obj["branch_prefix"]; ok {
+		return nil, invalid("/branch_prefix", "a branch prefix is set on create and never changes")
+	}
 	f, ref := readSenderFields(obj)
 	if ref != nil {
 		return nil, ref
@@ -501,8 +601,12 @@ func (s *Server) patchSender(r *http.Request) (map[string]any, *refusal) {
 		}
 		return nil, staleRefusal()
 	}
-	if f.branchPrefix != nil && s.prefixTaken(*f.branchPrefix, name) {
-		return nil, &refusal{http.StatusConflict, "branch_prefix_taken", "another sender has this branch prefix", "/branch_prefix"}
+	// No value ever serves both directions.
+	if f.requestSecret != nil && *f.requestSecret == rec.callbackSecret {
+		return nil, invalid("/request_secret", "a secret can't be the sender's current secret for the other direction")
+	}
+	if f.callbackSecret != nil && *f.callbackSecret == rec.requestSecret {
+		return nil, invalid("/callback_secret", "a secret can't be the sender's current secret for the other direction")
 	}
 
 	changed := false
@@ -511,9 +615,6 @@ func (s *Server) patchSender(r *http.Request) (map[string]any, *refusal) {
 	}
 	if f.kinds != nil && !slices.Equal(f.kinds, rec.kinds) {
 		rec.kinds, changed = f.kinds, true
-	}
-	if f.branchPrefix != nil && *f.branchPrefix != rec.branchPrefix {
-		rec.branchPrefix, changed = *f.branchPrefix, true
 	}
 	if f.requestSecret != nil && (*f.requestSecret != rec.requestSecret || *f.callbackSecret != rec.callbackSecret) {
 		rec.previousRequestSecret, rec.previousCallbackSecret = rec.requestSecret, rec.callbackSecret

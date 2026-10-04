@@ -238,8 +238,14 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 				return f, invalid("/repos/"+itoa(i), "a repository is owner/name")
 			}
 		}
-		// Matched without regard to case, and kept unique that way, as sent.
-		f.repos = sortedUniqueFold(repos)
+		// Matched without regard to case: a repository named twice in
+		// different cases is refused; named twice exactly, it is kept once.
+		f.repos = sortedUnique(repos)
+		for i := 1; i < len(f.repos); i++ {
+			if strings.EqualFold(f.repos[i-1], f.repos[i]) {
+				return f, invalid("/repos", "the list names one repository twice, in different cases")
+			}
+		}
 	}
 	if raw, ok := obj["accepts"]; ok {
 		var entries []map[string]json.RawMessage
@@ -250,7 +256,7 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 			return f, invalid("/accepts", "an app accepts at most 20 senders")
 		}
 		f.accepts = []Accept{}
-		seen := map[string]bool{}
+		seen := map[string]Accept{}
 		for i, e := range entries {
 			at := "/accepts/" + itoa(i)
 			if ref := refuseUnknown(e, at, acceptWritable...); ref != nil {
@@ -267,10 +273,6 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 			if !senderNamePattern.MatchString(sender) {
 				return f, invalid(at+"/sender", "a sender's name is a lowercase letter, then lowercase letters, digits and -, at most 40 characters")
 			}
-			if seen[sender] {
-				return f, invalid(at+"/sender", "an app accepts each sender at most once")
-			}
-			seen[sender] = true
 			rawKinds, ok := e["kinds"]
 			if !ok {
 				return f, invalid(at+"/kinds", "an accepted sender needs at least one kind")
@@ -296,7 +298,17 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 			if canDecide && !slices.Contains(kinds, reviewKind) {
 				return f, invalid(at+"/can_decide", "can_decide is only for an entry whose kinds include review-pr")
 			}
-			f.accepts = append(f.accepts, Accept{Sender: sender, Kinds: sortedUnique(kinds), CanDecide: canDecide})
+			entry := Accept{Sender: sender, Kinds: sortedUnique(kinds), CanDecide: canDecide}
+			// An entry sent twice exactly is kept once; two different entries
+			// for one sender are refused.
+			if prior, dup := seen[sender]; dup {
+				if prior.CanDecide == entry.CanDecide && slices.Equal(prior.Kinds, entry.Kinds) {
+					continue
+				}
+				return f, invalid(at+"/sender", "an app accepts each sender at most once")
+			}
+			seen[sender] = entry
+			f.accepts = append(f.accepts, entry)
 		}
 		f.accepts = sortAccepts(f.accepts)
 	}
@@ -354,6 +366,11 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 	obj, ref := readObject(r)
 	if ref != nil {
 		return 0, nil, ref
+	}
+	for _, k := range appReadOnly {
+		if _, ok := obj[k]; ok {
+			return 0, nil, invalid("/"+k, "this field is read-only")
+		}
 	}
 	if ref := refuseUnknown(obj, "", appCreateFields...); ref != nil {
 		return 0, nil, ref

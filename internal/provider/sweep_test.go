@@ -116,8 +116,8 @@ func TestSweepers_removeOnlyTestRecords(t *testing.T) {
 	if _, ok := env.fake.App("tfacc-left-behind"); ok {
 		t.Error("the test app is still there")
 	}
-	if _, ok := env.fake.Sender("tfacc-left-behind"); ok {
-		t.Error("the test sender is still there")
+	if v, _ := env.fake.Sender("tfacc-left-behind"); !v.Retired {
+		t.Error("the test sender was not retired")
 	}
 	if _, ok := env.fake.App("billing"); !ok {
 		t.Error("a real app was removed")

@@ -137,12 +137,20 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"stops the apply with \"Provider produced inconsistent final plan\", naming the secret's fingerprint. Use " +
 			"a stable value.\n\n" +
 			"## Deleting\n\n" +
-			"Deleting a sender retires it: it can send no new tasks, while the tasks it already sent run on and " +
-			"their events are still delivered. AutoPilot removes it for good once none is left. Until then the name " +
-			"can't be used again, so replacing a sender with `-replace` while work is still running under its name " +
-			"fails until that work is done. The retired sender keeps its branch prefix until then too, so renaming a " +
-			"sender that sets `branch_prefix` and keeps it fails the same way (`branch_prefix_taken`); give the " +
-			"renamed sender a new prefix, or wait.\n\n" +
+			"Deleting a sender retires it, and it reads as gone from then on. It can send no new tasks, and its " +
+			"queued tasks are refused, while its running tasks run on and their events are still delivered. To stop " +
+			"its running tasks too, as for a sender whose secrets have leaked, also take it out of the apps' " +
+			"`accepts`.\n\n" +
+			"A deleted sender's **name and branch prefix are never freed**, so no other system can take them over, " +
+			"or whatever the apps accept from that name (once it owes nothing, AutoPilot keeps a tombstone of it). " +
+			"Only the same sender can come back: a create with the same name, the same two secrets and the same " +
+			"branch prefix revives it. So:\n\n" +
+			"- **`terraform apply -replace`** deletes the sender and creates it again with the same secrets and " +
+			"prefix, which brings it back at once, even while its work is still running.\n" +
+			"- **Renaming** a sender gives it a new name, and the old one stays taken. Its old branch prefix stays " +
+			"taken too, so a renamed sender that sets `branch_prefix` needs a new prefix (one left to its default, " +
+			"the new name and a `/`, already has one).\n" +
+			"- **`create_before_destroy`** doesn't fit a sender: the name is its key, so there can't be two at once.\n\n" +
 			"## Import\n\n" +
 			"Import by name: `terraform import autopilot_sender.tracker tracker`. The secrets can't be imported. Put " +
 			"them in configuration: when their fingerprints match the stored ones the next plan is empty, and when " +
@@ -188,8 +196,11 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"branch_prefix": schema.StringAttribute{
 				MarkdownDescription: "What the sender's branches start with: a lowercase word and a `/` (`^[a-z][a-z0-9-]*/$`), " +
 					"at most 41 characters. No two senders share one. Defaults to the name and a `/`, AutoPilot's own " +
-					"default, so removing it from the configuration puts that back, and a change made outside Terraform " +
-					"shows in the plan.",
+					"default.\n\n" +
+					"It is set when the sender is created and **never changes**. A deleted sender's name and prefix " +
+					"stay taken for good, so a different prefix means a new sender with a new `name`: the plan refuses a " +
+					"new prefix under the same name (keep it, or change `name` too, which replaces the sender). After an " +
+					"import, set it to the sender's current prefix unless that is the default.",
 				Optional: true,
 				Computed: true,
 				Validators: []validator.String{
@@ -303,17 +314,48 @@ func (r *senderResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 		if resp.Diagnostics.HasError() {
 			return
 		}
+		// No value may ever serve both directions: AutoPilot refuses a new
+		// secret that is the sender's current secret for the other one.
+		// Fingerprints show it here, before anything is sent.
+		if secretsKnown {
+			if plan.RequestSecretFingerprint.Equal(state.CallbackSecretFingerprint) {
+				resp.Diagnostics.AddAttributeError(path.Root("request_secret_wo"), "A secret can't serve both directions",
+					"request_secret_wo is the sender's current callback secret (their fingerprints match). AutoPilot "+
+						"never lets one value serve both directions. Make each secret from its own random_password.")
+			}
+			if plan.CallbackSecretFingerprint.Equal(state.RequestSecretFingerprint) {
+				resp.Diagnostics.AddAttributeError(path.Root("callback_secret_wo"), "A secret can't serve both directions",
+					"callback_secret_wo is the sender's current request secret (their fingerprints match). AutoPilot "+
+						"never lets one value serve both directions. Make each secret from its own random_password.")
+			}
+			if resp.Diagnostics.HasError() {
+				return
+			}
+		}
+		// A branch prefix never changes. A new one means a new sender, which
+		// needs a new name too: replacing a sender under its own name with
+		// another prefix would retire it, and its name and prefix stay taken,
+		// so the create that follows could only fail.
+		if known(plan.BranchPrefix) && !plan.BranchPrefix.Equal(state.BranchPrefix) {
+			if plan.Name.Equal(state.Name) {
+				current := state.BranchPrefix.ValueString()
+				resp.Diagnostics.AddAttributeError(path.Root("branch_prefix"), "A sender's branch prefix never changes",
+					fmt.Sprintf("Sender %q has the branch prefix %q, and AutoPilot never changes a sender's prefix. A "+
+						"deleted sender's name and prefix stay taken for good, so a new prefix means a new sender with a "+
+						"new name. Set branch_prefix = %q to keep it (left out, it means the default, the name and a /), "+
+						"or change name as well.", state.Name.ValueString(), current, current))
+				return
+			}
+			resp.RequiresReplace = append(resp.RequiresReplace, path.Root("branch_prefix"))
+		}
 		rotating := !secretsKnown || !plan.RequestSecretFingerprint.Equal(state.RequestSecretFingerprint) ||
 			!plan.CallbackSecretFingerprint.Equal(state.CallbackSecretFingerprint)
+		// A rotation is a change the framework could not see when it planned.
+		// Marking what it moves as unknown is what turns it into a planned
+		// update; a computed attribute left at its prior value would make the
+		// apply an inconsistent result.
 		if rotating {
 			plan.SecretsChangedAt = types.StringUnknown()
-		}
-		// A rotation, or a branch prefix put back to its default, is a change
-		// the framework could not see when it planned. Marking what the change
-		// moves as unknown is what turns it into a planned update; a computed
-		// attribute left at its prior value would make the apply an
-		// inconsistent result.
-		if rotating || !plan.BranchPrefix.Equal(state.BranchPrefix) {
 			plan.PreviousSecretsUntil = types.StringUnknown()
 			plan.LockVersion = types.Int64Unknown()
 		}
@@ -413,16 +455,24 @@ func addSenderCreateError(diags *diag.Diagnostics, name string, err error) {
 				"choose another name.\n\nAutoPilot said: %s", name, name, apiMessage(err)))
 	case client.HasCode(err, client.CodeNameRetired):
 		diags.AddAttributeError(path.Root("name"), "This sender name is retired",
-			fmt.Sprintf("A sender named %q was deleted, and AutoPilot is still finishing the tasks it sent or "+
-				"delivering their events. The name can be used again once they are done. Apply again later, or choose "+
-				"another name.\n\nAutoPilot said: %s", name, apiMessage(err)))
+			fmt.Sprintf("A sender named %q was deleted, and AutoPilot keeps a deleted sender's name and branch prefix "+
+				"for good. Only a create with the same two secrets and the same branch prefix brings it back (which "+
+				"is what `terraform apply -replace` sends), and this one's differ. Use the old secrets and prefix, or "+
+				"choose another name.\n\nAutoPilot said: %s", name, apiMessage(err)))
 	case client.HasCode(err, client.CodeNameReserved):
 		diags.AddAttributeError(path.Root("name"), "This sender name is reserved",
 			fmt.Sprintf("AutoPilot keeps the name %q for itself. Choose another name.\n\nAutoPilot said: %s", name, apiMessage(err)))
 	case client.HasCode(err, client.CodeBranchPrefixTaken):
-		diags.AddAttributeError(path.Root("branch_prefix"), "Another sender has this branch prefix",
-			"No two senders share a branch prefix, so one sender's task can never build on another's pull request. "+
-				"Set `branch_prefix` to one of this sender's own.\n\nAutoPilot said: "+apiMessage(err))
+		// AutoPilot points at /name when the prefix was the default, the
+		// name's.
+		at, which := path.Root("branch_prefix"), "This branch prefix"
+		if e, ok := client.AsError(err); ok && e.Field == "/name" {
+			at, which = path.Root("name"), "This sender's default branch prefix, its name and a /,"
+		}
+		diags.AddAttributeError(at, "Another sender has this branch prefix",
+			which+" is taken by another sender, or was by a sender since deleted: AutoPilot never frees a "+
+				"branch prefix, so one sender's task can never build on another's pull request. Set `branch_prefix` "+
+				"to one of this sender's own.\n\nAutoPilot said: "+apiMessage(err))
 	default:
 		addAPIError(diags, summary, err, senderAPIFields)
 	}
@@ -470,9 +520,6 @@ func (r *senderResource) Update(ctx context.Context, req resource.UpdateRequest,
 	}
 	if !plan.Kinds.IsUnknown() && !plan.Kinds.IsNull() && !plan.Kinds.Equal(state.Kinds) {
 		spec.Kinds = stringsFromSet(ctx, plan.Kinds, "kinds", &resp.Diagnostics)
-	}
-	if known(plan.BranchPrefix) && !plan.BranchPrefix.Equal(state.BranchPrefix) {
-		spec.BranchPrefix = plan.BranchPrefix.ValueStringPointer()
 	}
 	requestSecret, callbackSecret := config.RequestSecretWO.ValueString(), config.CallbackSecretWO.ValueString()
 	if client.Fingerprint(requestSecret) != state.RequestSecretFingerprint.ValueString() ||

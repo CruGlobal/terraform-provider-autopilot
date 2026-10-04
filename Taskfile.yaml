@@ -85,13 +85,15 @@ tasks:
 
   # Acceptance tests run the same test bodies as `task test`, but against a
   # live AutoPilot instead of the fake. Every record they make has a random
-  # name and is removed when the test ends.
+  # tfacc- name and is removed when the test ends (a deleted sender stays as
+  # a tombstone, since its name is never freed).
   #
   #   AUTOPILOT_ENDPOINT   base URL, for example https://autopilot.example.com
   #   AUTOPILOT_TOKEN      an admin token for that AutoPilot
   #   AUTOPILOT_ACC_REPOS  optional; comma-separated owner/name repositories
-  #                        the test AutoPilot lets an app own. Without it, the
-  #                        app tests run live without repositories.
+  #                        the test AutoPilot lets an app own (its allowed
+  #                        list, which also limits what its tasks may reach).
+  #                        Without it, the app tests run without repositories.
   testacc:
     desc: Run acceptance tests against a live AutoPilot
     env:

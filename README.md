@@ -162,12 +162,34 @@ Two cautions:
   backoff, and so is `429` (honouring `Retry-After`) should AutoPilot ever
   send it. The caller's own cancellation is not retried.
 - AutoPilot's `404 not_found` refusal means the record is gone (a deleted
-  sender reads that way while AutoPilot finishes its tasks), and removes it
-  from state. Any other `404` (a proxy, a page that isn't AutoPilot's, an
-  endpoint with the wrong path) is an error, so a misconfigured endpoint can
-  never make Terraform forget a record.
+  sender reads that way), and removes it from state. Any other `404` (a
+  proxy, a page that isn't AutoPilot's, an endpoint with the wrong path) is
+  an error, so a misconfigured endpoint can never make Terraform forget a
+  record. A `405 method_not_allowed` means the AutoPilot is likely older than
+  the provider.
 - An argument left out of an `autopilot_app` is not sent on create; removing
   one later sends it as `[]`, so the app holds what the configuration says.
+
+### Deleting a sender
+
+Deleting a sender retires it: it reads as gone, can send no new tasks, and
+its queued tasks are refused, while its running tasks run on. (To stop those
+too, as for a sender whose secrets have leaked, also take it out of the
+apps' `accepts`.) **A deleted sender's name and branch prefix are never
+freed**, so no other system can take them over (once it owes nothing,
+AutoPilot keeps a tombstone of it). Only the same sender can come back: a
+create with the same name, the same two secrets and the same branch prefix
+revives it, at once. So:
+
+- `terraform apply -replace` of a sender works, even while its work is
+  still running: it deletes the sender and creates it again with the same
+  secrets and prefix.
+- A sender's `branch_prefix` is set when it is created and never changes.
+  A different prefix means a new sender with a new `name`; the plan refuses
+  a new prefix under the same name, before anything is deleted.
+- Renaming a sender leaves the old name, and its branch prefix, taken. A
+  renamed sender that sets `branch_prefix` needs a new one.
+- `create_before_destroy` doesn't fit either resource: the name is the key.
 
 ### Importing
 
@@ -223,10 +245,15 @@ real senders and apps live on. Every record they make has a random name
 starting with `tfacc-` and is removed when the test ends; `task sweep`
 removes any a failed run left behind. The scheduled acceptance workflow
 probes the target first, and skips the run (with a "target asleep" note)
-when it doesn't answer. An AutoPilot used for tests may limit the
-repositories an app can own; set `AUTOPILOT_ACC_REPOS` to a comma-separated
-list of `owner/name` repositories it allows, or the app tests run without
-repositories.
+when it doesn't answer. Since a deleted sender's name is never freed, each
+live run leaves its test senders behind as tombstones; their random names
+never collide.
+
+An AutoPilot used for tests may limit the repositories an app can own (the
+same list limits the repositories its tasks may reach, so it should hold
+only repositories kept for testing). Set `AUTOPILOT_ACC_REPOS` to a
+comma-separated list of `owner/name` repositories within it, or the app
+tests run without repositories.
 
 ```sh
 export TF_ACC=1

@@ -578,3 +578,24 @@ func TestSortedUniqueKeepsNilApartFromEmpty(t *testing.T) {
 		t.Error("an empty list must stay an empty, non-nil list (a field sent as [])")
 	}
 }
+
+// A sender's branch prefix never changes, so a change can't send one.
+func TestUpdateSender_RefusesABranchPrefix(t *testing.T) {
+	calls := 0
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { calls++ }))
+	prefix := "bots/"
+	if _, err := c.UpdateSender(context.Background(), "tracker", SenderSpec{BranchPrefix: &prefix}, 1); err == nil || calls != 0 {
+		t.Errorf("err = %v after %d calls", err, calls)
+	}
+}
+
+func TestDo_MethodNotAllowedRefusal(t *testing.T) {
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Allow", "GET, POST")
+		writeRefusal(w, http.StatusMethodNotAllowed, "method_not_allowed", "this route doesn't take PATCH", "")
+	}))
+	_, err := c.GetApp(context.Background(), "billing")
+	if !HasCode(err, CodeMethodNotAllowed) || IsNotFound(err) {
+		t.Errorf("err = %v", err)
+	}
+}

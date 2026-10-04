@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -51,9 +52,9 @@ type Server struct {
 	apps    map[string]*appRecord
 	// reserved are the sender names a create is refused for.
 	reserved map[string]bool
-	// retiredLinger leaves a deleted sender retired (still finishing its
-	// tasks) instead of removing it at once.
-	retiredLinger bool
+	// retiredOweWork leaves a deleted sender retired, still finishing its
+	// tasks, until FinishRetiredWork. Otherwise it becomes a tombstone at once.
+	retiredOweWork bool
 
 	// Fault injection.
 	throttleNext    int
@@ -93,9 +94,21 @@ func New(t testing.TB) *Server {
 	mux := http.NewServeMux()
 	s.senderRoutes(mux)
 	s.appRoutes(mux)
-	// A path AutoPilot has no route for gets a plain 404, not the not_found
-	// refusal that means a record is gone.
-	mux.HandleFunc("/", http.NotFound)
+	// Under /v1/admin, a route that doesn't take the method answers 405 with
+	// Allow, and a path with no route answers the not_found refusal. Outside
+	// it, a plain 404, as a path that isn't AutoPilot's admin API would get.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/admin" && !strings.HasPrefix(r.URL.Path, "/v1/admin/") {
+			http.NotFound(w, r)
+			return
+		}
+		if allow := allowedMethods(r.URL.Path); allow != "" {
+			w.Header().Set("Allow", allow)
+			writeError(w, refusal{http.StatusMethodNotAllowed, "method_not_allowed", "this route doesn't take " + r.Method, ""})
+			return
+		}
+		writeError(w, refusal{http.StatusNotFound, "not_found", "no such route", ""})
+	})
 	s.Server = httptest.NewServer(s.middleware(mux))
 	t.Cleanup(s.Close)
 	return s
@@ -111,13 +124,13 @@ func (s *Server) ReserveName(name string) {
 	s.reserved[name] = true
 }
 
-// RetiredSendersLinger makes a deleted sender stay retired, as one with tasks
-// still running does, instead of being removed at once. A create for its name
-// is refused with name_retired until RemoveSender.
-func (s *Server) RetiredSendersLinger(on bool) {
+// RetiredSendersOweWork makes a deleted sender keep owing work (tasks
+// running, events undelivered), so it stays retired, rather than a
+// tombstone, until FinishRetiredWork.
+func (s *Server) RetiredSendersOweWork(on bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.retiredLinger = on
+	s.retiredOweWork = on
 }
 
 // ThrottleNext makes the next n requests answer 429 with the given Retry-After.
@@ -153,6 +166,26 @@ func (s *Server) DropNextResponse(method, pathSuffix string) {
 	defer s.mu.Unlock()
 	s.dropResponses = append(s.dropResponses, requestHook{method: method, path: pathSuffix})
 }
+
+// allowedMethods lists the methods an admin route takes, or "" for a path
+// with no route.
+func allowedMethods(path string) string {
+	switch {
+	case collectionRoute.MatchString(path):
+		return "GET, POST"
+	case recordRoute.MatchString(path):
+		return "GET, PATCH, DELETE"
+	case previousSecretsRoute.MatchString(path):
+		return "DELETE"
+	}
+	return ""
+}
+
+var (
+	collectionRoute      = regexp.MustCompile(`^/v1/admin/(senders|apps)$`)
+	recordRoute          = regexp.MustCompile(`^/v1/admin/(senders|apps)/[^/]+$`)
+	previousSecretsRoute = regexp.MustCompile(`^/v1/admin/senders/[^/]+/previous-secrets$`)
+)
 
 // RespondNext answers the next request with the given method whose path ends
 // in pathSuffix with this raw response, without AutoPilot seeing it, as a
@@ -253,7 +286,9 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		token := s.token
 		s.mu.Unlock()
 
-		if r.Header.Get("Authorization") != "Bearer "+token {
+		scheme, given, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+		if !strings.EqualFold(scheme, "Bearer") || given != token {
+			rec.Header().Set("WWW-Authenticate", "Bearer")
 			writeError(rec, refusal{http.StatusUnauthorized, "unauthorized", "a missing or wrong admin token", ""})
 			return
 		}
@@ -263,6 +298,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		}
 
 		s.mu.Lock()
+		s.endExpiredOverlaps(time.Now())
 		for i, h := range s.beforeRequest {
 			if h.method == r.Method && h.path == r.URL.Path {
 				s.beforeRequest = append(s.beforeRequest[:i], s.beforeRequest[i+1:]...)
@@ -360,8 +396,7 @@ func ifMatch(r *http.Request, lockVersion int64, required bool) *refusal {
 		}
 		return nil
 	}
-	v, err := strconv.Unquote(h)
-	if err != nil || v != strconv.FormatInt(lockVersion, 10) {
+	if v := ifMatchValue(h); v != strconv.FormatInt(lockVersion, 10) {
 		return staleRefusal()
 	}
 	return nil
@@ -378,11 +413,18 @@ func changePrecondition(r *http.Request, lockVersion int64) (behind bool, ref *r
 	} else if ref.code != "stale_object" {
 		return false, ref
 	}
-	v, err := strconv.Unquote(r.Header.Get("If-Match"))
-	if err == nil && lockVersion > 1 && v == strconv.FormatInt(lockVersion-1, 10) {
+	if lockVersion > 1 && ifMatchValue(r.Header.Get("If-Match")) == strconv.FormatInt(lockVersion-1, 10) {
 		return true, nil
 	}
 	return false, staleRefusal()
+}
+
+// ifMatchValue is the version an If-Match names: quoted, or the bare number.
+func ifMatchValue(h string) string {
+	if v, err := strconv.Unquote(h); err == nil {
+		return v
+	}
+	return h
 }
 
 func staleRefusal() *refusal {

@@ -22,9 +22,9 @@ import (
 const appRes = "autopilot_app.test"
 
 // envAccRepos optionally names repositories (comma-separated owner/name) the
-// live AutoPilot lets an app own. A test AutoPilot limits the repositories
-// an app may own, so live tests can't make up their own. Without it, the app
-// tests run live without repositories.
+// live AutoPilot lets an app own. A test AutoPilot limits the repositories an
+// app may own (and its tasks may reach), so live tests can't make up their
+// own. Without it, the app tests run live without repositories.
 const envAccRepos = "AUTOPILOT_ACC_REPOS"
 
 // liveRepos returns the repositories a live app may own, or n made-up ones

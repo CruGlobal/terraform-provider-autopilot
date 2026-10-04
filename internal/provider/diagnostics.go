@@ -34,6 +34,9 @@ func addAPIError(diags *diag.Diagnostics, summary string, err error, fields map[
 	case apiErr.Code == client.CodeInvalidAttribute:
 		detail += "\n\nAutoPilot refused the value; fix the configuration rather than retrying. A field AutoPilot " +
 			"doesn't know at all means it is older than this provider."
+	case apiErr.Code == client.CodeMethodNotAllowed:
+		detail += "\n\nThis AutoPilot's admin API doesn't take that method on that route, so it is likely older " +
+			"than this provider."
 	case apiErr.Code == client.CodePreconditionRequired:
 		detail += "\n\nThe provider always sends If-Match with a change, so this is a bug in the provider or " +
 			"something between it and AutoPilot dropped the header."

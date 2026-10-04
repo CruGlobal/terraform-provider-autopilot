@@ -134,8 +134,11 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"Every argument but `name` is optional and sent only when set. Removing one from the configuration " +
 			"empties it at AutoPilot: an app without `accepts` accepts no sender. Narrowing or deleting an app takes " +
 			"effect at once: AutoPilot stops the queued and running tasks the app no longer accepts.\n\n" +
+			"A repository belongs to the first app that claims it. AutoPilot can't tell which app should own one, " +
+			"so review an app's `repos` as you would its access.\n\n" +
 			"An app with this name that already exists, made by anything but this resource, is never taken over, " +
-			"even when its values match: the create fails and says to import it.\n\n" +
+			"even when its values match: the create fails and says to import it. `create_before_destroy` doesn't " +
+			"fit an app: the name is its key.\n\n" +
 			"Import by name: `terraform import autopilot_app.billing billing`.",
 		Attributes: map[string]schema.Attribute{
 			"name": schema.StringAttribute{

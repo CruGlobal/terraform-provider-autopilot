@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"slices"
 )
 
@@ -46,7 +47,7 @@ type SenderSecrets struct {
 
 // SenderSpec is what a create or a change sends. A nil list, a nil
 // BranchPrefix or nil Secrets is not sent at all; an empty, non-nil list is
-// sent as [].
+// sent as []. BranchPrefix is for a create only: it never changes.
 type SenderSpec struct {
 	CallbackHosts []string
 	Kinds         []string
@@ -106,7 +107,9 @@ func (c *Client) GetSender(ctx context.Context, name string) (*Sender, error) {
 	return getRecord[*Sender](ctx, c, recordPath(sendersPath, name))
 }
 
-// CreateSender creates a sender. spec.Secrets is required.
+// CreateSender creates a sender, or brings back a deleted one: a create with
+// a deleted sender's name, both of its secrets and its branch prefix revives
+// it at once, at its next lock_version. spec.Secrets is required.
 func (c *Client) CreateSender(ctx context.Context, name string, spec SenderSpec) (*Sender, CreateOutcome, error) {
 	fields := spec.fields()
 	fields["name"] = name
@@ -115,14 +118,19 @@ func (c *Client) CreateSender(ctx context.Context, name string, spec SenderSpec)
 
 // UpdateSender changes the fields spec sends; the others stay as they are.
 // Sending new secrets rotates them, and AutoPilot keeps the old pair for an
-// overlap; sending the same secrets again changes nothing.
+// overlap; sending the same secrets again changes nothing. A branch prefix is
+// set on create and never changes, so spec.BranchPrefix must be nil.
 func (c *Client) UpdateSender(ctx context.Context, name string, spec SenderSpec, lockVersion int64) (*Sender, error) {
+	if spec.BranchPrefix != nil {
+		return nil, errors.New("a sender's branch prefix is set on create and never changes")
+	}
 	return patchRecord(ctx, c, recordPath(sendersPath, name), spec.fields(), lockVersion, spec.reflectedIn)
 }
 
-// DeleteSender retires a sender: it can send no new tasks, its tasks already
-// taken run on, and AutoPilot removes it for good once none is left. It reads
-// as 404 from then on. A sender that is already gone is success.
+// DeleteSender retires a sender: it reads as 404 from then on, can send no new
+// tasks, and its queued tasks are refused, while its running tasks run on. Its
+// name and branch prefix stay taken for good; once it owes nothing, AutoPilot
+// keeps a tombstone of it. A sender that is already gone is success.
 func (c *Client) DeleteSender(ctx context.Context, name string, lockVersion int64) error {
 	return deleteRecord(ctx, c, recordPath(sendersPath, name), lockVersion)
 }

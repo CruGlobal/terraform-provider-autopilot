@@ -16,11 +16,12 @@ const (
 	CodeBadRequest           = "bad_request"           // 400: the body could not be read
 	CodeNotJSON              = "not_json"              // 400: the body is not a JSON object
 	CodeUnauthorized         = "unauthorized"          // 401: no admin token, the wrong one, or no admin API here
-	CodeNotFound             = "not_found"             // 404: no such record, or a retired sender
+	CodeNotFound             = "not_found"             // 404: no such record, a retired sender, or no such admin route
+	CodeMethodNotAllowed     = "method_not_allowed"    // 405: the route doesn't take that method
 	CodeNameTaken            = "name_taken"            // 409: a create for a name that exists with other fields
 	CodeNameReserved         = "name_reserved"         // 409: a create for a reserved name
-	CodeNameRetired          = "name_retired"          // 409: a create for a sender that is retired but not yet removed
-	CodeBranchPrefixTaken    = "branch_prefix_taken"   // 409: another sender has that branch prefix
+	CodeNameRetired          = "name_retired"          // 409: a create for a deleted sender's name, other than its revival
+	CodeBranchPrefixTaken    = "branch_prefix_taken"   // 409: another sender, or a tombstone, has that branch prefix
 	CodeRepoTaken            = "repo_taken"            // 409: another app owns that repository; the message names it
 	CodeStaleObject          = "stale_object"          // 409: If-Match does not match the record's lock_version
 	CodeTooLarge             = "too_large"             // 413: the body is over 64 KiB
