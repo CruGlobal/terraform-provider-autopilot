@@ -1,17 +1,15 @@
 name: dependabot-auto-merge
 
-# Auto-approves and enables auto-merge on Dependabot PRs that meet any
-# of these criteria:
+# Auto-approves and enables auto-merge on Dependabot PRs that bump a
+# patch or minor version, security updates included. Required status
+# checks on the protected branch gate actual merging on green tests, so
+# low-risk updates flow through without a human in the loop.
 #
-#   1. Security advisories (alert-state set by fetch-metadata):
-#      always auto-merge, regardless of version-update type.
-#   2. Regular patch or minor version bumps, auto-merged too. Required
-#      status checks on the protected branch gate actual merging on
-#      green tests, so low-risk updates flow through without a human
-#      in the loop.
-#
-# Major version bumps are explicitly left for human review; this
-# workflow never approves or enables auto-merge on them.
+# Major version bumps are explicitly left for human review, security
+# updates included; this workflow never approves or enables auto-merge
+# on them. (Telling a security update apart would take fetch-metadata's
+# alert-lookup, which needs a personal access token or an app token,
+# not the GITHUB_TOKEN this workflow uses.)
 #
 # "Auto-merge" is GitHub's built-in feature that waits for required
 # branch-protection / ruleset checks before merging. Without required
@@ -45,17 +43,14 @@ jobs:
       - name: Evaluate eligibility
         id: gate
         env:
-          ALERT_STATE: ${{ steps.meta.outputs.alert-state }}
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
         run: |
-          if [ -n "$ALERT_STATE" ] \
-             || [ "$UPDATE_TYPE" = "version-update:semver-patch" ] \
+          if [ "$UPDATE_TYPE" = "version-update:semver-patch" ] \
              || [ "$UPDATE_TYPE" = "version-update:semver-minor" ]; then
             echo "eligible=true" >> "$GITHUB_OUTPUT"
           else
             echo "eligible=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "alert-state=$ALERT_STATE"
           echo "update-type=$UPDATE_TYPE"
 
       - name: Approve PR

@@ -64,11 +64,15 @@ jobs:
             echo "::error::Set the AUTOPILOT_ENDPOINT and AUTOPILOT_TOKEN repository secrets."
             exit 1
           fi
+          # The provider takes an endpoint with or without /v1/admin on the
+          # end, so the probe does too.
+          base="${AUTOPILOT_ENDPOINT%/}"
+          base="${base%/v1/admin}"
           # -s keeps curl quiet, so neither the endpoint nor the token is
           # printed; a failed connection reports status 000.
           status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
             -H "Authorization: Bearer $AUTOPILOT_TOKEN" -H "Accept: application/json" \
-            "${AUTOPILOT_ENDPOINT%/}/v1/admin/senders" || true)
+            "$base/v1/admin/senders" || true)
           case "$status" in
             200)
               echo "awake=true" >> "$GITHUB_OUTPUT"
