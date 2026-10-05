@@ -240,11 +240,16 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 		}
 		// Matched without regard to case: a repository named twice in
 		// different cases is refused; named twice exactly, it is kept once.
+		// A case-sensitive sort can put other repositories between two that
+		// differ only in case, so each is compared with all the others.
 		f.repos = sortedUnique(repos)
-		for i := 1; i < len(f.repos); i++ {
-			if strings.EqualFold(f.repos[i-1], f.repos[i]) {
+		seen := make(map[string]bool, len(f.repos))
+		for _, repo := range f.repos {
+			folded := strings.ToLower(repo)
+			if seen[folded] {
 				return f, invalid("/repos", "the list names one repository twice, in different cases")
 			}
+			seen[folded] = true
 		}
 	}
 	if raw, ok := obj["accepts"]; ok {

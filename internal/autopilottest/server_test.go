@@ -79,6 +79,9 @@ func TestRepos_MatchedWithoutRegardToCase(t *testing.T) {
 	s := New(t)
 	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "repos": []string{"example-org/a", "Example-Org/A"}})
 	expect(t, "one repository in two cases", st, http.StatusUnprocessableEntity, body)
+	// Sorted by byte, another repository falls between the two.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "repos": []string{"ACME/x", "Zed/y", "acme/x"}})
+	expect(t, "one repository in two cases, apart once sorted", st, http.StatusUnprocessableEntity, body)
 	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "repos": []string{"example-org/a", "example-org/a"}})
 	expect(t, "one repository twice exactly", st, http.StatusCreated, body)
 	if v, _ := s.App("billing"); len(v.Repos) != 1 {
