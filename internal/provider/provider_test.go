@@ -40,7 +40,14 @@ func newTestEnv(t *testing.T) *testEnv {
 		if os.Getenv(envToken) == "" {
 			t.Fatalf("%s must be set when %s is set", envToken, envEndpoint)
 		}
-		liveTestsRun.Add(1)
+		// Counted when the test ends, and only if it wasn't skipped:
+		// requireFake and the Terraform version check skip a test after it
+		// picked the live AutoPilot.
+		t.Cleanup(func() {
+			if !t.Skipped() {
+				liveTestsRun.Add(1)
+			}
+		})
 		return &testEnv{endpoint: os.Getenv(envEndpoint), token: os.Getenv(envToken)}
 	}
 	fake := autopilottest.New(t)
@@ -106,6 +113,26 @@ func randSecret(t *testing.T) string {
 
 // liveTestsRun counts tests that actually ran against a live AutoPilot.
 var liveTestsRun atomic.Int32
+
+// Only a test that ran against the live AutoPilot counts toward an
+// acceptance run's coverage; one skipped after it picked the live backend
+// doesn't.
+func TestLiveTestsRun_CountsOnlyTestsThatRan(t *testing.T) {
+	t.Setenv(resource.EnvTfAcc, "1")
+	t.Setenv(envEndpoint, "https://autopilot.example.com")
+	t.Setenv(envToken, "not-a-real-token")
+	start := liveTestsRun.Load()
+	// Put the count back, so this test never adds to a real live run's.
+	t.Cleanup(func() { liveTestsRun.Store(start) })
+	t.Run("skipped", func(t *testing.T) { newTestEnv(t).requireFake(t) })
+	if got := liveTestsRun.Load(); got != start {
+		t.Errorf("a skipped test was counted: %d, want %d", got, start)
+	}
+	t.Run("ran", func(t *testing.T) { newTestEnv(t) })
+	if got := liveTestsRun.Load(); got != start+1 {
+		t.Errorf("a test that ran was not counted: %d, want %d", got, start+1)
+	}
+}
 
 // TestMain runs the sweepers when asked (-sweep, see sweep_test.go), and
 // otherwise the tests. It makes an acceptance run that asserted nothing fail
