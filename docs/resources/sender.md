@@ -13,7 +13,7 @@ description: |-
   Deleting
   Deleting a sender retires it, and it reads as gone from then on. It can send no new tasks, and its queued tasks are refused, while its running tasks run on and their events are still delivered. To stop its running tasks too, as for a sender whose secrets have leaked, also take it out of the apps' accepts.
   A deleted sender's name and branch prefix are never freed, so no other system can take them over, or whatever the apps accept from that name (once it owes nothing, AutoPilot keeps a tombstone of it). Only the same sender can come back: a create with the same name, the same two secrets and the same branch prefix revives it. So:
-  terraform apply -replace deletes the sender and creates it again with the same secrets and prefix, which brings it back at once, even while its work is still running.Renaming a sender gives it a new name, and the old one stays taken. Its old branch prefix stays taken too, so a renamed sender that sets branch_prefix needs a new prefix (one left to its default, the new name and a /, already has one).create_before_destroy doesn't fit a sender: the name is its key, so there can't be two at once.
+  terraform apply -replace deletes the sender and creates it again with the same secrets and prefix, which brings it back at once, even while its work is still running.Renaming a sender gives it a new name, and the old one stays taken. Its old branch prefix stays taken too, so a renamed sender needs a new prefix: the plan refuses a new name with the old prefix, before anything is deleted. (A prefix left to its default, the new name and a /, is usually new.)create_before_destroy doesn't fit a sender: the name is its key, so there can't be two at once.
   Import
   Import by name: terraform import autopilot_sender.tracker tracker. The secrets can't be imported. Put them in configuration: when their fingerprints match the stored ones the next plan is empty, and when they don't, the next apply sends them. A secrets_wo_version in the configuration shows as a change on that first plan too; applying it records the number and sends the secrets, which changes nothing when they match.
 ---
@@ -44,7 +44,7 @@ Deleting a sender retires it, and it reads as gone from then on. It can send no 
 A deleted sender's **name and branch prefix are never freed**, so no other system can take them over, or whatever the apps accept from that name (once it owes nothing, AutoPilot keeps a tombstone of it). Only the same sender can come back: a create with the same name, the same two secrets and the same branch prefix revives it. So:
 
 - **`terraform apply -replace`** deletes the sender and creates it again with the same secrets and prefix, which brings it back at once, even while its work is still running.
-- **Renaming** a sender gives it a new name, and the old one stays taken. Its old branch prefix stays taken too, so a renamed sender that sets `branch_prefix` needs a new prefix (one left to its default, the new name and a `/`, already has one).
+- **Renaming** a sender gives it a new name, and the old one stays taken. Its old branch prefix stays taken too, so a renamed sender needs a new prefix: the plan refuses a new name with the old prefix, before anything is deleted. (A prefix left to its default, the new name and a `/`, is usually new.)
 - **`create_before_destroy`** doesn't fit a sender: the name is its key, so there can't be two at once.
 
 ## Import
@@ -101,7 +101,7 @@ resource "autopilot_sender" "tracker" {
 
 - `branch_prefix` (String) What the sender's branches start with: a lowercase word and a `/` (`^[a-z][a-z0-9-]*/$`), at most 41 characters. No two senders share one. Defaults to the name and a `/`, AutoPilot's own default.
 
-It is set when the sender is created and **never changes**. A deleted sender's name and prefix stay taken for good, so a different prefix means a new sender with a new `name`: the plan refuses a new prefix under the same name (keep it, or change `name` too, which replaces the sender). After an import, set it to the sender's current prefix unless that is the default.
+It is set when the sender is created and **never changes**. A deleted sender's name and prefix stay taken for good, so a different prefix means a new sender with a new `name`: the plan refuses a new prefix under the same name (keep it, or change `name` too, which replaces the sender), and a new name with the old prefix. After an import, set it to the sender's current prefix unless that is the default.
 - `callback_hosts` (Set of String) Host names the sender's callbacks may go to (over https on port 443): lowercase DNS names with at least one dot, not IP addresses and not `localhost`. At most 10. Empty (the default) for a sender that only polls.
 - `kinds` (Set of String) The kinds of task the sender may send, such as `implement-work-item`, `fix-error`, `review-pr` or `research`. Each must be one AutoPilot knows. At least one. Defaults to `["implement-work-item"]`, AutoPilot's own default, so removing it from the configuration puts that back, and a change made outside Terraform shows in the plan.
 - `secrets_wo_version` (Number) A number you change to send both secrets again, whatever their fingerprints say. Rarely needed, since a changed secret already shows as a changed fingerprint.

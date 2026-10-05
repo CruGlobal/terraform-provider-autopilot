@@ -148,8 +148,8 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"- **`terraform apply -replace`** deletes the sender and creates it again with the same secrets and " +
 			"prefix, which brings it back at once, even while its work is still running.\n" +
 			"- **Renaming** a sender gives it a new name, and the old one stays taken. Its old branch prefix stays " +
-			"taken too, so a renamed sender that sets `branch_prefix` needs a new prefix (one left to its default, " +
-			"the new name and a `/`, already has one).\n" +
+			"taken too, so a renamed sender needs a new prefix: the plan refuses a new name with the old prefix, " +
+			"before anything is deleted. (A prefix left to its default, the new name and a `/`, is usually new.)\n" +
 			"- **`create_before_destroy`** doesn't fit a sender: the name is its key, so there can't be two at once.\n\n" +
 			"## Import\n\n" +
 			"Import by name: `terraform import autopilot_sender.tracker tracker`. The secrets can't be imported. Put " +
@@ -199,8 +199,9 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"default.\n\n" +
 					"It is set when the sender is created and **never changes**. A deleted sender's name and prefix " +
 					"stay taken for good, so a different prefix means a new sender with a new `name`: the plan refuses a " +
-					"new prefix under the same name (keep it, or change `name` too, which replaces the sender). After an " +
-					"import, set it to the sender's current prefix unless that is the default.",
+					"new prefix under the same name (keep it, or change `name` too, which replaces the sender), and a " +
+					"new name with the old prefix. After an import, set it to the sender's current prefix unless that is " +
+					"the default.",
 				Optional: true,
 				Computed: true,
 				Validators: []validator.String{
@@ -347,6 +348,25 @@ func (r *senderResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 				return
 			}
 			resp.RequiresReplace = append(resp.RequiresReplace, path.Root("branch_prefix"))
+		}
+		// A new name with the old prefix is refused too. The replace would
+		// retire the old sender first, which keeps its prefix for good, so the
+		// create that follows could only fail, with the old sender already
+		// retired.
+		if known(plan.Name) && !plan.Name.Equal(state.Name) && known(plan.BranchPrefix) &&
+			plan.BranchPrefix.Equal(state.BranchPrefix) {
+			at, fix := path.Root("branch_prefix"), "Set branch_prefix to a prefix of the new sender's own (left out, it "+
+				"is the new name and a /), or keep the old name."
+			if config.BranchPrefix.IsNull() {
+				at, fix = path.Root("name"), "Its default, the new name and a /, is the old sender's prefix. Set "+
+					"branch_prefix to a prefix of the new sender's own, or keep the old name."
+			}
+			resp.Diagnostics.AddAttributeError(at, "A renamed sender needs a new branch prefix",
+				fmt.Sprintf("Renaming sender %q to %q deletes it and creates a new sender. A deleted sender keeps its "+
+					"branch prefix %q for good, so creating the new one with that prefix would fail, after the old "+
+					"one was already deleted. Nothing was changed. %s", state.Name.ValueString(),
+					plan.Name.ValueString(), state.BranchPrefix.ValueString(), fix))
+			return
 		}
 		rotating := !secretsKnown || !plan.RequestSecretFingerprint.Equal(state.RequestSecretFingerprint) ||
 			!plan.CallbackSecretFingerprint.Equal(state.CallbackSecretFingerprint)

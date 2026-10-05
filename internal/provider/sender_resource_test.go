@@ -1150,20 +1150,40 @@ func TestSender_replaceRevivesIt(t *testing.T) {
 	})
 }
 
-// Renaming a sender never frees its old branch prefix, so a renamed sender
-// that keeps an explicit prefix is refused.
+// Renaming a sender never frees its old branch prefix, so the plan refuses a
+// new name with the old prefix, set or by default, before the replace would
+// delete the old sender. The old sender is still there afterwards.
 func TestSender_renameKeepingThePrefixIsRefused(t *testing.T) {
 	env := newTestEnv(t)
 	first, second := randName(), randName()
 	secrets := newSecretPair(t)
-	prefix := fmt.Sprintf("  branch_prefix = %q", first+"-bots/")
+	// The first sender's prefix is the second name's default.
+	prefix := fmt.Sprintf("  branch_prefix = %q", second+"/")
 	runTest(t, resource.TestCase{
 		CheckDestroy: checkSendersGone(t, env),
 		Steps: []resource.TestStep{
 			{Config: senderConfig(env, first, secrets, prefix)},
 			{
 				Config:      senderConfig(env, second, secrets, prefix),
-				ExpectError: expectErr("Another sender has this branch prefix ... AutoPilot never frees a branch prefix"),
+				PlanOnly:    true,
+				ExpectError: expectErr("A renamed sender needs a new branch prefix ... Set branch_prefix to a prefix of the new sender's own"),
+			},
+			{
+				Config:      senderConfig(env, second, secrets, ""),
+				PlanOnly:    true,
+				ExpectError: expectErr("A renamed sender needs a new branch prefix ... Its default, the new name and a /, is the old sender's prefix"),
+			},
+			{
+				// Nothing was deleted: the refresh still finds the first sender,
+				// so its own configuration plans nothing.
+				Config: senderConfig(env, first, secrets, prefix),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "name", first),
+					resource.TestCheckResourceAttr(senderRes, "lock_version", "1"),
+				),
 			},
 		},
 	})

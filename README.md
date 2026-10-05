@@ -188,7 +188,8 @@ revives it, at once. So:
   A different prefix means a new sender with a new `name`; the plan refuses
   a new prefix under the same name, before anything is deleted.
 - Renaming a sender leaves the old name, and its branch prefix, taken. A
-  renamed sender that sets `branch_prefix` needs a new one.
+  renamed sender needs a new prefix; the plan refuses a new name with the
+  old prefix, before anything is deleted.
 - `create_before_destroy` doesn't fit either resource: the name is the key.
 
 ### Importing
