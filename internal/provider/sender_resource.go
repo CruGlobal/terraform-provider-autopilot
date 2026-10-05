@@ -150,7 +150,11 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"- **Renaming** a sender gives it a new name, and the old one stays taken. Its old branch prefix stays " +
 			"taken too, so a renamed sender needs a new prefix: the plan refuses a new name with the old prefix, " +
 			"before anything is deleted. (A prefix left to its default, the new name and a `/`, is usually new.)\n" +
-			"- **`create_before_destroy`** doesn't fit a sender: the name is its key, so there can't be two at once.\n\n" +
+			"- **`create_before_destroy`** doesn't fit a sender: the name is its key, so there can't be two at once.\n" +
+			"- **Don't replace a sender to rotate its secrets**, as `replace_triggered_by` on its `random_password` " +
+			"resources would. That deletes the sender and creates it with the new secrets, but a deleted sender " +
+			"comes back only with its old ones, so the create fails. Let the secrets change in place, which plans " +
+			"an update.\n\n" +
 			"## Import\n\n" +
 			"Import by name: `terraform import autopilot_sender.tracker tracker`. The secrets can't be imported. Put " +
 			"them in configuration: when their fingerprints match the stored ones the next plan is empty, and when " +

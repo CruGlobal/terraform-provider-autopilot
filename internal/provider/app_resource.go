@@ -136,9 +136,11 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"effect at once: AutoPilot stops the queued and running tasks the app no longer accepts.\n\n" +
 			"A repository belongs to the first app that claims it. AutoPilot can't tell which app should own one, " +
 			"so review an app's `repos` as you would its access.\n\n" +
-			"An app with this name that already exists, made by anything but this resource, is never taken over, " +
-			"even when its values match: the create fails and says to import it. `create_before_destroy` doesn't " +
-			"fit an app: the name is its key.\n\n" +
+			"An app with this name that already exists is not taken over, even when its values match: the create " +
+			"fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a " +
+			"gateway's 502, say) before an identical app answered: that attempt may have made the app, and the " +
+			"provider can't tell, so it takes the app as its own. `create_before_destroy` doesn't fit an app: the " +
+			"name is its key.\n\n" +
 			"Import by name: `terraform import autopilot_app.billing billing`.",
 		Attributes: map[string]schema.Attribute{
 			"name": schema.StringAttribute{

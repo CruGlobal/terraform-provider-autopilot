@@ -140,7 +140,9 @@ Two cautions:
   already taken by something else:
   - with other values, the apply fails and says how to import it;
   - with exactly these values, an `autopilot_app` fails the same way, since
-    an app is a unit of consent and another configuration may manage it. An
+    an app is a unit of consent and another configuration may manage it
+    (unless an earlier attempt of the same create went unanswered, say a
+    gateway's `502`: that attempt may have made it, so it is taken). An
     `autopilot_sender` is taken over with a warning instead: its values
     include its secrets, and only a configuration that holds those secrets
     (in practice this one, after an earlier apply's state was lost) can match
@@ -197,6 +199,10 @@ revives it, at once. So:
   renamed sender needs a new prefix; the plan refuses a new name with the
   old prefix, before anything is deleted.
 - `create_before_destroy` doesn't fit either resource: the name is the key.
+- Don't replace a sender to rotate its secrets, as `replace_triggered_by`
+  on its `random_password` resources would: a deleted sender comes back only
+  with its old secrets, so the create fails. Let the secrets change in
+  place, which plans an update.
 
 ### Importing
 
