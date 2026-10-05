@@ -184,6 +184,14 @@ func New(endpoint, token string, opts ...Option) (*Client, error) {
 	for _, opt := range opts {
 		opt(c)
 	}
+	// AutoPilot never redirects, so a redirect is never followed: a 3xx is
+	// reported like any other answer that isn't a 2xx. Following one would
+	// turn a DELETE into a GET (and take a 200 from it as done), and would
+	// carry the token to wherever the redirect points, plain http included.
+	// The http.Client is copied, so one passed in is left as it is.
+	hc := *c.httpClient
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	c.httpClient = &hc
 	return c, nil
 }
 

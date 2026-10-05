@@ -560,6 +560,46 @@ func TestDelete_GoneIsSuccess(t *testing.T) {
 	}
 }
 
+// AutoPilot never redirects, so the client never follows a redirect: a 3xx is
+// an error, a delete answered with one is not done, and wherever it points
+// never sees a request, or the token.
+func TestDo_NeverFollowsARedirect(t *testing.T) {
+	var followed sync.Map
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		followed.Store(r.Method+" "+r.URL.Path, r.Header.Get("Authorization"))
+		writeRecord(w, http.StatusOK, map[string]any{"name": "tracker", "lock_version": 1})
+	}))
+	t.Cleanup(target.Close)
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, target.URL+"/moved"+r.URL.Path, status)
+		}))
+		ctx := context.Background()
+		if _, err := c.GetSender(ctx, "tracker"); err == nil || !hasStatus(err, status) {
+			t.Errorf("%d: a read was answered %v, want an HTTP %d error", status, err, status)
+		}
+		if err := c.DeleteSender(ctx, "tracker", 1); err == nil || !hasStatus(err, status) {
+			t.Errorf("%d: a delete was answered %v, want an HTTP %d error", status, err, status)
+		}
+	}
+	followed.Range(func(k, _ any) bool {
+		t.Errorf("a redirect was followed: %v", k)
+		return true
+	})
+}
+
+// A client passed in keeps its own redirect policy; New works on a copy.
+func TestNew_LeavesAGivenHTTPClientAsItIs(t *testing.T) {
+	given := &http.Client{}
+	if _, err := New("https://autopilot.example.com", "tok", WithHTTPClient(given)); err != nil {
+		t.Fatal(err)
+	}
+	if given.CheckRedirect != nil {
+		t.Error("New changed the http.Client it was given")
+	}
+}
+
 // randomValue is a fresh random string, so no test holds a fixed secret.
 func randomValue(t *testing.T) string {
 	t.Helper()

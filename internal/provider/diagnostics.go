@@ -27,6 +27,10 @@ func addAPIError(diags *diag.Diagnostics, summary string, err error, fields map[
 	case client.IsUnauthorized(err):
 		detail += "\n\nAutoPilot refused the admin token. Check that the token (or AUTOPILOT_TOKEN) is the current " +
 			"admin token of the AutoPilot at the endpoint. An AutoPilot with no admin token set up answers the same way."
+	case apiErr.Status >= 300 && apiErr.Status < 400:
+		detail += "\n\nAutoPilot never redirects, and the provider never follows a redirect, so the admin token " +
+			"goes nowhere but the endpoint. Check that the endpoint is the AutoPilot itself, at its current address, " +
+			"and that nothing in between (a proxy or a sign-in page) answered instead."
 	case apiErr.Status == 404:
 		detail += "\n\nAutoPilot answers a missing record with a not_found refusal, and this 404 is not one. Check " +
 			"that the endpoint is the AutoPilot itself, with no extra path, and that nothing in between (a proxy or " +

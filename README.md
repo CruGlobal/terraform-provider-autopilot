@@ -167,6 +167,9 @@ Two cautions:
   an error, so a misconfigured endpoint can never make Terraform forget a
   record. A `405 method_not_allowed` means the AutoPilot is likely older than
   the provider.
+- AutoPilot never redirects, so the provider never follows a redirect: a
+  `3xx` is an error. A delete answered with one is not taken as done, and
+  the admin token never goes anywhere but the endpoint.
 - An argument left out of an `autopilot_app` is not sent on create; removing
   one later sends it as `[]`, so the app holds what the configuration says.
 
