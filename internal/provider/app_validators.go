@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"regexp"
-	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -108,11 +107,20 @@ func (acceptsValidator) ValidateSet(ctx context.Context, req validator.SetReques
 		if m.CanDecide.IsNull() || m.CanDecide.IsUnknown() || !m.CanDecide.ValueBool() || m.Kinds.IsUnknown() {
 			continue
 		}
-		var kinds []string
-		if diags := m.Kinds.ElementsAs(ctx, &kinds, true); diags.HasError() {
-			continue
+		// A kind not known yet may turn out to be review-pr, so the check waits
+		// until every kind is known: Terraform validates again at apply, with
+		// the values the plan left unknown.
+		hasReviewPR, unknownKind := false, false
+		for _, k := range m.Kinds.Elements() {
+			s, ok := k.(types.String)
+			switch {
+			case !ok || s.IsUnknown():
+				unknownKind = true
+			case s.ValueString() == "review-pr":
+				hasReviewPR = true
+			}
 		}
-		if !slices.Contains(kinds, "review-pr") {
+		if !hasReviewPR && !unknownKind {
 			resp.Diagnostics.AddAttributeError(req.Path, "can_decide without review-pr",
 				fmt.Sprintf("The entry for %q sets can_decide, which only applies to review-pr tasks, but its kinds "+
 					"don't include review-pr. Add review-pr to its kinds, or leave can_decide out.", m.Sender.ValueString()))

@@ -11,7 +11,10 @@ import (
 
 	"github.com/CruGlobal/terraform-provider-autopilot/internal/autopilottest"
 	"github.com/CruGlobal/terraform-provider-autopilot/internal/client"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -561,6 +564,75 @@ func TestApp_planTimeValidation(t *testing.T) {
 		resource.TestStep{Config: appConfig(env, strings.Repeat("a", 65), ""), PlanOnly: true, ExpectError: expectErr("at most 64")},
 	)
 	runTest(t, resource.TestCase{Steps: steps})
+}
+
+// can_decide with a kind not known at plan time waits for the kind: the plan
+// passes, and the apply checks it once it is known.
+func TestApp_canDecideWithAKindNotKnownYet(t *testing.T) {
+	env := newTestEnv(t)
+	name, sender := randName(), randName()
+	config := func(kind string) string {
+		return env.providerConfig() + fmt.Sprintf(`
+resource "terraform_data" "kind" {
+  input = %q
+}
+
+resource "autopilot_app" "test" {
+  name    = %q
+  accepts = [{ sender = %q, kinds = [terraform_data.kind.output], can_decide = true }]
+}
+`, kind, name, sender)
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config("review-pr"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "accepts.0.can_decide", "true"),
+					resource.TestCheckResourceAttr(appRes, "accepts.0.kinds.0", "review-pr"),
+				),
+			},
+			{
+				Config:      config("research"),
+				ExpectError: expectErr("can_decide without review-pr"),
+			},
+		},
+	})
+}
+
+// The accepts check skips an entry whose kinds aren't all known, and still
+// refuses one whose known kinds leave out review-pr.
+func TestAcceptsValidator_UnknownKind(t *testing.T) {
+	ctx := context.Background()
+	entry := func(kinds ...attr.Value) attr.Value {
+		return types.ObjectValueMust(acceptAttrTypes, map[string]attr.Value{
+			"sender":     types.StringValue("tracker"),
+			"kinds":      types.SetValueMust(types.StringType, kinds),
+			"can_decide": types.BoolValue(true),
+		})
+	}
+	cases := []struct {
+		name    string
+		entry   attr.Value
+		refused bool
+	}{
+		{"an unknown kind", entry(types.StringUnknown()), false},
+		{"an unknown kind beside another", entry(types.StringValue("research"), types.StringUnknown()), false},
+		{"review-pr", entry(types.StringValue("review-pr")), false},
+		{"no review-pr", entry(types.StringValue("research")), true},
+	}
+	for _, c := range cases {
+		req := validator.SetRequest{
+			Path:        path.Root("accepts"),
+			ConfigValue: types.SetValueMust(acceptObjectType, []attr.Value{c.entry}),
+		}
+		var resp validator.SetResponse
+		acceptsValidator{}.ValidateSet(ctx, req, &resp)
+		if resp.Diagnostics.HasError() != c.refused {
+			t.Errorf("%s: refused = %v, want %v (%v)", c.name, resp.Diagnostics.HasError(), c.refused, resp.Diagnostics)
+		}
+	}
 }
 
 // A PATCH replaces a list as sent, so changing only the case of a repository
