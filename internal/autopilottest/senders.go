@@ -205,10 +205,13 @@ func (s *Server) ExpireOverlap(name string) {
 	}
 }
 
-// retireLocked retires a sender. One that owes nothing becomes a tombstone on
-// AutoPilot's next dispatcher pass, which the fake runs at once.
+// retireLocked retires a sender, which is a change: lock_version goes up. One
+// that owes nothing becomes a tombstone on AutoPilot's next dispatcher pass,
+// which the fake runs at once.
 func (s *Server) retireLocked(rec *senderRecord) {
 	rec.retired = true
+	rec.lockVersion++
+	rec.updatedAt = time.Now()
 	rec.owesWork = s.retiredOweWork
 	if !rec.owesWork {
 		rec.entomb()
@@ -216,11 +219,14 @@ func (s *Server) retireLocked(rec *senderRecord) {
 }
 
 // entomb wipes a retired sender's secrets, keeping its name, its branch prefix
-// and its two fingerprints for good.
+// and its two fingerprints for good. That is a change too: lock_version goes
+// up again.
 func (rec *senderRecord) entomb() {
 	if rec.tombstone {
 		return
 	}
+	rec.lockVersion++
+	rec.updatedAt = time.Now()
 	rec.requestFP, rec.callbackFP = Fingerprint(rec.requestSecret), Fingerprint(rec.callbackSecret)
 	rec.requestSecret, rec.callbackSecret = "", ""
 	rec.previousRequestSecret, rec.previousCallbackSecret = "", ""

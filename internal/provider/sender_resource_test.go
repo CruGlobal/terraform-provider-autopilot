@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -341,8 +342,9 @@ func TestSender_nameRetired(t *testing.T) {
 					"... Only a create with the same two secrets and the same branch prefix brings it back"),
 			},
 			{
+				// The same secrets revive it: created, retired, revived.
 				Config: senderConfig(env, name, secrets, ""),
-				Check:  resource.TestCheckResourceAttr(senderRes, "lock_version", "2"),
+				Check:  resource.TestCheckResourceAttr(senderRes, "lock_version", "3"),
 			},
 		},
 	})
@@ -659,14 +661,15 @@ func TestSender_deletedOutsideTerraformIsMadeAgain(t *testing.T) {
 			{Config: senderConfig(env, name, secrets, "")},
 			{
 				// Deleted outside: it drops out of state, and the create, with
-				// the same secrets, revives its tombstone at the next version.
+				// the same secrets, revives its tombstone. Retiring it, the
+				// tombstone and the revival each raise lock_version.
 				PreConfig: func() { env.fake.RetireSenderOutOfBand(name) },
 				Config:    senderConfig(env, name, secrets, ""),
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionCreate)},
 				},
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(senderRes, "lock_version", "2"),
+					resource.TestCheckResourceAttr(senderRes, "lock_version", "4"),
 					func(*terraform.State) error {
 						if v, ok := env.fake.Sender(name); !ok || v.Retired {
 							return fmt.Errorf("the sender was not revived")
@@ -1136,16 +1139,25 @@ func TestSecretsMatchPlan(t *testing.T) {
 }
 
 // terraform apply -replace deletes the sender and creates it again with the
-// same secrets and prefix, which brings it back at once, at the next
-// lock_version.
+// same secrets and prefix, which brings it back at once, at a higher
+// lock_version. How much higher varies: AutoPilot raises it when it retires
+// the sender, again if its sweep makes a tombstone in between, and again on
+// the revival.
 func TestSender_replaceRevivesIt(t *testing.T) {
 	env := newTestEnv(t)
 	name := randName()
 	secrets := newSecretPair(t)
+	var before int64
 	runTest(t, resource.TestCase{
 		CheckDestroy: checkSendersGone(t, env),
 		Steps: []resource.TestStep{
-			{Config: senderConfig(env, name, secrets, `  kinds = ["research"]`)},
+			{
+				Config: senderConfig(env, name, secrets, `  kinds = ["research"]`),
+				Check: resource.TestCheckResourceAttrWith(senderRes, "lock_version", func(v string) (err error) {
+					before, err = strconv.ParseInt(v, 10, 64)
+					return err
+				}),
+			},
 			{
 				Taint:  []string{senderRes},
 				Config: senderConfig(env, name, secrets, `  kinds = ["research"]`),
@@ -1153,7 +1165,16 @@ func TestSender_replaceRevivesIt(t *testing.T) {
 					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionDestroyBeforeCreate)},
 				},
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(senderRes, "lock_version", "2"),
+					resource.TestCheckResourceAttrWith(senderRes, "lock_version", func(v string) error {
+						after, err := strconv.ParseInt(v, 10, 64)
+						if err != nil {
+							return err
+						}
+						if after <= before {
+							return fmt.Errorf("lock_version = %d after the revival, want more than %d", after, before)
+						}
+						return nil
+					}),
 					resource.TestCheckTypeSetElemAttr(senderRes, "kinds.*", "research"),
 					func(*terraform.State) error {
 						if env.live() {

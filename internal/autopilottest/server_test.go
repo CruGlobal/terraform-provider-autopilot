@@ -205,7 +205,8 @@ func newSender(t *testing.T, s *Server, name string, extra map[string]any) (requ
 
 // A deleted sender that owes nothing becomes a tombstone: it reads as 404,
 // its name and prefix stay taken, and only a create with both of its secrets
-// and its prefix revives it, at the next lock_version.
+// and its prefix revives it. Retiring it, making the tombstone and reviving it
+// each raise lock_version, as AutoPilot does.
 func TestSender_TombstoneAndRevive(t *testing.T) {
 	s := New(t)
 	request, callback := newSender(t, s, "tracker", nil)
@@ -236,8 +237,8 @@ func TestSender_TombstoneAndRevive(t *testing.T) {
 	st, body = call(t, s, http.MethodPost, "/v1/admin/senders", "", map[string]any{
 		"name": "tracker", "kinds": []string{"research"}, "request_secret": request, "callback_secret": callback})
 	expect(t, "revive with both secrets and the prefix", st, http.StatusCreated, body)
-	if body["lock_version"] != float64(2) {
-		t.Errorf("lock_version = %v, want the next one", body["lock_version"])
+	if body["lock_version"] != float64(4) {
+		t.Errorf("lock_version = %v, want 4: created, retired, made a tombstone, revived", body["lock_version"])
 	}
 	if v, _ := s.Sender("tracker"); v.Retired || len(v.Kinds) != 1 || v.Kinds[0] != "research" {
 		t.Errorf("revived as %+v, want the fields the create sent", v)
@@ -261,8 +262,8 @@ func TestSender_RetiredRevivesAtOnce(t *testing.T) {
 	st, body = call(t, s, http.MethodPost, "/v1/admin/senders", "", map[string]any{
 		"name": "tracker", "request_secret": request, "callback_secret": callback})
 	expect(t, "the same sender", st, http.StatusCreated, body)
-	if body["lock_version"] != float64(2) {
-		t.Errorf("lock_version = %v", body["lock_version"])
+	if body["lock_version"] != float64(3) {
+		t.Errorf("lock_version = %v, want 3: created, retired, revived", body["lock_version"])
 	}
 }
 
