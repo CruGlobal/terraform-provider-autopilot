@@ -3,6 +3,7 @@ package provider
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/CruGlobal/terraform-provider-autopilot/internal/client"
@@ -31,6 +32,13 @@ func addAPIError(diags *diag.Diagnostics, summary string, err error, fields map[
 		detail += "\n\nAutoPilot never redirects, and the provider never follows a redirect, so the admin token " +
 			"goes nowhere but the endpoint. Check that the endpoint is the AutoPilot itself, at its current address, " +
 			"and that nothing in between (a proxy or a sign-in page) answered instead."
+	case client.IsNotFound(err) && apiErr.Method == http.MethodPost:
+		detail += "\n\nAutoPilot doesn't know this route, which a create meets only when the endpoint's path is " +
+			"wrong. Check that the endpoint is the AutoPilot's base URL, with no extra path."
+	case client.IsNotFound(err):
+		detail += "\n\nAutoPilot has no such record: it was deleted outside of Terraform after the last refresh (a " +
+			"deleted sender reads as missing too). Run `terraform plan` again: the refresh drops it from state, and " +
+			"the plan creates it again."
 	case apiErr.Status == 404:
 		detail += "\n\nAutoPilot answers a missing record with a not_found refusal, and this 404 is not one. Check " +
 			"that the endpoint is the AutoPilot itself, with no extra path, and that nothing in between (a proxy or " +

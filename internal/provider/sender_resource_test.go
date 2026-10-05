@@ -679,6 +679,27 @@ func TestSender_deletedOutsideTerraformIsMadeAgain(t *testing.T) {
 	})
 }
 
+// A sender deleted after the refresh, before the update reaches it, is
+// reported as deleted outside of Terraform, with the advice to plan again.
+func TestSender_deletedBeforeTheUpdateSaysToPlanAgain(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: senderConfig(env, name, secrets, "")},
+			{
+				PreConfig: func() {
+					env.fake.OnNextRequest(http.MethodPatch, "/v1/admin/senders/"+name, func() { env.fake.RetireSenderOutOfBand(name) })
+				},
+				Config:      senderConfig(env, name, secrets, `  kinds = ["research"]`),
+				ExpectError: expectErr("Error updating AutoPilot sender ... deleted outside of Terraform after the last refresh"),
+			},
+		},
+	})
+}
+
 func TestSender_import(t *testing.T) {
 	env := newTestEnv(t)
 	name := randName()
