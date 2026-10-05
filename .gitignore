@@ -1,0 +1,28 @@
+# Build artifacts
+/terraform-provider-autopilot
+/dist/
+
+# Go test caches
+*.test
+*.out
+
+# Terraform state from running examples by hand
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+example.tf
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local credentials for acceptance tests
+.env
+.env.local
+.env.test
+.env.*.local

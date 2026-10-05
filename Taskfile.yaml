@@ -1,0 +1,122 @@
+# https://taskfile.dev
+version: "3"
+
+vars:
+  NAME: autopilot
+  BINARY: terraform-provider-{{.NAME}}
+
+env:
+  CGO_ENABLED: "0"
+
+tasks:
+  default:
+    desc: Run unit tests
+    cmds:
+      - task: test
+
+  build:
+    desc: Build the provider binary
+    cmds:
+      - go build -o {{.BINARY}}
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    generates:
+      - "{{.BINARY}}"
+
+  install:
+    desc: Install the provider binary into $GOBIN (or $GOPATH/bin) for use with terraform dev_overrides
+    silent: true
+    cmds:
+      - go install .
+      - |
+        BIN_DIR="$(go env GOBIN)"
+        : "${BIN_DIR:=$(go env GOPATH)/bin}"
+        cat <<EOF
+
+        Installed to ${BIN_DIR}/{{.BINARY}}
+
+        Add this to ~/.terraformrc and run terraform without 'terraform init':
+
+          provider_installation {
+            dev_overrides {
+              "CruGlobal/autopilot" = "${BIN_DIR}"
+            }
+            direct {}
+          }
+        EOF
+
+  tidy:
+    desc: Run go mod tidy
+    cmds:
+      - go mod tidy
+
+  fmt:
+    desc: Format Go and Terraform files
+    cmds:
+      - gofmt -s -w -e .
+      - terraform fmt -recursive ./examples/
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  lint:
+    desc: Run golangci-lint
+    cmds:
+      - golangci-lint run
+
+  test:
+    desc: Run unit tests (against the in-process fake AutoPilot admin API; requires terraform on PATH)
+    cmds:
+      - go test -count=1 -cover ./...
+
+  vulncheck:
+    desc: Report known vulnerabilities reachable from this module (what CI gates on)
+    cmds:
+      - go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  generate:
+    desc: Regenerate provider docs from schema (requires terraform on PATH)
+    cmds:
+      - go generate ./...
+
+  # Acceptance tests run the same test bodies as `task test`, but against a
+  # live AutoPilot instead of the fake. Every record they make has a random
+  # tfacc- name and is removed when the test ends (a deleted sender stays as
+  # a tombstone, since its name is never freed).
+  #
+  #   AUTOPILOT_ENDPOINT   base URL, for example https://autopilot.example.com
+  #   AUTOPILOT_TOKEN      an admin token for that AutoPilot
+  #   AUTOPILOT_ACC_REPOS  optional; comma-separated owner/name repositories
+  #                        the test AutoPilot lets an app own (its allowed
+  #                        list, which also limits what its tasks may reach).
+  #                        Without it, the app tests run without repositories.
+  testacc:
+    desc: Run acceptance tests against a live AutoPilot
+    env:
+      TF_ACC: "1"
+    preconditions:
+      - sh: test -n "$AUTOPILOT_ENDPOINT"
+        msg: "AUTOPILOT_ENDPOINT must be set"
+      - sh: test -n "$AUTOPILOT_TOKEN"
+        msg: "AUTOPILOT_TOKEN must be set"
+    cmds:
+      - go test -v -cover -count=1 -timeout 30m ./internal/provider/...
+
+  sweep:
+    desc: Remove the tfacc- apps and senders a failed live run left behind
+    preconditions:
+      - sh: test -n "$AUTOPILOT_ENDPOINT"
+        msg: "AUTOPILOT_ENDPOINT must be set"
+      - sh: test -n "$AUTOPILOT_TOKEN"
+        msg: "AUTOPILOT_TOKEN must be set"
+    cmds:
+      - go test -count=1 -timeout 10m ./internal/provider/ -sweep=live
+
+  release:snapshot:
+    desc: Build a local snapshot release with goreleaser
+    cmds:
+      - goreleaser release --clean --snapshot
