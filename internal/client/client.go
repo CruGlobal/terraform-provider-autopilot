@@ -143,7 +143,16 @@ func parseEndpoint(endpoint string) (*url.URL, error) {
 	u.Fragment = ""
 	// Tolerate an endpoint that already carries /v1/admin (or a trailing
 	// slash), so a URL copied out of the API's docs works either way.
-	u.Path = strings.TrimSuffix(strings.TrimSuffix(u.Path, "/"), APIPath) + APIPath
+	prefix := strings.TrimSuffix(strings.TrimSuffix(u.Path, "/"), APIPath)
+	// A route after /v1/admin can't be a path prefix: it would put the route
+	// in front of every request, and AutoPilot answers an unknown route under
+	// /v1/admin with the same not_found it gives a missing record, so every
+	// record would read as gone.
+	if strings.Contains(prefix+"/", APIPath+"/") {
+		return nil, fmt.Errorf("invalid endpoint %q: it has a path after %s; give the AutoPilot's base URL, such "+
+			"as https://autopilot.example.com", endpoint, APIPath)
+	}
+	u.Path = prefix + APIPath
 	return u, nil
 }
 

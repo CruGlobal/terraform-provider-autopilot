@@ -97,7 +97,8 @@ func TestConfigure_InvalidEndpoint(t *testing.T) {
 	t.Setenv(envEndpoint, "")
 	t.Setenv(envToken, "")
 	for _, endpoint := range []string{"autopilot.example.com", "ftp://autopilot.example.com", "https://",
-		"https://user:pw@autopilot.example.com", "http://autopilot.example.com"} {
+		"https://user:pw@autopilot.example.com", "http://autopilot.example.com",
+		"https://autopilot.example.com/v1/admin/senders"} {
 		resp := configure(t, ptr(endpoint), ptr("admin-token"))
 		if got := summaries(resp); got != "Invalid AutoPilot endpoint" {
 			t.Errorf("endpoint %q: diagnostics = %q", endpoint, got)

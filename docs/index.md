@@ -56,5 +56,5 @@ provider "autopilot" {
 
 ### Optional
 
-- `endpoint` (String) Base URL of the AutoPilot, for example `https://autopilot.example.com`. The `/v1/admin` path is appended automatically. It must be https; plain `http://` is allowed only for a loopback host (`localhost`, `127.0.0.1`, `::1`), because the admin token travels in every request. Falls back to the `AUTOPILOT_ENDPOINT` environment variable.
+- `endpoint` (String) Base URL of the AutoPilot, for example `https://autopilot.example.com`. The `/v1/admin` path is appended automatically; a URL with a route after `/v1/admin` is refused. It must be https; plain `http://` is allowed only for a loopback host (`localhost`, `127.0.0.1`, `::1`), because the admin token travels in every request. Falls back to the `AUTOPILOT_ENDPOINT` environment variable.
 - `token` (String, Sensitive) Admin token, sent as the bearer token on every request. Falls back to the `AUTOPILOT_TOKEN` environment variable.

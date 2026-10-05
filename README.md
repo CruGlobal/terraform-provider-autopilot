@@ -88,8 +88,9 @@ resource "autopilot_app" "billing" {
 | `token` | Admin token, sent as a bearer token. Sensitive. Falls back to `AUTOPILOT_TOKEN`. |
 
 Both are checked when the provider is configured: a missing value, an
-endpoint that isn't an https URL with a host, or a token with spaces in it
-fails the plan with an error that says which and where it came from. Plain
+endpoint that isn't an https URL with a host, an endpoint with a route after
+`/v1/admin`, or a token with spaces in it fails the plan with an error that
+says which and where it came from. Plain
 `http://` is allowed only for a loopback host (`localhost`, `127.0.0.1`,
 `::1`), because the admin token travels in every request.
 
@@ -165,8 +166,10 @@ Two cautions:
   sender reads that way), and removes it from state. Any other `404` (a
   proxy, a page that isn't AutoPilot's, an endpoint with the wrong path) is
   an error, so a misconfigured endpoint can never make Terraform forget a
-  record. A `405 method_not_allowed` means the AutoPilot is likely older than
-  the provider.
+  record. AutoPilot answers an unknown route under `/v1/admin` with
+  `not_found` too, so an endpoint with a route after `/v1/admin` is refused
+  when the provider is configured. A `405 method_not_allowed` means the
+  AutoPilot is likely older than the provider.
 - AutoPilot never redirects, so the provider never follows a redirect: a
   `3xx` is an error. A delete answered with one is not taken as done, and
   the admin token never goes anywhere but the endpoint.

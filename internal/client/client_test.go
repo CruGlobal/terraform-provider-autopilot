@@ -81,9 +81,28 @@ func TestNew_NormalisesEndpoint(t *testing.T) {
 	}
 	for _, bad := range []string{"", "ftp://x", "autopilot.example.com", "https://", "https://u:p@autopilot.example.com",
 		// The token travels in every request: plain http only to this machine.
-		"http://autopilot.example.com", "http://10.0.0.5"} {
+		"http://autopilot.example.com", "http://10.0.0.5",
+		// A route after /v1/admin: AutoPilot would answer every request
+		// not_found, which reads as every record gone.
+		"https://autopilot.example.com/v1/admin/senders", "https://autopilot.example.com/v1/admin/senders/",
+		"https://autopilot.example.com/proxy/v1/admin/apps/billing", "https://autopilot.example.com/v1/admin/v1/admin"} {
 		if _, err := New(bad, "tok"); err == nil {
 			t.Errorf("New(%q) succeeded, want error", bad)
+		}
+	}
+	// A path prefix is kept, and a name that only starts like /v1/admin is no
+	// route after it.
+	for in, want := range map[string]string{
+		"https://autopilot.example.com/proxy":             "https://autopilot.example.com/proxy/v1/admin",
+		"https://autopilot.example.com/proxy/v1/admin":    "https://autopilot.example.com/proxy/v1/admin",
+		"https://autopilot.example.com/v1/administration": "https://autopilot.example.com/v1/administration/v1/admin",
+	} {
+		c, err := New(in, "tok")
+		if err != nil {
+			t.Fatalf("New(%q): %v", in, err)
+		}
+		if got := c.BaseURL(); got != want {
+			t.Errorf("New(%q).BaseURL() = %q, want %q", in, got, want)
 		}
 	}
 	for _, bad := range []string{"", "  ", "two words"} {
