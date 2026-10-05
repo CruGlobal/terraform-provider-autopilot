@@ -66,9 +66,9 @@ func (p *autopilotProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 			"endpoint": schema.StringAttribute{
 				MarkdownDescription: "Base URL of the AutoPilot, for example `https://autopilot.example.com`. " +
 					"The `/v1/admin` path is appended automatically; a URL with a route after `/v1/admin` is refused. " +
-				"It must be https; plain `http://` is allowed " +
-					"only for a loopback host (`localhost`, `127.0.0.1`, `::1`), because the admin token travels in " +
-					"every request. Falls back to the `AUTOPILOT_ENDPOINT` environment variable.",
+					"It must be https; plain `http://` is allowed only for a loopback host (`localhost`, `127.0.0.1`, " +
+					"`::1`), because the admin token travels in every request. Falls back to the `AUTOPILOT_ENDPOINT` " +
+					"environment variable.",
 				Optional: true,
 			},
 			"token": schema.StringAttribute{
