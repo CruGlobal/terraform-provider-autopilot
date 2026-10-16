@@ -115,6 +115,12 @@ func ValidateToken(token string) error {
 	return nil
 }
 
+// parseEndpoint checks an endpoint and resolves the API base from it. Its
+// errors give the reason only, never the endpoint or any part of it: a token
+// can end up where the endpoint should be (the two values swapped, or the
+// wrong output wired in), and an error is printed in plan output, which a
+// runner may post where many people can read it. For the same reason it
+// never wraps url.Parse's error, which quotes its whole input.
 func parseEndpoint(endpoint string) (*url.URL, error) {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
@@ -122,22 +128,21 @@ func parseEndpoint(endpoint string) (*url.URL, error) {
 	}
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("invalid endpoint %q: %w", endpoint, err)
+		return nil, errors.New("endpoint is not a valid URL")
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, fmt.Errorf("invalid endpoint %q: scheme must be http or https", endpoint)
+		return nil, errors.New("endpoint must start with https://")
 	}
 	if u.Host == "" {
-		return nil, fmt.Errorf("invalid endpoint %q: missing host", endpoint)
+		return nil, errors.New("endpoint has no host")
 	}
 	// The admin token travels in every request, so plain http is only for a
 	// server on this machine (a local AutoPilot, or the tests' fake).
 	if u.Scheme == "http" && !isLoopback(u.Hostname()) {
-		return nil, fmt.Errorf("invalid endpoint %q: plain http is allowed only for a loopback host "+
-			"(localhost, 127.0.0.1 or ::1); use https", endpoint)
+		return nil, errors.New("plain http is allowed only for a loopback host (localhost, 127.0.0.1 or ::1); use https")
 	}
 	if u.User != nil {
-		return nil, fmt.Errorf("invalid endpoint %q: credentials belong in the token, not the URL", u.Redacted())
+		return nil, errors.New("endpoint must not carry a user name or password; credentials belong in the token")
 	}
 	u.RawQuery = ""
 	u.Fragment = ""
@@ -149,8 +154,8 @@ func parseEndpoint(endpoint string) (*url.URL, error) {
 	// /v1/admin with the same not_found it gives a missing record, so every
 	// record would read as gone.
 	if strings.Contains(prefix+"/", APIPath+"/") {
-		return nil, fmt.Errorf("invalid endpoint %q: it has a path after %s; give the AutoPilot's base URL, such "+
-			"as https://autopilot.example.com", endpoint, APIPath)
+		return nil, fmt.Errorf("endpoint has a path after %s; give the AutoPilot's base URL, such as "+
+			"https://autopilot.example.com", APIPath)
 	}
 	u.Path = prefix + APIPath
 	return u, nil

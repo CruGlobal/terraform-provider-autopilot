@@ -15,8 +15,9 @@ import (
 )
 
 // configure drives Configure directly with the given attribute values (nil
-// means null, unknown means unknown) so the environment fallback and the
-// validation can be tested without a resource to hang a configuration on.
+// means null, unknown means unknown) so where the endpoint and token come
+// from, and their validation, can be tested without a resource to hang a
+// configuration on.
 func configure(t *testing.T, endpoint, token *string) provider.ConfigureResponse {
 	t.Helper()
 	ctx := context.Background()
@@ -64,7 +65,7 @@ func TestConfigure_MissingValuesAreAttributeErrors(t *testing.T) {
 	}
 }
 
-func TestConfigure_EnvironmentFallback(t *testing.T) {
+func TestConfigure_BothFromEnvironment(t *testing.T) {
 	t.Setenv(envEndpoint, "https://autopilot.example.com")
 	t.Setenv(envToken, "admin-token-from-env")
 	resp := configure(t, nil, nil)
@@ -207,7 +208,7 @@ func TestConfigure_EndpointAndTokenComeFromOnePlace(t *testing.T) {
 		{
 			name:     "endpoint in the block, token in the environment",
 			endpoint: ptr(blockEndpoint), envToken: envSecret,
-			want:       "Missing AutoPilot token",
+			want:       incompleteBlock,
 			wantDetail: []string{"sets `endpoint` but not `token`", envToken + " is set in this environment, but it is never used"},
 		},
 		{
@@ -215,32 +216,32 @@ func TestConfigure_EndpointAndTokenComeFromOnePlace(t *testing.T) {
 			// a configuration that sets only its own endpoint.
 			name:     "endpoint in the block, both in the environment",
 			endpoint: ptr(blockEndpoint), envEndpoint: envURL, envToken: envSecret,
-			want:       "Missing AutoPilot token",
+			want:       incompleteBlock,
 			wantDetail: []string{"sets `endpoint` but not `token`", envToken + " is set in this environment, but it is never used"},
 		},
 		{
 			name:       "endpoint in the block, nothing in the environment",
 			endpoint:   ptr(blockEndpoint),
-			want:       "Missing AutoPilot token",
+			want:       incompleteBlock,
 			wantDetail: []string{"sets `endpoint` but not `token`"},
 			notDetail:  []string{"is set in this environment"},
 		},
 		{
 			name:  "token in the block, endpoint in the environment",
 			token: ptr(blockToken), envEndpoint: envURL,
-			want:       "Missing AutoPilot endpoint",
+			want:       incompleteBlock,
 			wantDetail: []string{"sets `token` but not `endpoint`", envEndpoint + " is set in this environment, but it is never used"},
 		},
 		{
 			name:  "token in the block, both in the environment",
 			token: ptr(blockToken), envEndpoint: envURL, envToken: envSecret,
-			want:       "Missing AutoPilot endpoint",
+			want:       incompleteBlock,
 			wantDetail: []string{"sets `token` but not `endpoint`"},
 		},
 		{
 			name:       "token in the block, nothing in the environment",
 			token:      ptr(blockToken),
-			want:       "Missing AutoPilot endpoint",
+			want:       incompleteBlock,
 			wantDetail: []string{"sets `token` but not `endpoint`"},
 			notDetail:  []string{"is set in this environment"},
 		},
@@ -281,8 +282,59 @@ func TestConfigure_EndpointAndTokenComeFromOnePlace(t *testing.T) {
 		{
 			name:     "an unknown endpoint in the block, with a token in the environment",
 			endpoint: ptr(unknown), envToken: envSecret,
-			want:       "Unknown AutoPilot endpoint; Missing AutoPilot token",
+			want:       "Unknown AutoPilot endpoint; " + incompleteBlock,
 			wantDetail: []string{"sets `endpoint` but not `token`"},
+		},
+		{
+			name:     "a token of only spaces in the block, with a token in the environment",
+			endpoint: ptr(blockEndpoint), token: ptr("  \n"), envToken: envSecret,
+			want:       "Missing AutoPilot token",
+			wantDetail: []string{"sets `token` to an empty value (or only spaces)", "never filled in from the environment"},
+		},
+		{
+			name:     "an endpoint of only spaces in the block, with an endpoint in the environment",
+			endpoint: ptr(" "), token: ptr(blockToken), envEndpoint: envURL,
+			want:       "Missing AutoPilot endpoint",
+			wantDetail: []string{"sets `endpoint` to an empty value (or only spaces)"},
+		},
+		{
+			name:        "a token of only spaces in the environment",
+			envEndpoint: envURL, envToken: " \t",
+			want:       "Missing AutoPilot token",
+			wantDetail: []string{envEndpoint + " is set but " + envToken + " is not (or is blank)"},
+		},
+		{
+			name:        "an endpoint of only spaces in the environment",
+			envEndpoint: "\n", envToken: envSecret,
+			want:       "Missing AutoPilot endpoint",
+			wantDetail: []string{envToken + " is set but " + envEndpoint + " is not (or is blank)"},
+		},
+		{
+			name:        "both of only spaces in the environment",
+			envEndpoint: " ", envToken: " ",
+			want: "Missing AutoPilot endpoint; Missing AutoPilot token",
+		},
+		{
+			// A blank variable is not "set", so the error doesn't say it was
+			// passed over.
+			name:     "endpoint in the block, a token of only spaces in the environment",
+			endpoint: ptr(blockEndpoint), envToken: "  ",
+			want:      incompleteBlock,
+			notDetail: []string{"is set in this environment"},
+		},
+		{
+			// The two values swapped: the token, where the endpoint should be,
+			// is never shown.
+			name:        "the endpoint and the token swapped in the environment",
+			envEndpoint: envSecret, envToken: envURL,
+			want:       "Invalid AutoPilot endpoint",
+			wantDetail: []string{"from the " + envEndpoint + " environment variable", "The value is not shown"},
+		},
+		{
+			name:     "the endpoint and the token swapped in the block",
+			endpoint: ptr(blockToken), token: ptr(blockEndpoint),
+			want:       "Invalid AutoPilot endpoint",
+			wantDetail: []string{"from the provider block", "The value is not shown"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -312,9 +364,10 @@ func TestConfigure_EndpointAndTokenComeFromOnePlace(t *testing.T) {
 				if strings.Contains(text, blockToken) || strings.Contains(text, envSecret) {
 					t.Errorf("a diagnostic repeats a token: %q", text)
 				}
-				// Each error says where the values can come from.
+				// Each error about where the values come from says where
+				// they can come from.
 				for _, where := range []string{"provider block", envEndpoint, envToken} {
-					if !strings.Contains(d.Detail(), where) {
+					if !strings.HasPrefix(d.Summary(), "Invalid") && !strings.Contains(d.Detail(), where) {
 						t.Errorf("%q does not mention %s: %q", d.Summary(), where, d.Detail())
 					}
 				}
@@ -355,7 +408,7 @@ resource "autopilot_app" "test" {
   name = %q
 }
 `, elsewhere.URL, randName()),
-				ExpectError: expectErr("Missing AutoPilot token ... sets `endpoint` but not `token`"),
+				ExpectError: expectErr("Incomplete AutoPilot provider block ... sets `endpoint` but not `token`"),
 			},
 		},
 	})

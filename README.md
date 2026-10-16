@@ -89,7 +89,7 @@ resource "autopilot_app" "billing" {
 Both are checked when the provider is configured: a missing value, an
 endpoint that isn't an https URL with a host, an endpoint with a route after
 `/v1/admin`, or a token with spaces in it fails the plan with an error that
-says which and where it came from. Plain
+says which and where it came from, without showing the value. Plain
 `http://` is allowed only for a loopback host (`localhost`, `127.0.0.1`,
 `::1`), because the admin token travels in every request.
 
@@ -118,9 +118,16 @@ token in from the environment, it would send production's token to the test
 AutoPilot. Instead the plan fails when the provider is configured, before any
 request is sent.
 
-A refusal names what is missing and where it can come from, and never shows
-the token. An empty value in the block counts as set: it is refused, never
-filled in from the environment.
+A refusal names what is missing and where it can come from. No error shows
+the token, or the endpoint, in case a token was put there by mistake (say,
+with the two values swapped).
+
+A value that is empty or only spaces counts as missing, in the block and in
+the environment alike, and one in the block is never filled in from the
+environment. A value in the block that is unknown when the provider is
+configured (say, one that comes from a resource not yet applied) counts as
+set, so it is refused too: apply its source first with `-target`, or set the
+value statically.
 
 ### A sender's secrets
 
