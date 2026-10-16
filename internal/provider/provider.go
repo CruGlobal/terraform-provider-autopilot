@@ -3,9 +3,11 @@ package provider
 import (
 	"context"
 	"os"
+	"strings"
 
 	"github.com/CruGlobal/terraform-provider-autopilot/internal/client"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
@@ -13,12 +15,24 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-// Environment variables the provider falls back to when the corresponding
-// provider-block attribute is unset.
+// Environment variables the provider reads when the provider block sets
+// neither endpoint nor token. It never takes one from the block and the
+// other from the environment: see endpointAndToken.
 const (
 	envEndpoint = "AUTOPILOT_ENDPOINT"
 	envToken    = "AUTOPILOT_TOKEN"
 )
+
+// fromBlock names the provider block as where a value came from, in an
+// error message.
+const fromBlock = "the provider block"
+
+// oneSource is the rule the provider holds the endpoint and the token to,
+// said the same way in every error that refuses a configuration for it.
+const oneSource = "The provider takes the endpoint and the token from one place, so that a token meant for one " +
+	"AutoPilot is never sent to another: either both from the provider block, or both from the " +
+	envEndpoint + " and " + envToken + " environment variables (as a runner such as Atlantis sets them) " +
+	"with neither in the block."
 
 var _ provider.Provider = &autopilotProvider{}
 
@@ -59,7 +73,16 @@ func (p *autopilotProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 			"The provider authenticates with an AutoPilot **admin token**, sent as a bearer token. AutoPilot keeps " +
 			"only the token's SHA-256, so it cannot show you the token; whoever set it up holds it. Keep it in the " +
 			"`AUTOPILOT_TOKEN` environment variable rather than in configuration.\n\n" +
-			"Both attributes fall back to environment variables (`AUTOPILOT_ENDPOINT`, `AUTOPILOT_TOKEN`).\n\n" +
+			"The provider takes the endpoint and the token from one place, so that a token meant for one " +
+			"AutoPilot is never sent to another:\n\n" +
+			"- **Both from the environment:** leave `endpoint` and `token` out of the provider block (or leave " +
+			"the block out), and set both `AUTOPILOT_ENDPOINT` and `AUTOPILOT_TOKEN`.\n" +
+			"- **Both from the provider block:** set both `endpoint` and `token`. The environment variables are " +
+			"then not read.\n\n" +
+			"Anything else fails when the provider is configured, before any request is sent: a provider block " +
+			"that sets one of the two but not the other (even when the environment has the other), or, with " +
+			"neither in the block, an environment that has only one of them. An empty value in the block " +
+			"counts as set, so it is refused too, never filled in from the environment.\n\n" +
 			"## Terraform version\n\n" +
 			"`autopilot_sender` takes its secrets as write-only arguments, which need **Terraform 1.11 or later**.",
 		Attributes: map[string]schema.Attribute{
@@ -67,13 +90,14 @@ func (p *autopilotProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 				MarkdownDescription: "Base URL of the AutoPilot, for example `https://autopilot.example.com`. " +
 					"The `/v1/admin` path is appended automatically; a URL with a route after `/v1/admin` is refused. " +
 					"It must be https; plain `http://` is allowed only for a loopback host (`localhost`, `127.0.0.1`, " +
-					"`::1`), because the admin token travels in every request. Falls back to the `AUTOPILOT_ENDPOINT` " +
-					"environment variable.",
+					"`::1`), because the admin token travels in every request. Set it together with `token`, or " +
+					"leave both out to use the `AUTOPILOT_ENDPOINT` and `AUTOPILOT_TOKEN` environment variables.",
 				Optional: true,
 			},
 			"token": schema.StringAttribute{
-				MarkdownDescription: "Admin token, sent as the bearer token on every request. Falls back to the " +
-					"`AUTOPILOT_TOKEN` environment variable.",
+				MarkdownDescription: "Admin token, sent as the bearer token on every request. Set it together with " +
+					"`endpoint`, or leave both out to use the `AUTOPILOT_ENDPOINT` and `AUTOPILOT_TOKEN` environment " +
+					"variables.",
 				Optional:  true,
 				Sensitive: true,
 			},
@@ -88,37 +112,12 @@ func (p *autopilotProvider) Configure(ctx context.Context, req provider.Configur
 		return
 	}
 
-	if cfg.Endpoint.IsUnknown() {
-		resp.Diagnostics.AddAttributeError(
-			path.Root("endpoint"),
-			"Unknown AutoPilot endpoint",
-			"The provider cannot create the AutoPilot API client because `endpoint` is unknown at configure time. "+
-				"Either target-apply the source of the value first, set it statically, or use the "+envEndpoint+" environment variable.",
-		)
-	}
-	if cfg.Token.IsUnknown() {
-		resp.Diagnostics.AddAttributeError(
-			path.Root("token"),
-			"Unknown AutoPilot token",
-			"The provider cannot create the AutoPilot API client because `token` is unknown at configure time. "+
-				"Either target-apply the source of the value first, set it statically, or use the "+envToken+" environment variable.",
-		)
-	}
+	endpoint, endpointFrom, token, tokenFrom := endpointAndToken(cfg, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	endpoint, endpointFrom := stringValueOrEnv(cfg.Endpoint, envEndpoint)
-	token, tokenFrom := stringValueOrEnv(cfg.Token, envToken)
-
-	if endpoint == "" {
-		resp.Diagnostics.AddAttributeError(
-			path.Root("endpoint"),
-			"Missing AutoPilot endpoint",
-			"Set `endpoint` in the provider configuration or the "+envEndpoint+" environment variable to the base URL "+
-				"of the AutoPilot to manage (for example https://autopilot.example.com).",
-		)
-	} else if err := client.ValidateEndpoint(endpoint); err != nil {
+	if err := client.ValidateEndpoint(endpoint); err != nil {
 		resp.Diagnostics.AddAttributeError(
 			path.Root("endpoint"),
 			"Invalid AutoPilot endpoint",
@@ -126,14 +125,7 @@ func (p *autopilotProvider) Configure(ctx context.Context, req provider.Configur
 				"such as https://autopilot.example.com: "+err.Error(),
 		)
 	}
-	if token == "" {
-		resp.Diagnostics.AddAttributeError(
-			path.Root("token"),
-			"Missing AutoPilot token",
-			"Set `token` in the provider configuration or the "+envToken+" environment variable to an AutoPilot "+
-				"admin token.",
-		)
-	} else if err := client.ValidateToken(token); err != nil {
+	if err := client.ValidateToken(token); err != nil {
 		// The error never repeats the token.
 		resp.Diagnostics.AddAttributeError(
 			path.Root("token"),
@@ -167,17 +159,111 @@ func (p *autopilotProvider) DataSources(_ context.Context) []func() datasource.D
 	return nil
 }
 
-// stringValueOrEnv resolves the config-then-environment fallback: a non-empty
-// configured value wins, otherwise the first non-empty environment variable.
-// It also says where the value came from, for an error message.
-func stringValueOrEnv(v types.String, envVars ...string) (value, from string) {
-	if !v.IsNull() && !v.IsUnknown() && v.ValueString() != "" {
-		return v.ValueString(), "the provider configuration"
+// endpointAndToken finds the endpoint and the token, and says where each came
+// from, for an error message. Both come from one place. When the provider
+// block sets either of them, both come from the block and the environment is
+// not read; otherwise both come from the environment. That way a block aimed
+// at one AutoPilot can never pick up another's token from the environment,
+// as it would if it set only endpoint where a runner has both variables set.
+//
+// An attribute counts as set in the block whenever it isn't null: an unknown
+// value or an empty one is set, and is refused rather than filled in from
+// the environment. Every refusal names what is missing and where it can come
+// from. None repeats the token, or says more of an environment variable than
+// whether it is set.
+func endpointAndToken(cfg autopilotProviderModel, diags *diag.Diagnostics) (endpoint, endpointFrom, token, tokenFrom string) {
+	endpointInBlock, tokenInBlock := !cfg.Endpoint.IsNull(), !cfg.Token.IsNull()
+
+	if cfg.Endpoint.IsUnknown() {
+		diags.AddAttributeError(
+			path.Root("endpoint"),
+			"Unknown AutoPilot endpoint",
+			"The provider cannot create the AutoPilot API client because `endpoint` is unknown at configure time. "+
+				"Either target-apply the source of the value first, set it statically, or take both `endpoint` and "+
+				"`token` out of the provider block to use the "+envEndpoint+" and "+envToken+" environment variables.",
+		)
 	}
-	for _, name := range envVars {
-		if got := os.Getenv(name); got != "" {
-			return got, "the " + name + " environment variable"
+	if cfg.Token.IsUnknown() {
+		diags.AddAttributeError(
+			path.Root("token"),
+			"Unknown AutoPilot token",
+			"The provider cannot create the AutoPilot API client because `token` is unknown at configure time. "+
+				"Either target-apply the source of the value first, set it statically, or take both `endpoint` and "+
+				"`token` out of the provider block to use the "+envEndpoint+" and "+envToken+" environment variables.",
+		)
+	}
+	switch {
+	case endpointInBlock && !tokenInBlock:
+		diags.AddAttributeError(path.Root("token"), "Missing AutoPilot token", halfBlock("endpoint", "token", envToken))
+	case tokenInBlock && !endpointInBlock:
+		diags.AddAttributeError(path.Root("endpoint"), "Missing AutoPilot endpoint", halfBlock("token", "endpoint", envEndpoint))
+	}
+	if diags.HasError() {
+		return "", "", "", ""
+	}
+
+	if endpointInBlock {
+		// The token is in the block too: a block with only one of them was
+		// refused above.
+		endpoint, token = cfg.Endpoint.ValueString(), cfg.Token.ValueString()
+		if strings.TrimSpace(endpoint) == "" {
+			diags.AddAttributeError(path.Root("endpoint"), "Missing AutoPilot endpoint", emptyInBlock("endpoint",
+				"the base URL of the AutoPilot to manage, for example https://autopilot.example.com"))
 		}
+		if strings.TrimSpace(token) == "" {
+			diags.AddAttributeError(path.Root("token"), "Missing AutoPilot token", emptyInBlock("token",
+				"an AutoPilot admin token"))
+		}
+		return endpoint, fromBlock, token, fromBlock
 	}
-	return "", ""
+
+	endpoint, token = os.Getenv(envEndpoint), os.Getenv(envToken)
+	switch {
+	case endpoint == "" && token == "":
+		diags.AddAttributeError(path.Root("endpoint"), "Missing AutoPilot endpoint", neitherSet+
+			" The endpoint is the base URL of the AutoPilot to manage, for example https://autopilot.example.com.")
+		diags.AddAttributeError(path.Root("token"), "Missing AutoPilot token", neitherSet+
+			" The token is an AutoPilot admin token.")
+	case endpoint == "":
+		diags.AddAttributeError(path.Root("endpoint"), "Missing AutoPilot endpoint", halfEnvironment(envToken, envEndpoint))
+	case token == "":
+		diags.AddAttributeError(path.Root("token"), "Missing AutoPilot token", halfEnvironment(envEndpoint, envToken))
+	}
+	return endpoint, "the " + envEndpoint + " environment variable", token, "the " + envToken + " environment variable"
+}
+
+// neitherSet explains a provider that has neither the endpoint nor the token
+// from anywhere.
+const neitherSet = "The provider block sets neither `endpoint` nor `token`, and neither " + envEndpoint + " nor " +
+	envToken + " is set in the environment. Set both `endpoint` and `token` in the provider block, or set both " +
+	"environment variables."
+
+// halfBlock explains a provider block that sets one of endpoint and token but
+// not the other. It says whether the missing one's environment variable is
+// set, since that is the value the provider declined to use, but never what
+// it holds.
+func halfBlock(set, missing, missingEnv string) string {
+	detail := "The provider block sets `" + set + "` but not `" + missing + "`. " + oneSource +
+		" Set `" + missing + "` in the provider block too, or take `" + set + "` out of it."
+	if os.Getenv(missingEnv) != "" {
+		detail += " " + missingEnv + " is set in this environment, but it is never used together with a " +
+			"provider block that sets `" + set + "`."
+	}
+	return detail
+}
+
+// halfEnvironment explains an environment that has one of the two variables
+// but not the other, when the provider block sets neither attribute.
+func halfEnvironment(setEnv, missingEnv string) string {
+	return "The provider block sets neither `endpoint` nor `token`, so both come from the environment, where " +
+		setEnv + " is set but " + missingEnv + " is not. " + oneSource +
+		" Set " + missingEnv + " too, or set both `endpoint` and `token` in the provider block."
+}
+
+// emptyInBlock explains an attribute the provider block sets to an empty
+// value.
+func emptyInBlock(attr, want string) string {
+	return "The provider block sets `" + attr + "` to an empty value. Set it to " + want + ", or take both " +
+		"`endpoint` and `token` out of the block to use the " + envEndpoint + " and " + envToken +
+		" environment variables. An empty value in the block is never filled in from the environment."
 }

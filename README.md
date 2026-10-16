@@ -48,10 +48,9 @@ terraform {
   }
 }
 
-provider "autopilot" {
-  endpoint = "https://autopilot.example.com"
-  # token = var.autopilot_token   # or set AUTOPILOT_TOKEN
-}
+# The endpoint and the admin token both come from AUTOPILOT_ENDPOINT and
+# AUTOPILOT_TOKEN. See "Where the endpoint and token come from" below.
+provider "autopilot" {}
 
 resource "random_password" "request_secret" {
   length  = 48
@@ -84,8 +83,8 @@ resource "autopilot_app" "billing" {
 
 | Attribute | Description |
 | --- | --- |
-| `endpoint` | Base URL of the AutoPilot. `/v1/admin` is appended. Falls back to `AUTOPILOT_ENDPOINT`. |
-| `token` | Admin token, sent as a bearer token. Sensitive. Falls back to `AUTOPILOT_TOKEN`. |
+| `endpoint` | Base URL of the AutoPilot. `/v1/admin` is appended. Set it with `token`, or leave both out to use `AUTOPILOT_ENDPOINT`. |
+| `token` | Admin token, sent as a bearer token. Sensitive. Set it with `endpoint`, or leave both out to use `AUTOPILOT_TOKEN`. |
 
 Both are checked when the provider is configured: a missing value, an
 endpoint that isn't an https URL with a host, an endpoint with a route after
@@ -97,6 +96,31 @@ says which and where it came from. Plain
 Full reference docs (generated from the provider schema) live in
 [`docs/`](./docs/) and on the
 [Terraform Registry](https://registry.terraform.io/providers/CruGlobal/autopilot/latest).
+
+### Where the endpoint and token come from
+
+The provider takes the endpoint and the token from one place: both from the
+provider block, or both from the environment.
+
+| Provider block | Environment | Result |
+| --- | --- | --- |
+| Sets `endpoint` and `token` | Anything | Uses the block. The environment variables are not read. |
+| Sets neither, or there is no block | `AUTOPILOT_ENDPOINT` and `AUTOPILOT_TOKEN` both set | Uses the environment. |
+| Sets one of the two | Anything, even with the other variable set | Refused. |
+| Sets neither, or there is no block | Only one of the two set | Refused. |
+| Sets neither, or there is no block | Neither set | Refused. |
+
+This keeps a token meant for one AutoPilot from reaching another. Say the
+runner that plans your configurations (Atlantis, for example) has both
+variables set for your production AutoPilot, and a configuration aimed at a
+test AutoPilot sets only `endpoint` in its block. If the provider filled the
+token in from the environment, it would send production's token to the test
+AutoPilot. Instead the plan fails when the provider is configured, before any
+request is sent.
+
+A refusal names what is missing and where it can come from, and never shows
+the token. An empty value in the block counts as set: it is refused, never
+filled in from the environment.
 
 ### A sender's secrets
 
