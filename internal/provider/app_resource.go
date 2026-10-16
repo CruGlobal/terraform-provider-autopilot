@@ -239,7 +239,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 								"repository's own settings and ruleset allow it, which means the repository allows " +
 								"auto-merge and its required checks and reviews pass. Off, a person merges. Only with " +
 								"`implement-work-item` or `fix-error` in `kinds`. Off unless set: leaving it out is the " +
-								"same as `false`.",
+								"same as `false`. Turning it off, or removing the entry or the app, leaves auto-merge on " +
+								"for a pull request that already has it, and GitHub still merges that pull request: turn " +
+								"auto-merge off on the pull request in GitHub.",
 							Optional: true,
 						},
 					},
