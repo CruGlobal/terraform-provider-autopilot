@@ -309,8 +309,8 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 			}
 			canDecide := false
 			if rawDecide, ok := e["can_decide"]; ok {
-				if err := json.Unmarshal(rawDecide, &canDecide); err != nil {
-					return f, invalid(at+"/can_decide", "must be true or false")
+				if canDecide, ref = boolValue(rawDecide, at+"/can_decide"); ref != nil {
+					return f, ref
 				}
 			}
 			if canDecide && !slices.Contains(kinds, reviewKind) {
@@ -318,8 +318,8 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 			}
 			canAutoMerge := false
 			if rawMerge, ok := e["can_auto_merge"]; ok {
-				if err := json.Unmarshal(rawMerge, &canAutoMerge); err != nil {
-					return f, invalid(at+"/can_auto_merge", "must be true or false")
+				if canAutoMerge, ref = boolValue(rawMerge, at+"/can_auto_merge"); ref != nil {
+					return f, ref
 				}
 			}
 			if canAutoMerge && !slices.ContainsFunc(kinds, func(k string) bool { return slices.Contains(pullRequestKinds, k) }) {

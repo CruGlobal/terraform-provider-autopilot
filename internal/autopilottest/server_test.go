@@ -126,6 +126,16 @@ func TestAccepts_CanAutoMerge(t *testing.T) {
 		map[string]any{"sender": "tracker", "kinds": []string{"implement-work-item"}, "can_auto_merge": "yes"},
 	}})
 	expect(t, "can_auto_merge not a flag", st, http.StatusUnprocessableEntity, body)
+	// null is not false: AutoPilot refuses it, for both flags.
+	for _, flag := range []string{"can_auto_merge", "can_decide"} {
+		st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{
+			map[string]any{"sender": "tracker", "kinds": []string{"implement-work-item", "review-pr"}, flag: nil},
+		}})
+		expect(t, flag+" null", st, http.StatusUnprocessableEntity, body)
+		if body["field"] != "/accepts/0/"+flag {
+			t.Errorf("%s null: field = %v", flag, body["field"])
+		}
+	}
 
 	on := map[string]any{"sender": "tracker", "kinds": []string{"research", "fix-error"}, "can_auto_merge": true}
 	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{on}})
