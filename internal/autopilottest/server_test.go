@@ -110,6 +110,53 @@ func TestAccepts_Duplicates(t *testing.T) {
 	expect(t, "two entries for one sender", st, http.StatusUnprocessableEntity, body)
 }
 
+// can_auto_merge is true only with a kind that opens a pull request, is kept
+// and answered, and two entries for one sender that differ only in it are
+// refused.
+func TestAccepts_CanAutoMerge(t *testing.T) {
+	s := New(t)
+	for _, kinds := range [][]string{{"research"}, {"review-pr"}} {
+		entry := map[string]any{"sender": "tracker", "kinds": kinds, "can_auto_merge": true}
+		st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{entry}})
+		expect(t, "can_auto_merge with "+kinds[0], st, http.StatusUnprocessableEntity, body)
+		if body["field"] != "/accepts/0/can_auto_merge" {
+			t.Errorf("%s: field = %v", kinds[0], body["field"])
+		}
+	}
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{
+		map[string]any{"sender": "tracker", "kinds": []string{"implement-work-item"}, "can_auto_merge": "yes"},
+	}})
+	expect(t, "can_auto_merge not a flag", st, http.StatusUnprocessableEntity, body)
+	// null is not false: AutoPilot refuses it, for both flags.
+	for _, flag := range []string{"can_auto_merge", "can_decide"} {
+		st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{
+			map[string]any{"sender": "tracker", "kinds": []string{"implement-work-item", "review-pr"}, flag: nil},
+		}})
+		expect(t, flag+" null", st, http.StatusUnprocessableEntity, body)
+		if body["field"] != "/accepts/0/"+flag {
+			t.Errorf("%s null: field = %v", flag, body["field"])
+		}
+	}
+
+	on := map[string]any{"sender": "tracker", "kinds": []string{"research", "fix-error"}, "can_auto_merge": true}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{on}})
+	expect(t, "can_auto_merge with fix-error", st, http.StatusCreated, body)
+	if v, _ := s.App("billing"); len(v.Accepts) != 1 || !v.Accepts[0].CanAutoMerge {
+		t.Errorf("accepts = %+v, want can_auto_merge kept", v.Accepts)
+	}
+	accepts, _ := body["accepts"].([]any)
+	if len(accepts) != 1 {
+		t.Fatalf("accepts = %v", accepts)
+	}
+	if first, _ := accepts[0].(map[string]any); first["can_auto_merge"] != true {
+		t.Errorf("accepts = %v, want can_auto_merge answered", accepts)
+	}
+
+	off := map[string]any{"sender": "tracker", "kinds": []string{"research", "fix-error"}}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "payroll", "accepts": []any{on, off}})
+	expect(t, "two entries for one sender, apart in can_auto_merge", st, http.StatusUnprocessableEntity, body)
+}
+
 func TestDevelopers_LowercaseASCIIOnly(t *testing.T) {
 	s := New(t)
 	for _, bad := range []string{"Someone@example.com", "someone@Example.com", "someoné@example.com", "someone", "some one@example.com"} {

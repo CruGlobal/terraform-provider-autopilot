@@ -449,6 +449,15 @@ func stringValue(raw json.RawMessage, pointer string) (string, *refusal) {
 	return *out, nil
 }
 
+// boolValue reads true or false, and refuses null as AutoPilot does.
+func boolValue(raw json.RawMessage, pointer string) (bool, *refusal) {
+	var out *bool
+	if err := json.Unmarshal(raw, &out); err != nil || out == nil {
+		return false, &refusal{http.StatusUnprocessableEntity, "invalid_attribute", "must be true or false", pointer}
+	}
+	return *out, nil
+}
+
 func sortedUnique(values []string) []string {
 	out := slices.Clone(values)
 	if out == nil {

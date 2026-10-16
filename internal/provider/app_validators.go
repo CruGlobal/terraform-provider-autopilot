@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -72,11 +73,17 @@ func (v noCaseRepeatsValidator) ValidateSet(ctx context.Context, req validator.S
 }
 
 // acceptsValidator checks the rules that span an accepts entry or the whole
-// set: each sender at most once, and can_decide only with review-pr.
+// set: each sender at most once, can_decide only with review-pr, and
+// can_auto_merge only with a kind that opens a pull request.
 type acceptsValidator struct{}
 
+// pullRequestKinds are the kinds whose tasks open a pull request, the only
+// ones auto-merge applies to.
+var pullRequestKinds = []string{"implement-work-item", "fix-error"}
+
 func (acceptsValidator) Description(context.Context) string {
-	return "each sender at most once; can_decide only with review-pr in kinds"
+	return "each sender at most once; can_decide only with review-pr in kinds; " +
+		"can_auto_merge only with implement-work-item or fix-error in kinds"
 }
 
 func (v acceptsValidator) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
@@ -104,26 +111,36 @@ func (acceptsValidator) ValidateSet(ctx context.Context, req validator.SetReques
 			}
 			seen[sender] = true
 		}
-		if m.CanDecide.IsNull() || m.CanDecide.IsUnknown() || !m.CanDecide.ValueBool() || m.Kinds.IsUnknown() {
-			continue
-		}
-		// A kind not known yet may turn out to be review-pr, so the check waits
-		// until every kind is known: Terraform validates again at apply, with
-		// the values the plan left unknown.
-		hasReviewPR, unknownKind := false, false
-		for _, k := range m.Kinds.Elements() {
-			s, ok := k.(types.String)
-			switch {
-			case !ok || s.IsUnknown():
-				unknownKind = true
-			case s.ValueString() == "review-pr":
-				hasReviewPR = true
-			}
-		}
-		if !hasReviewPR && !unknownKind {
+		if isTrue(m.CanDecide) && lacksKind(m.Kinds, "review-pr") {
 			resp.Diagnostics.AddAttributeError(req.Path, "can_decide without review-pr",
 				fmt.Sprintf("The entry for %q sets can_decide, which only applies to review-pr tasks, but its kinds "+
 					"don't include review-pr. Add review-pr to its kinds, or leave can_decide out.", m.Sender.ValueString()))
 		}
+		if isTrue(m.CanAutoMerge) && lacksKind(m.Kinds, pullRequestKinds...) {
+			resp.Diagnostics.AddAttributeError(req.Path, "can_auto_merge without a pull request kind",
+				fmt.Sprintf("The entry for %q sets can_auto_merge, which only applies to the pull requests that "+
+					"implement-work-item and fix-error tasks open, but its kinds include neither. Add one of them to its "+
+					"kinds, or leave can_auto_merge out.", m.Sender.ValueString()))
+		}
 	}
+}
+
+// isTrue reports whether a flag is known and true.
+func isTrue(b types.Bool) bool { return !b.IsNull() && !b.IsUnknown() && b.ValueBool() }
+
+// lacksKind reports whether a known set of kinds holds none of wanted. A kind
+// not known yet may turn out to be one of them, so the answer is false until
+// every kind is known: Terraform validates again at apply, with the values
+// the plan left unknown.
+func lacksKind(kinds types.Set, wanted ...string) bool {
+	if kinds.IsNull() || kinds.IsUnknown() {
+		return false
+	}
+	for _, k := range kinds.Elements() {
+		s, ok := k.(types.String)
+		if !ok || s.IsUnknown() || slices.Contains(wanted, s.ValueString()) {
+			return false
+		}
+	}
+	return true
 }
