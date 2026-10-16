@@ -11,8 +11,18 @@ terraform {
   }
 }
 
-# Both attributes fall back to AUTOPILOT_ENDPOINT and AUTOPILOT_TOKEN, so the
-# admin token never has to appear in configuration.
-provider "autopilot" {
-  endpoint = "https://autopilot.example.com"
-}
+# The provider takes the endpoint and the admin token from one place. Here
+# both come from the AUTOPILOT_ENDPOINT and AUTOPILOT_TOKEN environment
+# variables, so the token never has to appear in configuration.
+provider "autopilot" {}
+
+# Or set both in the block, and the environment is not read:
+#
+#   provider "autopilot" {
+#     endpoint = "https://autopilot.example.com"
+#     token    = var.autopilot_token
+#   }
+#
+# A block that sets one of the two but not the other is refused, even when
+# the environment has the other, so a token meant for one AutoPilot is never
+# sent to another.

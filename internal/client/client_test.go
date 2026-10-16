@@ -112,6 +112,40 @@ func TestNew_NormalisesEndpoint(t *testing.T) {
 	}
 }
 
+// An endpoint error gives the reason only. A token can end up where the
+// endpoint should be (the two swapped, or the wrong output wired in), and the
+// error is printed in plan output.
+func TestValidateEndpoint_NeverRepeatsTheValue(t *testing.T) {
+	var b [24]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatal(err)
+	}
+	secret := "tfacc-" + hex.EncodeToString(b[:])
+	for _, bad := range []string{
+		secret,                              // no scheme: the token itself
+		"ftp://" + secret,                   // not http or https
+		"https:///" + secret,                // no host
+		"http://" + secret + ".example.com", // plain http to another host
+		"https://" + secret + "@autopilot.example.com",      // as a user name
+		"https://user:" + secret + "@autopilot.example.com", // as a password
+		"https://autopilot.example.com:" + secret,           // not a valid URL (the port)
+		"https://autopilot.example.com/\x7f" + secret,       // not a valid URL (a control character)
+		"https://autopilot.example.com/v1/admin/" + secret,  // a path after /v1/admin
+	} {
+		err := ValidateEndpoint(bad)
+		if err == nil {
+			t.Errorf("an endpoint was accepted: %s", strings.ReplaceAll(bad, secret, "<secret>"))
+			continue
+		}
+		if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), secret[len("tfacc-"):len("tfacc-")+12]) {
+			t.Errorf("the error repeats the value: %q", strings.ReplaceAll(err.Error(), secret, "<secret>"))
+		}
+		if _, err := New(bad, "tok"); err == nil || strings.Contains(err.Error(), secret) {
+			t.Errorf("New: %v", err)
+		}
+	}
+}
+
 func TestFingerprint(t *testing.T) {
 	// Worked out independently: printf '%s' 'autopilot-fingerprint:<secret>' | shasum -a 256 | cut -c1-16
 	cases := map[string]string{
