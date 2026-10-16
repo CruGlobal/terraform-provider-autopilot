@@ -23,15 +23,20 @@ var (
 	maxDevelopers   = 100
 	appWritable     = []string{"repos", "accepts", "developers"}
 	appReadOnly     = []string{"lock_version", "created_at", "updated_at"}
-	acceptWritable  = []string{"sender", "kinds", "can_decide"}
+	acceptWritable  = []string{"sender", "kinds", "can_decide", "can_auto_merge"}
 	appCreateFields = append([]string{"name"}, appWritable...)
 )
 
+// pullRequestKinds are the kinds whose tasks open a pull request, the only
+// ones auto-merge applies to.
+var pullRequestKinds = []string{"implement-work-item", "fix-error"}
+
 // Accept is one sender an app accepts work from.
 type Accept struct {
-	Sender    string
-	Kinds     []string
-	CanDecide bool
+	Sender       string
+	Kinds        []string
+	CanDecide    bool
+	CanAutoMerge bool
 }
 
 // appRecord is an app as the fake stores it.
@@ -63,7 +68,7 @@ func (rec *appRecord) view() AppView {
 func cloneAccepts(in []Accept) []Accept {
 	out := make([]Accept, 0, len(in))
 	for _, a := range in {
-		out = append(out, Accept{Sender: a.Sender, Kinds: slices.Clone(a.Kinds), CanDecide: a.CanDecide})
+		out = append(out, Accept{Sender: a.Sender, Kinds: slices.Clone(a.Kinds), CanDecide: a.CanDecide, CanAutoMerge: a.CanAutoMerge})
 	}
 	return out
 }
@@ -79,14 +84,22 @@ func sortAccepts(in []Accept) []Accept {
 
 func acceptsEqual(x, y []Accept) bool {
 	return slices.EqualFunc(sortAccepts(x), sortAccepts(y), func(a, b Accept) bool {
-		return a.Sender == b.Sender && a.CanDecide == b.CanDecide && slices.Equal(a.Kinds, b.Kinds)
+		return sameAccept(a, b)
 	})
+}
+
+// sameAccept reports whether two entries, kinds sorted, are exactly equal.
+func sameAccept(a, b Accept) bool {
+	return a.Sender == b.Sender && a.CanDecide == b.CanDecide && a.CanAutoMerge == b.CanAutoMerge &&
+		slices.Equal(a.Kinds, b.Kinds)
 }
 
 func (rec *appRecord) json() map[string]any {
 	accepts := make([]any, 0, len(rec.accepts))
 	for _, a := range sortAccepts(rec.accepts) {
-		accepts = append(accepts, map[string]any{"sender": a.Sender, "kinds": a.Kinds, "can_decide": a.CanDecide})
+		accepts = append(accepts, map[string]any{
+			"sender": a.Sender, "kinds": a.Kinds, "can_decide": a.CanDecide, "can_auto_merge": a.CanAutoMerge,
+		})
 	}
 	return map[string]any{
 		"name":         rec.name,
@@ -303,11 +316,20 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 			if canDecide && !slices.Contains(kinds, reviewKind) {
 				return f, invalid(at+"/can_decide", "can_decide is only for an entry whose kinds include review-pr")
 			}
-			entry := Accept{Sender: sender, Kinds: sortedUnique(kinds), CanDecide: canDecide}
+			canAutoMerge := false
+			if rawMerge, ok := e["can_auto_merge"]; ok {
+				if err := json.Unmarshal(rawMerge, &canAutoMerge); err != nil {
+					return f, invalid(at+"/can_auto_merge", "must be true or false")
+				}
+			}
+			if canAutoMerge && !slices.ContainsFunc(kinds, func(k string) bool { return slices.Contains(pullRequestKinds, k) }) {
+				return f, invalid(at+"/can_auto_merge", "is true only with implement-work-item or fix-error in kinds")
+			}
+			entry := Accept{Sender: sender, Kinds: sortedUnique(kinds), CanDecide: canDecide, CanAutoMerge: canAutoMerge}
 			// An entry sent twice exactly is kept once; two different entries
 			// for one sender are refused.
 			if prior, dup := seen[sender]; dup {
-				if prior.CanDecide == entry.CanDecide && slices.Equal(prior.Kinds, entry.Kinds) {
+				if sameAccept(prior, entry) {
 					continue
 				}
 				return f, invalid(at+"/sender", "an app accepts each sender at most once")

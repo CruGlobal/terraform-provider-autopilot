@@ -8,7 +8,9 @@
 > they may take time to be reviewed.
 
 AutoPilot runs AI agents on work that senders such as issue trackers send it,
-and opens pull requests a person reviews.
+and opens pull requests a person reviews. Where the task asks, the app allows
+it (`can_auto_merge`) and the repository allows auto-merge, GitHub merges the
+pull request itself once the repository's required checks and reviews pass.
 
 `terraform-provider-autopilot` manages the records that say who may send
 AutoPilot work and what each app allows, through AutoPilot's admin API. Each

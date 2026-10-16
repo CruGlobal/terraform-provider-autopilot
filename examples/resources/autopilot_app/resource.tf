@@ -15,6 +15,11 @@ resource "autopilot_app" "billing" {
       kinds  = ["implement-work-item", "fix-error", "review-pr"]
       # Let the tracker's review-pr tasks approve or request changes.
       can_decide = true
+      # Let GitHub's auto-merge be turned on for the pull requests the
+      # tracker's tasks open, when a task asks for it. GitHub merges each one
+      # once the repository allows auto-merge and its required checks and
+      # reviews pass.
+      can_auto_merge = true
     },
     {
       sender = "monitor"

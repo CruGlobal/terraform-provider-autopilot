@@ -41,15 +41,17 @@ type appModel struct {
 }
 
 type acceptModel struct {
-	Sender    types.String `tfsdk:"sender"`
-	Kinds     types.Set    `tfsdk:"kinds"`
-	CanDecide types.Bool   `tfsdk:"can_decide"`
+	Sender       types.String `tfsdk:"sender"`
+	Kinds        types.Set    `tfsdk:"kinds"`
+	CanDecide    types.Bool   `tfsdk:"can_decide"`
+	CanAutoMerge types.Bool   `tfsdk:"can_auto_merge"`
 }
 
 var acceptAttrTypes = map[string]attr.Type{
-	"sender":     types.StringType,
-	"kinds":      types.SetType{ElemType: types.StringType},
-	"can_decide": types.BoolType,
+	"sender":         types.StringType,
+	"kinds":          types.SetType{ElemType: types.StringType},
+	"can_decide":     types.BoolType,
+	"can_auto_merge": types.BoolType,
 }
 
 var acceptObjectType = types.ObjectType{AttrTypes: acceptAttrTypes}
@@ -79,15 +81,48 @@ func acceptsToSet(accepts []client.Accept, prior types.Set) types.Set {
 	if len(accepts) == 0 && prior.IsNull() {
 		return types.SetNull(acceptObjectType)
 	}
+	saysFalse := autoMergeSetFalse(prior)
 	elems := make([]attr.Value, 0, len(accepts))
 	for _, a := range accepts {
+		// can_auto_merge off stays null unless prior set it to false.
+		autoMerge := types.BoolValue(a.CanAutoMerge)
+		if !a.CanAutoMerge && !saysFalse[a.Sender] {
+			autoMerge = types.BoolNull()
+		}
 		elems = append(elems, types.ObjectValueMust(acceptAttrTypes, map[string]attr.Value{
-			"sender":     types.StringValue(a.Sender),
-			"kinds":      setFromStrings(a.Kinds),
-			"can_decide": types.BoolValue(a.CanDecide),
+			"sender":         types.StringValue(a.Sender),
+			"kinds":          setFromStrings(a.Kinds),
+			"can_decide":     types.BoolValue(a.CanDecide),
+			"can_auto_merge": autoMerge,
 		}))
 	}
 	return types.SetValueMust(acceptObjectType, elems)
+}
+
+// autoMergeSetFalse names the senders whose entry in prior (the plan, or the
+// state) sets can_auto_merge to false. That attribute is optional and has no
+// default, so off is null unless the configuration says false. A second
+// default in a set's element would be wrong: the framework finds an
+// element's configuration by the element's whole value, which a computed
+// value taken from the state changes, and then it would apply can_decide's
+// default over a can_decide the configuration sets.
+func autoMergeSetFalse(prior types.Set) map[string]bool {
+	out := map[string]bool{}
+	if prior.IsNull() || prior.IsUnknown() {
+		return out
+	}
+	for _, elem := range prior.Elements() {
+		obj, ok := elem.(types.Object)
+		if !ok || obj.IsNull() || obj.IsUnknown() {
+			continue
+		}
+		sender, _ := obj.Attributes()["sender"].(types.String)
+		flag, _ := obj.Attributes()["can_auto_merge"].(types.Bool)
+		if known(sender) && !flag.IsNull() && !flag.IsUnknown() && !flag.ValueBool() {
+			out[sender.ValueString()] = true
+		}
+	}
+	return out
 }
 
 // acceptsFromSet returns a known set's entries. A null set gives nil (not
@@ -107,9 +142,10 @@ func acceptsFromSet(ctx context.Context, set types.Set, diags *diag.Diagnostics)
 	out := make([]client.Accept, 0, len(models))
 	for _, m := range models {
 		out = append(out, client.Accept{
-			Sender:    m.Sender.ValueString(),
-			Kinds:     stringsFromSet(ctx, m.Kinds, "accepts", diags),
-			CanDecide: m.CanDecide.ValueBool(),
+			Sender:       m.Sender.ValueString(),
+			Kinds:        stringsFromSet(ctx, m.Kinds, "accepts", diags),
+			CanDecide:    m.CanDecide.ValueBool(),
+			CanAutoMerge: m.CanAutoMerge.ValueBool(),
 		})
 	}
 	return out
@@ -195,6 +231,16 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 							Optional: true,
 							Computed: true,
 							Default:  booldefault.StaticBool(false),
+						},
+						"can_auto_merge": schema.BoolAttribute{
+							MarkdownDescription: "Whether GitHub's auto-merge may be turned on for the pull requests that " +
+								"sender's `implement-work-item` and `fix-error` tasks open on this app's repositories, when " +
+								"the task asks for it. AutoPilot never merges: GitHub merges each pull request once the " +
+								"repository's own settings and ruleset allow it, which means the repository allows " +
+								"auto-merge and its required checks and reviews pass. Off, a person merges. Only with " +
+								"`implement-work-item` or `fix-error` in `kinds`. Off unless set: leaving it out is the " +
+								"same as `false`.",
+							Optional: true,
 						},
 					},
 				},

@@ -301,6 +301,106 @@ func TestApp_canDecideSentOnlyWhenTrue(t *testing.T) {
 	})
 }
 
+// can_auto_merge is sent only when true, as can_decide is, so an AutoPilot
+// that predates it still takes an entry that leaves it off.
+func TestApp_canAutoMergeSentOnlyWhenTrue(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, fmt.Sprintf(`
+  accepts = [
+    { sender = %q, kinds = ["implement-work-item"], can_auto_merge = false },
+    { sender = %q, kinds = ["implement-work-item", "fix-error"], can_auto_merge = true },
+  ]`, "aaa-"+randName(), "zzz-"+randName())),
+				Check: func(*terraform.State) error {
+					post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0]
+					accepts, _ := requestBody(t, post)["accepts"].([]any)
+					if len(accepts) != 2 {
+						return fmt.Errorf("accepts = %v", accepts)
+					}
+					first, _ := accepts[0].(map[string]any)
+					second, _ := accepts[1].(map[string]any)
+					if _, ok := first["can_auto_merge"]; ok {
+						return fmt.Errorf("can_auto_merge false was sent")
+					}
+					if second["can_auto_merge"] != true {
+						return fmt.Errorf("can_auto_merge true was not sent")
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// can_auto_merge is off unless set, is kept when set, and can be turned off
+// again.
+func TestApp_canAutoMergeLifecycle(t *testing.T) {
+	env := newTestEnv(t)
+	name, tracker, monitor := randName(), randName(), randName()
+	config := func(on bool) string {
+		return appConfig(env, name, fmt.Sprintf(`
+  accepts = [
+    { sender = %q, kinds = ["implement-work-item", "research"], can_auto_merge = %t },
+    { sender = %q, kinds = ["fix-error"] },
+  ]`, tracker, on, monitor))
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckTypeSetElemNestedAttrs(appRes, "accepts.*", map[string]string{
+						"sender": tracker, "can_auto_merge": "true", "can_decide": "false",
+					}),
+					resource.TestCheckTypeSetElemNestedAttrs(appRes, "accepts.*", map[string]string{
+						"sender": monitor, "kinds.#": "1", "can_decide": "false",
+					}),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "1"),
+					// Left out, it is off at AutoPilot.
+					func(*terraform.State) error {
+						return env.checkAutoMerge(t, name, map[string]bool{tracker: true, monitor: false})
+					},
+				),
+			},
+			{
+				Config: config(false),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckTypeSetElemNestedAttrs(appRes, "accepts.*", map[string]string{
+						"sender": tracker, "can_auto_merge": "false",
+					}),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					func(*terraform.State) error {
+						return env.checkAutoMerge(t, name, map[string]bool{tracker: false, monitor: false})
+					},
+				),
+			},
+		},
+	})
+}
+
+// checkAutoMerge reads the app from AutoPilot, the fake or a live one, and
+// checks each sender's can_auto_merge there.
+func (env *testEnv) checkAutoMerge(t *testing.T, name string, want map[string]bool) error {
+	app, err := env.apiClient(t).GetApp(context.Background(), name)
+	if err != nil {
+		return err
+	}
+	for _, a := range app.Accepts {
+		if on, ok := want[a.Sender]; ok && a.CanAutoMerge != on {
+			return fmt.Errorf("%s: can_auto_merge = %v at AutoPilot, want %v", a.Sender, a.CanAutoMerge, on)
+		}
+	}
+	return nil
+}
+
 func TestApp_lostCreateAnswerIsSentAgain(t *testing.T) {
 	env := newTestEnv(t)
 	env.requireFake(t)
@@ -543,6 +643,8 @@ func TestApp_planTimeValidation(t *testing.T) {
 		want string
 	}{
 		{`  accepts = [{ sender = "tracker", kinds = ["research"], can_decide = true }]`, "can_decide without review-pr"},
+		{`  accepts = [{ sender = "tracker", kinds = ["research"], can_auto_merge = true }]`, "can_auto_merge without a pull request kind"},
+		{`  accepts = [{ sender = "tracker", kinds = ["review-pr"], can_auto_merge = true }]`, "can_auto_merge without a pull request kind"},
 		{`  accepts = [
     { sender = "tracker", kinds = ["research"] },
     { sender = "tracker", kinds = ["fix-error"] },
@@ -601,15 +703,50 @@ resource "autopilot_app" "test" {
 	})
 }
 
+// can_auto_merge with a kind not known at plan time waits for the kind too.
+func TestApp_canAutoMergeWithAKindNotKnownYet(t *testing.T) {
+	env := newTestEnv(t)
+	name, sender := randName(), randName()
+	config := func(kind string) string {
+		return env.providerConfig() + fmt.Sprintf(`
+resource "terraform_data" "kind" {
+  input = %q
+}
+
+resource "autopilot_app" "test" {
+  name    = %q
+  accepts = [{ sender = %q, kinds = [terraform_data.kind.output], can_auto_merge = true }]
+}
+`, kind, name, sender)
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config("fix-error"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "accepts.0.can_auto_merge", "true"),
+					resource.TestCheckResourceAttr(appRes, "accepts.0.kinds.0", "fix-error"),
+				),
+			},
+			{
+				Config:      config("research"),
+				ExpectError: expectErr("can_auto_merge without a pull request kind"),
+			},
+		},
+	})
+}
+
 // The accepts check skips an entry whose kinds aren't all known, and still
 // refuses one whose known kinds leave out review-pr.
 func TestAcceptsValidator_UnknownKind(t *testing.T) {
 	ctx := context.Background()
 	entry := func(kinds ...attr.Value) attr.Value {
 		return types.ObjectValueMust(acceptAttrTypes, map[string]attr.Value{
-			"sender":     types.StringValue("tracker"),
-			"kinds":      types.SetValueMust(types.StringType, kinds),
-			"can_decide": types.BoolValue(true),
+			"sender":         types.StringValue("tracker"),
+			"kinds":          types.SetValueMust(types.StringType, kinds),
+			"can_decide":     types.BoolValue(true),
+			"can_auto_merge": types.BoolValue(false),
 		})
 	}
 	cases := []struct {
@@ -621,6 +758,44 @@ func TestAcceptsValidator_UnknownKind(t *testing.T) {
 		{"an unknown kind beside another", entry(types.StringValue("research"), types.StringUnknown()), false},
 		{"review-pr", entry(types.StringValue("review-pr")), false},
 		{"no review-pr", entry(types.StringValue("research")), true},
+	}
+	for _, c := range cases {
+		req := validator.SetRequest{
+			Path:        path.Root("accepts"),
+			ConfigValue: types.SetValueMust(acceptObjectType, []attr.Value{c.entry}),
+		}
+		var resp validator.SetResponse
+		acceptsValidator{}.ValidateSet(ctx, req, &resp)
+		if resp.Diagnostics.HasError() != c.refused {
+			t.Errorf("%s: refused = %v, want %v (%v)", c.name, resp.Diagnostics.HasError(), c.refused, resp.Diagnostics)
+		}
+	}
+}
+
+// The same for can_auto_merge: an entry whose kinds aren't all known waits,
+// and one whose known kinds include neither implement-work-item nor fix-error
+// is refused.
+func TestAcceptsValidator_AutoMergeUnknownKind(t *testing.T) {
+	ctx := context.Background()
+	entry := func(kinds ...attr.Value) attr.Value {
+		return types.ObjectValueMust(acceptAttrTypes, map[string]attr.Value{
+			"sender":         types.StringValue("tracker"),
+			"kinds":          types.SetValueMust(types.StringType, kinds),
+			"can_decide":     types.BoolValue(false),
+			"can_auto_merge": types.BoolValue(true),
+		})
+	}
+	cases := []struct {
+		name    string
+		entry   attr.Value
+		refused bool
+	}{
+		{"an unknown kind", entry(types.StringUnknown()), false},
+		{"an unknown kind beside another", entry(types.StringValue("research"), types.StringUnknown()), false},
+		{"implement-work-item", entry(types.StringValue("implement-work-item")), false},
+		{"fix-error beside research", entry(types.StringValue("research"), types.StringValue("fix-error")), false},
+		{"review-pr only", entry(types.StringValue("review-pr")), true},
+		{"research only", entry(types.StringValue("research")), true},
 	}
 	for _, c := range cases {
 		req := validator.SetRequest{
@@ -769,6 +944,35 @@ func TestApp_canDecideWidenedOutsideTerraformIsPutBack(t *testing.T) {
 				Check: func(*terraform.State) error {
 					if v, _ := env.fake.App(name); len(v.Accepts) != 1 || v.Accepts[0].CanDecide {
 						return fmt.Errorf("accepts = %+v, want can_decide off again", v.Accepts)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// can_auto_merge turned on outside Terraform shows as a change, and the apply
+// turns it off again.
+func TestApp_canAutoMergeWidenedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name, sender := randName(), randName()
+	config := appConfig(env, name, fmt.Sprintf(`  accepts = [{ sender = %q, kinds = ["implement-work-item"] }]`, sender))
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config},
+			{
+				PreConfig: func() {
+					env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) { v.Accepts[0].CanAutoMerge = true })
+				},
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					if v, _ := env.fake.App(name); len(v.Accepts) != 1 || v.Accepts[0].CanAutoMerge {
+						return fmt.Errorf("accepts = %+v, want can_auto_merge off again", v.Accepts)
 					}
 					return nil
 				},

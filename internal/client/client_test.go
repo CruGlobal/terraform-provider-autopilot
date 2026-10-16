@@ -315,13 +315,14 @@ func TestCreateApp_SendsOnlyWhatIsSet(t *testing.T) {
 		Accepts: []Accept{
 			{Sender: "tracker", Kinds: []string{"review-pr", "implement-work-item"}, CanDecide: true},
 			{Sender: "monitor", Kinds: []string{"fix-error"}},
+			{Sender: "planner", Kinds: []string{"implement-work-item"}, CanAutoMerge: true},
 		},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
 		`{"name":"billing"}`,
-		`{"accepts":[{"kinds":["fix-error"],"sender":"monitor"},{"can_decide":true,"kinds":["implement-work-item","review-pr"],"sender":"tracker"}],"name":"billing","repos":[]}`,
+		`{"accepts":[{"kinds":["fix-error"],"sender":"monitor"},{"can_auto_merge":true,"kinds":["implement-work-item"],"sender":"planner"},{"can_decide":true,"kinds":["implement-work-item","review-pr"],"sender":"tracker"}],"name":"billing","repos":[]}`,
 	}
 	for i := range want {
 		if bodies[i] != want[i] {

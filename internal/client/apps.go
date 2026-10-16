@@ -40,6 +40,10 @@ type Accept struct {
 	// CanDecide lets that sender's review-pr tasks approve or request changes
 	// on the app's repositories.
 	CanDecide bool `json:"can_decide"`
+	// CanAutoMerge lets GitHub's auto-merge be turned on for the pull
+	// requests that sender's implement-work-item and fix-error tasks open on
+	// the app's repositories, when the task asks for it.
+	CanAutoMerge bool `json:"can_auto_merge"`
 }
 
 // AppSpec is what a create or a change sends. A nil list is not sent at all;
@@ -68,8 +72,10 @@ func (s AppSpec) fields() Fields {
 func (s AppSpec) Empty() bool { return len(s.fields()) == 0 }
 
 // acceptsBody is accepts as the API keeps them: sorted by sender, each with
-// its kinds sorted. can_decide is sent only when true, so an entry whose
-// kinds lack review-pr never carries it; false is the API's default.
+// its kinds sorted. can_decide and can_auto_merge are sent only when true, so
+// an entry whose kinds don't allow one never carries it, and an AutoPilot that
+// predates can_auto_merge still takes an entry without it; false is the API's
+// default for both.
 func acceptsBody(accepts []Accept) []map[string]any {
 	sorted := normalizeAccepts(accepts)
 	out := make([]map[string]any, 0, len(sorted))
@@ -77,6 +83,9 @@ func acceptsBody(accepts []Accept) []map[string]any {
 		entry := map[string]any{"sender": a.Sender, "kinds": a.Kinds}
 		if a.CanDecide {
 			entry["can_decide"] = true
+		}
+		if a.CanAutoMerge {
+			entry["can_auto_merge"] = true
 		}
 		out = append(out, entry)
 	}
@@ -90,7 +99,7 @@ func normalizeAccepts(accepts []Accept) []Accept {
 		if kinds == nil {
 			kinds = []string{}
 		}
-		out = append(out, Accept{Sender: a.Sender, Kinds: kinds, CanDecide: a.CanDecide})
+		out = append(out, Accept{Sender: a.Sender, Kinds: kinds, CanDecide: a.CanDecide, CanAutoMerge: a.CanAutoMerge})
 	}
 	slices.SortFunc(out, func(x, y Accept) int { return cmp.Compare(x.Sender, y.Sender) })
 	return out
@@ -106,7 +115,8 @@ func (s AppSpec) reflectedIn(app *App) bool {
 	}
 	if s.Accepts != nil && !slices.EqualFunc(normalizeAccepts(s.Accepts), normalizeAccepts(app.Accepts),
 		func(x, y Accept) bool {
-			return x.Sender == y.Sender && x.CanDecide == y.CanDecide && slices.Equal(x.Kinds, y.Kinds)
+			return x.Sender == y.Sender && x.CanDecide == y.CanDecide && x.CanAutoMerge == y.CanAutoMerge &&
+				slices.Equal(x.Kinds, y.Kinds)
 		}) {
 		return false
 	}
