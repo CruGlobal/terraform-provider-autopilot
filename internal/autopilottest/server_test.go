@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -389,6 +390,60 @@ func TestPost_RefusesReadOnlyFields(t *testing.T) {
 	expect(t, "lock_version on create", st, http.StatusUnprocessableEntity, body)
 	if message, _ := body["message"].(string); body["field"] != "/lock_version" || !strings.Contains(message, "read-only") {
 		t.Errorf("refusal = %v", body)
+	}
+}
+
+// The credential policy is one: a write that sends credential sets both
+// fields, when_seats_full goes with seat_first only, and alone it is refused.
+func TestCredentialPolicy_Rules(t *testing.T) {
+	s := New(t)
+	refused := []struct {
+		fields map[string]any
+		field  string
+	}{
+		{map[string]any{"credential": "seats"}, "/credential"},
+		{map[string]any{"credential": 1}, "/credential"},
+		{map[string]any{"credential": "seat_first"}, "/when_seats_full"},
+		{map[string]any{"credential": "seat_first", "when_seats_full": nil}, "/when_seats_full"},
+		{map[string]any{"credential": "seat_first", "when_seats_full": "later"}, "/when_seats_full"},
+		{map[string]any{"credential": "bedrock", "when_seats_full": "wait"}, "/when_seats_full"},
+		{map[string]any{"credential": nil, "when_seats_full": "fall_back"}, "/when_seats_full"},
+		{map[string]any{"when_seats_full": "wait"}, "/when_seats_full"},
+		{map[string]any{"when_seats_full": nil}, "/when_seats_full"},
+	}
+	for _, c := range refused {
+		body := map[string]any{"name": "billing"}
+		for k, v := range c.fields {
+			body[k] = v
+		}
+		st, answer := call(t, s, http.MethodPost, "/v1/admin/apps", "", body)
+		expect(t, fmt.Sprint(c.fields), st, http.StatusUnprocessableEntity, answer)
+		if answer["field"] != c.field {
+			t.Errorf("%v: field = %v, want %s", c.fields, answer["field"], c.field)
+		}
+	}
+
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{
+		"name": "billing", "credential": "seat_first", "when_seats_full": "wait",
+	})
+	expect(t, "seat_first and wait", st, http.StatusCreated, body)
+	if body["credential"] != "seat_first" || body["when_seats_full"] != "wait" {
+		t.Errorf("created %v", body)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"credential": "bedrock"})
+	expect(t, "bedrock alone", st, http.StatusOK, body)
+	if body["credential"] != "bedrock" || body["when_seats_full"] != nil {
+		t.Errorf("changed to %v", body)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"developers": []string{}})
+	expect(t, "another field", st, http.StatusOK, body)
+	if body["credential"] != "bedrock" {
+		t.Errorf("a change without the policy took it: %v", body)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"credential": nil})
+	expect(t, "taken away", st, http.StatusOK, body)
+	if body["credential"] != nil || body["lock_version"] != float64(3) {
+		t.Errorf("taken away: %v", body)
 	}
 }
 

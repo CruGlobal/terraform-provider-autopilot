@@ -8,15 +8,21 @@ import (
 
 // App is a unit of consent: the repositories it owns, the senders it accepts
 // work from (with the kinds it accepts from each), and the people who may
-// start work for it themselves.
+// start work for it themselves. It also holds the app's credential policy.
 type App struct {
-	Name        string   `json:"name"`
-	Repos       []string `json:"repos"`
-	Accepts     []Accept `json:"accepts"`
-	Developers  []string `json:"developers"`
-	LockVersion int64    `json:"lock_version"`
-	CreatedAt   string   `json:"created_at"`
-	UpdatedAt   string   `json:"updated_at"`
+	Name       string   `json:"name"`
+	Repos      []string `json:"repos"`
+	Accepts    []Accept `json:"accepts"`
+	Developers []string `json:"developers"`
+	// Credential is "bedrock" or "seat_first", or nil when the app has no
+	// credential policy of its own (or the AutoPilot predates the field).
+	Credential *string `json:"credential"`
+	// WhenSeatsFull is "wait" or "fall_back" with seat_first, and nil
+	// otherwise.
+	WhenSeatsFull *string `json:"when_seats_full"`
+	LockVersion   int64   `json:"lock_version"`
+	CreatedAt     string  `json:"created_at"`
+	UpdatedAt     string  `json:"updated_at"`
 }
 
 func (a *App) recordName() string {
@@ -42,12 +48,25 @@ type Accept struct {
 	CanDecide bool `json:"can_decide"`
 }
 
+// CredentialPolicy is an app's credential policy. AutoPilot takes it as one:
+// a write that sends credential sets when_seats_full too, so a
+// when_seats_full left out is null.
+type CredentialPolicy struct {
+	// Credential is "bedrock" or "seat_first", or "" to take the app's own
+	// policy away (sent as null).
+	Credential string
+	// WhenSeatsFull is "wait" or "fall_back" with seat_first, and ""
+	// otherwise (not sent).
+	WhenSeatsFull string
+}
+
 // AppSpec is what a create or a change sends. A nil list is not sent at all;
-// an empty, non-nil list is sent as [].
+// an empty, non-nil list is sent as []. A nil Policy is not sent either.
 type AppSpec struct {
 	Repos      []string
 	Accepts    []Accept
 	Developers []string
+	Policy     *CredentialPolicy
 }
 
 func (s AppSpec) fields() Fields {
@@ -60,6 +79,16 @@ func (s AppSpec) fields() Fields {
 	}
 	if s.Developers != nil {
 		f["developers"] = sortedUnique(s.Developers)
+	}
+	if s.Policy != nil {
+		if s.Policy.Credential == "" {
+			f["credential"] = nil
+		} else {
+			f["credential"] = s.Policy.Credential
+		}
+		if s.Policy.WhenSeatsFull != "" {
+			f["when_seats_full"] = s.Policy.WhenSeatsFull
+		}
 	}
 	return f
 }
@@ -110,7 +139,18 @@ func (s AppSpec) reflectedIn(app *App) bool {
 		}) {
 		return false
 	}
+	if s.Policy != nil && (deref(app.Credential) != s.Policy.Credential || deref(app.WhenSeatsFull) != s.Policy.WhenSeatsFull) {
+		return false
+	}
 	return true
+}
+
+// deref is a nullable string's value, or "" for null.
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 const appsPath = "/apps"
