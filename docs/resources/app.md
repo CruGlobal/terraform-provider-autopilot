@@ -7,6 +7,7 @@ description: |-
   AutoPilot takes a sender's task only when the app the task is billed to, and the app that owns each repository the task touches, accept that sender for that kind. An app may accept a sender that doesn't exist yet, so the app and the sender can be applied in either order.
   Every argument but name is optional and sent only when set. Removing one from the configuration empties it at AutoPilot: an app without accepts accepts no sender. Narrowing or deleting an app takes effect at once: AutoPilot stops the queued and running tasks the app no longer accepts.
   A repository belongs to the first app that claims it. AutoPilot can't tell which app should own one, so review an app's repos as you would its access.
+  credential and when_seats_full are the app's credential policy: what the model calls of the tasks billed to it run on. A change to either sends both.
   An app with this name that already exists is not taken over, even when its values match: the create fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a gateway's 502, say) before an identical app answered: that attempt may have made the app, and the provider can't tell, so it takes the app as its own. create_before_destroy doesn't fit an app: the name is its key.
   Import by name: terraform import autopilot_app.billing billing.
 ---
@@ -20,6 +21,8 @@ AutoPilot takes a sender's task only when the app the task is billed to, and the
 Every argument but `name` is optional and sent only when set. Removing one from the configuration empties it at AutoPilot: an app without `accepts` accepts no sender. Narrowing or deleting an app takes effect at once: AutoPilot stops the queued and running tasks the app no longer accepts.
 
 A repository belongs to the first app that claims it. AutoPilot can't tell which app should own one, so review an app's `repos` as you would its access.
+
+`credential` and `when_seats_full` are the app's credential policy: what the model calls of the tasks billed to it run on. A change to either sends both.
 
 An app with this name that already exists is not taken over, even when its values match: the create fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a gateway's 502, say) before an identical app answered: that attempt may have made the app, and the provider can't tell, so it takes the app as its own. `create_before_destroy` doesn't fit an app: the name is its key.
 
@@ -54,6 +57,11 @@ resource "autopilot_app" "billing" {
 
   # The people who may start work for this app themselves.
   developers = local.developers
+
+  # What its tasks' model calls run on: a Claude seat when one has room,
+  # and Bedrock when every seat is full.
+  credential      = "seat_first"
+  when_seats_full = "fall_back"
 }
 ```
 
@@ -67,8 +75,10 @@ resource "autopilot_app" "billing" {
 ### Optional
 
 - `accepts` (Attributes Set) The senders this app accepts work from, each at most once, with the kinds of task it accepts from each. At most 20. (see [below for nested schema](#nestedatt--accepts))
+- `credential` (String) What the model calls of the tasks billed to this app run on: `bedrock` (Amazon Bedrock, billed per token) or `seat_first` (one of the organization's Claude seats, when one has room). Left out, the app has no policy of its own, and AutoPilot's default applies: `bedrock`, unless AutoPilot's own settings still name the app. AutoPilot uses seats only while its seat mode is on; with it off, every task runs on Bedrock. Removing it from the configuration takes the app's own policy away. The credential is chosen when a task starts, so a change reaches only the tasks that start after it.
 - `developers` (Set of String) The people who may start work for this app themselves, through AutoPilot's MCP server: their sign-in logins, which are email addresses, written in lowercase ASCII (AutoPilot refuses anything else). At most 100.
 - `repos` (Set of String) The repositories this app **owns**, as `owner/name`. A repository belongs to at most one app. AutoPilot matches them without regard to case, so no two may differ only in case. At most 50.
+- `when_seats_full` (String) With `credential = "seat_first"`, what a task does when every seat is full: `wait` until one has room, or `fall_back` to Bedrock. Required with `seat_first`, and only allowed with it.
 
 ### Read-Only
 

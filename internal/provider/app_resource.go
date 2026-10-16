@@ -20,9 +20,10 @@ import (
 )
 
 var (
-	_ resource.Resource                = &appResource{}
-	_ resource.ResourceWithConfigure   = &appResource{}
-	_ resource.ResourceWithImportState = &appResource{}
+	_ resource.Resource                   = &appResource{}
+	_ resource.ResourceWithConfigure      = &appResource{}
+	_ resource.ResourceWithImportState    = &appResource{}
+	_ resource.ResourceWithValidateConfig = &appResource{}
 )
 
 // NewAppResource returns the autopilot_app resource.
@@ -33,11 +34,13 @@ type appResource struct {
 }
 
 type appModel struct {
-	Name        types.String `tfsdk:"name"`
-	Repos       types.Set    `tfsdk:"repos"`
-	Accepts     types.Set    `tfsdk:"accepts"`
-	Developers  types.Set    `tfsdk:"developers"`
-	LockVersion types.Int64  `tfsdk:"lock_version"`
+	Name          types.String `tfsdk:"name"`
+	Repos         types.Set    `tfsdk:"repos"`
+	Accepts       types.Set    `tfsdk:"accepts"`
+	Developers    types.Set    `tfsdk:"developers"`
+	Credential    types.String `tfsdk:"credential"`
+	WhenSeatsFull types.String `tfsdk:"when_seats_full"`
+	LockVersion   types.Int64  `tfsdk:"lock_version"`
 }
 
 type acceptModel struct {
@@ -56,23 +59,44 @@ var acceptObjectType = types.ObjectType{AttrTypes: acceptAttrTypes}
 
 // appAPIFields maps the API's field names to this resource's attributes.
 var appAPIFields = map[string]string{
-	"name":       "name",
-	"repos":      "repos",
-	"accepts":    "accepts",
-	"developers": "developers",
+	"name":            "name",
+	"repos":           "repos",
+	"accepts":         "accepts",
+	"developers":      "developers",
+	"credential":      "credential",
+	"when_seats_full": "when_seats_full",
 }
 
 // appToModel maps an app. Every list is optional and left out of the
 // configuration is null, while AutoPilot answers [] for it, so an empty
-// answer stays null where prior (the plan, or the state) was null.
+// answer stays null where prior (the plan, or the state) was null. The
+// credential policy is null when AutoPilot answers null, as it does for an
+// app without one.
 func appToModel(a *client.App, prior appModel) appModel {
 	return appModel{
-		Name:        types.StringValue(a.Name),
-		Repos:       setOrNull(a.Repos, prior.Repos),
-		Accepts:     acceptsToSet(a.Accepts, prior.Accepts),
-		Developers:  setOrNull(a.Developers, prior.Developers),
-		LockVersion: types.Int64Value(a.LockVersion),
+		Name:          types.StringValue(a.Name),
+		Repos:         setOrNull(a.Repos, prior.Repos),
+		Accepts:       acceptsToSet(a.Accepts, prior.Accepts),
+		Developers:    setOrNull(a.Developers, prior.Developers),
+		Credential:    types.StringPointerValue(a.Credential),
+		WhenSeatsFull: types.StringPointerValue(a.WhenSeatsFull),
+		LockVersion:   types.Int64Value(a.LockVersion),
 	}
+}
+
+// policyFromModel is the credential policy the plan holds, as the client
+// sends it: credential "" for none, which takes the app's own policy away.
+// A value still unknown at apply is an error, never read as none.
+func policyFromModel(m appModel, diags *diag.Diagnostics) *client.CredentialPolicy {
+	if m.Credential.IsUnknown() {
+		unknownAtApply(diags, "credential")
+		return nil
+	}
+	if m.WhenSeatsFull.IsUnknown() {
+		unknownAtApply(diags, "when_seats_full")
+		return nil
+	}
+	return &client.CredentialPolicy{Credential: m.Credential.ValueString(), WhenSeatsFull: m.WhenSeatsFull.ValueString()}
 }
 
 func acceptsToSet(accepts []client.Accept, prior types.Set) types.Set {
@@ -136,6 +160,8 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"effect at once: AutoPilot stops the queued and running tasks the app no longer accepts.\n\n" +
 			"A repository belongs to the first app that claims it. AutoPilot can't tell which app should own one, " +
 			"so review an app's `repos` as you would its access.\n\n" +
+			"`credential` and `when_seats_full` are the app's credential policy: what the model calls of the tasks " +
+			"billed to it run on. A change to either sends both.\n\n" +
 			"An app with this name that already exists is not taken over, even when its values match: the create " +
 			"fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a " +
 			"gateway's 502, say) before an identical app answered: that attempt may have made the app, and the " +
@@ -214,12 +240,51 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					setvalidator.ValueStringsAre(stringvalidator.RegexMatches(loginPattern, "must be an email address in lowercase ASCII")),
 				},
 			},
+			"credential": schema.StringAttribute{
+				MarkdownDescription: "What the model calls of the tasks billed to this app run on: `bedrock` (Amazon " +
+					"Bedrock, billed per token) or `seat_first` (one of the organization's Claude seats, when one has room). " +
+					"Left out, the app has no policy of its own, and AutoPilot's default applies: `bedrock`, unless " +
+					"AutoPilot's own settings still name the app. AutoPilot uses seats only while its seat mode is on; with " +
+					"it off, every task runs on Bedrock. Removing it from the configuration takes the app's own policy away. " +
+					"The credential is chosen when a task starts, so a change reaches only the tasks that start after it.",
+				Optional:   true,
+				Validators: []validator.String{stringvalidator.OneOf("bedrock", "seat_first")},
+			},
+			"when_seats_full": schema.StringAttribute{
+				MarkdownDescription: "With `credential = \"seat_first\"`, what a task does when every seat is full: " +
+					"`wait` until one has room, or `fall_back` to Bedrock. Required with `seat_first`, and only allowed with it.",
+				Optional:   true,
+				Validators: []validator.String{stringvalidator.OneOf("wait", "fall_back")},
+			},
 			"lock_version": schema.Int64Attribute{
 				MarkdownDescription: "The record's version, which AutoPilot raises on every change. Sent as `If-Match` " +
 					"on updates and deletes.",
 				Computed: true,
 			},
 		},
+	}
+}
+
+// ValidateConfig checks the rule that spans the credential policy's two
+// arguments: when_seats_full with seat_first, and only with it. A value not
+// known yet waits: Terraform validates again at apply.
+func (r *appResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var credential, whenFull types.String
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("credential"), &credential)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("when_seats_full"), &whenFull)...)
+	if resp.Diagnostics.HasError() || credential.IsUnknown() || whenFull.IsUnknown() {
+		return
+	}
+	seatFirst := credential.ValueString() == "seat_first"
+	switch {
+	case seatFirst && whenFull.IsNull():
+		resp.Diagnostics.AddAttributeError(path.Root("when_seats_full"), "when_seats_full is required with seat_first",
+			"credential = \"seat_first\" needs when_seats_full: \"wait\" for a seat to have room, or \"fall_back\" to "+
+				"Bedrock when every seat is full.")
+	case !seatFirst && !whenFull.IsNull():
+		resp.Diagnostics.AddAttributeError(path.Root("when_seats_full"), "when_seats_full only with seat_first",
+			"when_seats_full applies only to credential = \"seat_first\". Set credential to \"seat_first\", or leave "+
+				"when_seats_full out.")
 	}
 }
 
@@ -230,11 +295,15 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 		return
 	}
 	name := plan.Name.ValueString()
-	// Only what is set is sent; the rest takes AutoPilot's defaults (empty).
+	// Only what is set is sent; the rest takes AutoPilot's defaults (empty,
+	// and no credential policy of its own).
 	spec := client.AppSpec{
 		Repos:      stringsFromSet(ctx, plan.Repos, "repos", &resp.Diagnostics),
 		Accepts:    acceptsFromSet(ctx, plan.Accepts, &resp.Diagnostics),
 		Developers: stringsFromSet(ctx, plan.Developers, "developers", &resp.Diagnostics),
+	}
+	if !plan.Credential.IsNull() {
+		spec.Policy = policyFromModel(plan, &resp.Diagnostics)
 	}
 	if resp.Diagnostics.HasError() {
 		return
@@ -296,8 +365,9 @@ func (r *appResource) Read(ctx context.Context, req resource.ReadRequest, resp *
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
-// Update sends only what changed. An argument removed from the configuration
-// is sent as [], so AutoPilot empties it as the plan says.
+// Update sends only what changed. A list removed from the configuration is
+// sent as [], so AutoPilot empties it as the plan says; a credential policy
+// removed is sent as credential null, which takes it away.
 func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, state appModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -319,6 +389,10 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 	}
 	if !plan.Developers.Equal(state.Developers) {
 		spec.Developers = orEmptyStrings(stringsFromSet(ctx, plan.Developers, "developers", &resp.Diagnostics))
+	}
+	// The two are one policy, so a change to either sends both.
+	if !plan.Credential.Equal(state.Credential) || !plan.WhenSeatsFull.Equal(state.WhenSeatsFull) {
+		spec.Policy = policyFromModel(plan, &resp.Diagnostics)
 	}
 	if resp.Diagnostics.HasError() {
 		return

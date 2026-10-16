@@ -21,10 +21,14 @@ var (
 	maxRepos        = 50
 	maxAccepts      = 20
 	maxDevelopers   = 100
-	appWritable     = []string{"repos", "accepts", "developers"}
+	appWritable     = []string{"repos", "accepts", "developers", "credential", "when_seats_full"}
 	appReadOnly     = []string{"lock_version", "created_at", "updated_at"}
 	acceptWritable  = []string{"sender", "kinds", "can_decide"}
 	appCreateFields = append([]string{"name"}, appWritable...)
+	// An app's credential policy: what its tasks run on, and with
+	// seat_first, what they do when every seat is full.
+	credentials   = []string{"bedrock", "seat_first"}
+	whenSeatsFull = []string{"wait", "fall_back"}
 )
 
 // Accept is one sender an app accepts work from.
@@ -34,29 +38,35 @@ type Accept struct {
 	CanDecide bool
 }
 
-// appRecord is an app as the fake stores it.
+// appRecord is an app as the fake stores it. An empty credential or
+// whenSeatsFull is null: the app has no credential policy of its own.
 type appRecord struct {
-	name                 string
-	repos                []string
-	accepts              []Accept
-	developers           []string
-	lockVersion          int64
-	createdAt, updatedAt time.Time
+	name                      string
+	repos                     []string
+	accepts                   []Accept
+	developers                []string
+	credential, whenSeatsFull string
+	lockVersion               int64
+	createdAt, updatedAt      time.Time
 }
 
-// AppView is a copy of a stored app, for assertions.
+// AppView is a copy of a stored app, for assertions. An empty Credential or
+// WhenSeatsFull is null.
 type AppView struct {
-	Name        string
-	Repos       []string
-	Accepts     []Accept
-	Developers  []string
-	LockVersion int64
+	Name          string
+	Repos         []string
+	Accepts       []Accept
+	Developers    []string
+	Credential    string
+	WhenSeatsFull string
+	LockVersion   int64
 }
 
 func (rec *appRecord) view() AppView {
 	return AppView{
 		Name: rec.name, Repos: slices.Clone(rec.repos), Accepts: cloneAccepts(rec.accepts),
-		Developers: slices.Clone(rec.developers), LockVersion: rec.lockVersion,
+		Developers: slices.Clone(rec.developers), Credential: rec.credential, WhenSeatsFull: rec.whenSeatsFull,
+		LockVersion: rec.lockVersion,
 	}
 }
 
@@ -89,14 +99,24 @@ func (rec *appRecord) json() map[string]any {
 		accepts = append(accepts, map[string]any{"sender": a.Sender, "kinds": a.Kinds, "can_decide": a.CanDecide})
 	}
 	return map[string]any{
-		"name":         rec.name,
-		"repos":        sortedUnique(rec.repos),
-		"accepts":      accepts,
-		"developers":   sortedUnique(rec.developers),
-		"lock_version": rec.lockVersion,
-		"created_at":   timestamp(rec.createdAt),
-		"updated_at":   timestamp(rec.updatedAt),
+		"name":            rec.name,
+		"repos":           sortedUnique(rec.repos),
+		"accepts":         accepts,
+		"developers":      sortedUnique(rec.developers),
+		"credential":      nullable(rec.credential),
+		"when_seats_full": nullable(rec.whenSeatsFull),
+		"lock_version":    rec.lockVersion,
+		"created_at":      timestamp(rec.createdAt),
+		"updated_at":      timestamp(rec.updatedAt),
 	}
+}
+
+// nullable is "" as null, and any other string as itself.
+func nullable(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // --- test controls ----------------------------------------------------------
@@ -108,7 +128,8 @@ func (s *Server) SeedApp(v AppView) {
 	now := time.Now()
 	s.apps[v.Name] = &appRecord{
 		name: v.Name, repos: sortedUniqueFold(v.Repos), accepts: sortAccepts(v.Accepts),
-		developers: sortedUnique(v.Developers), lockVersion: 1, createdAt: now, updatedAt: now,
+		developers: sortedUnique(v.Developers), credential: v.Credential, whenSeatsFull: v.WhenSeatsFull,
+		lockVersion: 1, createdAt: now, updatedAt: now,
 	}
 }
 
@@ -135,6 +156,7 @@ func (s *Server) ChangeAppOutOfBand(name string, change func(v *AppView)) {
 	v := rec.view()
 	change(&v)
 	rec.repos, rec.accepts, rec.developers = sortedUniqueFold(v.Repos), sortAccepts(v.Accepts), sortedUnique(v.Developers)
+	rec.credential, rec.whenSeatsFull = v.Credential, v.WhenSeatsFull
 	rec.lockVersion++
 	rec.updatedAt = time.Now()
 }
@@ -216,11 +238,14 @@ func (s *Server) appRoutes(mux *http.ServeMux) {
 }
 
 // appFields are the writable fields of an app, as read from a body. A nil
-// list was not sent.
+// list was not sent. policySent says the body sent credential, which sets
+// both credential and whenSeatsFull ("" for null).
 type appFields struct {
-	repos      []string
-	accepts    []Accept
-	developers []string
+	repos                     []string
+	accepts                   []Accept
+	developers                []string
+	policySent                bool
+	credential, whenSeatsFull string
 }
 
 func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
@@ -332,14 +357,55 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 		}
 		f.developers = sortedUnique(devs)
 	}
+	// The credential policy is one: a write that sends credential sets both
+	// fields, and when_seats_full means nothing without it.
+	rawCredential, sentCredential := obj["credential"]
+	rawWhen, sentWhen := obj["when_seats_full"]
+	if sentCredential {
+		credential, ref := oneOrNull(rawCredential, "/credential", credentials)
+		if ref != nil {
+			return f, ref
+		}
+		when := ""
+		if sentWhen {
+			if when, ref = oneOrNull(rawWhen, "/when_seats_full", whenSeatsFull); ref != nil {
+				return f, ref
+			}
+		}
+		switch {
+		case credential == "seat_first" && when == "":
+			return f, invalid("/when_seats_full", "is wait or fall_back when credential is seat_first")
+		case credential != "seat_first" && when != "":
+			return f, invalid("/when_seats_full", "is only for credential seat_first")
+		}
+		f.policySent, f.credential, f.whenSeatsFull = true, credential, when
+	} else if sentWhen {
+		return f, invalid("/when_seats_full", "is sent with credential: a write that sends credential sets both")
+	}
 	return f, nil
+}
+
+// oneOrNull reads one of allowed, or null as "".
+func oneOrNull(raw json.RawMessage, pointer string, allowed []string) (string, *refusal) {
+	var out *string
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", invalid(pointer, "must be one of "+strings.Join(allowed, ", ")+", or null")
+	}
+	if out == nil {
+		return "", nil
+	}
+	if !slices.Contains(allowed, *out) {
+		return "", invalid(pointer, "must be one of "+strings.Join(allowed, ", ")+", or null")
+	}
+	return *out, nil
 }
 
 // holds reports whether the app already holds everything f sends.
 func (rec *appRecord) holds(f appFields) bool {
 	return (f.repos == nil || slices.Equal(f.repos, rec.repos)) &&
 		(f.accepts == nil || acceptsEqual(f.accepts, rec.accepts)) &&
-		(f.developers == nil || slices.Equal(f.developers, rec.developers))
+		(f.developers == nil || slices.Equal(f.developers, rec.developers)) &&
+		(!f.policySent || (f.credential == rec.credential && f.whenSeatsFull == rec.whenSeatsFull))
 }
 
 // repoOwner names the app other than except that owns repo, matched without
@@ -401,7 +467,8 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 	}
 	now := time.Now()
 	if existing, ok := s.apps[name]; ok {
-		same := slices.Equal(existing.repos, repos) && acceptsEqual(existing.accepts, accepts) && slices.Equal(existing.developers, devs)
+		same := slices.Equal(existing.repos, repos) && acceptsEqual(existing.accepts, accepts) && slices.Equal(existing.developers, devs) &&
+			existing.credential == f.credential && existing.whenSeatsFull == f.whenSeatsFull
 		if !same {
 			return 0, nil, &refusal{http.StatusConflict, "name_taken", "an app with this name exists with other fields", "/name"}
 		}
@@ -410,7 +477,8 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 	if ref := s.refuseTakenRepos(repos, name); ref != nil {
 		return 0, nil, ref
 	}
-	rec := &appRecord{name: name, repos: repos, accepts: accepts, developers: devs, lockVersion: 1, createdAt: now, updatedAt: now}
+	rec := &appRecord{name: name, repos: repos, accepts: accepts, developers: devs,
+		credential: f.credential, whenSeatsFull: f.whenSeatsFull, lockVersion: 1, createdAt: now, updatedAt: now}
 	s.apps[name] = rec
 	return http.StatusCreated, rec.json(), nil
 }
@@ -465,6 +533,9 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 	}
 	if f.developers != nil && !slices.Equal(f.developers, rec.developers) {
 		rec.developers, changed = f.developers, true
+	}
+	if f.policySent && (f.credential != rec.credential || f.whenSeatsFull != rec.whenSeatsFull) {
+		rec.credential, rec.whenSeatsFull, changed = f.credential, f.whenSeatsFull, true
 	}
 	if changed {
 		rec.lockVersion++

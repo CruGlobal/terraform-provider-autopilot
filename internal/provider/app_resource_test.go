@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -854,6 +855,273 @@ func TestApp_onlyTheNotFoundRefusalMeansGone(t *testing.T) {
 			},
 		},
 	})
+}
+
+// lastAppPatch checks the body of the last change sent for an app, on the
+// fake.
+func lastAppPatch(t *testing.T, env *testEnv, name string, want map[string]any) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		if env.live() {
+			return nil
+		}
+		patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)
+		if len(patches) == 0 {
+			return fmt.Errorf("no change was sent")
+		}
+		if body := requestBody(t, patches[len(patches)-1]); !reflect.DeepEqual(body, want) {
+			return fmt.Errorf("the change sent %v, want %v", body, want)
+		}
+		return nil
+	}
+}
+
+// An app's credential policy is set, changed and taken away. Its two
+// arguments are one policy, so a change to either sends both, and removing
+// it sends credential null.
+func TestApp_credentialPolicy(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, `
+  credential      = "seat_first"
+  when_seats_full = "wait"`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "credential", "seat_first"),
+					resource.TestCheckResourceAttr(appRes, "when_seats_full", "wait"),
+					func(*terraform.State) error {
+						if env.live() {
+							return nil
+						}
+						post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0]
+						body := requestBody(t, post)
+						if body["credential"] != "seat_first" || body["when_seats_full"] != "wait" {
+							return fmt.Errorf("the create sent %v", body)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: appConfig(env, name, `
+  credential      = "seat_first"
+  when_seats_full = "wait"`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: appConfig(env, name, `
+  credential      = "seat_first"
+  when_seats_full = "fall_back"`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "when_seats_full", "fall_back"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					lastAppPatch(t, env, name, map[string]any{"credential": "seat_first", "when_seats_full": "fall_back"}),
+				),
+			},
+			{
+				Config: appConfig(env, name, `  credential = "bedrock"`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "credential", "bedrock"),
+					resource.TestCheckNoResourceAttr(appRes, "when_seats_full"),
+					lastAppPatch(t, env, name, map[string]any{"credential": "bedrock"}),
+				),
+			},
+			{
+				Config: appConfig(env, name, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "credential"),
+					resource.TestCheckNoResourceAttr(appRes, "when_seats_full"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "4"),
+					lastAppPatch(t, env, name, map[string]any{"credential": nil}),
+					func(*terraform.State) error {
+						if env.live() {
+							return nil
+						}
+						if v, _ := env.fake.App(name); v.Credential != "" || v.WhenSeatsFull != "" {
+							return fmt.Errorf("AutoPilot still holds %q, %q", v.Credential, v.WhenSeatsFull)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: appConfig(env, name, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A change to another argument leaves the credential policy out, so the
+// app keeps it.
+func TestApp_credentialPolicyNotSentWhenUnchanged(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	policy := `
+  credential      = "seat_first"
+  when_seats_full = "fall_back"`
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, name, policy)},
+			{
+				Config: appConfig(env, name, policy+`
+  developers = ["someone@example.com"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, name, map[string]any{"developers": []any{"someone@example.com"}}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(name); v.Credential != "seat_first" || v.WhenSeatsFull != "fall_back" {
+							return fmt.Errorf("AutoPilot holds %q, %q", v.Credential, v.WhenSeatsFull)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// A credential policy changed outside Terraform shows as a change, and the
+// apply puts the configured one back; one set outside Terraform on an app
+// that configures none is taken away.
+func TestApp_credentialPolicyChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name, other := randName(), randName()
+	policy := `
+  credential      = "seat_first"
+  when_seats_full = "fall_back"`
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, name, policy)},
+			{
+				PreConfig: func() {
+					env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) {
+						v.Credential, v.WhenSeatsFull = "bedrock", ""
+					})
+				},
+				Config: appConfig(env, name, policy),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					if v, _ := env.fake.App(name); v.Credential != "seat_first" || v.WhenSeatsFull != "fall_back" {
+						return fmt.Errorf("AutoPilot holds %q, %q", v.Credential, v.WhenSeatsFull)
+					}
+					return nil
+				},
+			},
+		},
+	})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, other, "")},
+			{
+				PreConfig: func() {
+					env.fake.ChangeAppOutOfBand(other, func(v *autopilottest.AppView) {
+						v.Credential, v.WhenSeatsFull = "seat_first", "wait"
+					})
+				},
+				Config: appConfig(env, other, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, other, map[string]any{"credential": nil}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(other); v.Credential != "" || v.WhenSeatsFull != "" {
+							return fmt.Errorf("AutoPilot still holds %q, %q", v.Credential, v.WhenSeatsFull)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// An imported app's credential policy is read into state, so a
+// configuration that sets the same plans nothing.
+func TestApp_importWithCredentialPolicy(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{Name: name, Credential: "seat_first", WhenSeatsFull: "fall_back"})
+	config := appConfig(env, name, `
+  credential      = "seat_first"
+  when_seats_full = "fall_back"`)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             config,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// The credential policy's rules fail the plan.
+func TestApp_credentialPolicyPlanTimeValidation(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	cases := []struct {
+		body string
+		want string
+	}{
+		{`  credential = "seat_first"`, "when_seats_full is required with seat_first"},
+		{`  when_seats_full = "wait"`, "when_seats_full only with seat_first"},
+		{`
+  credential      = "bedrock"
+  when_seats_full = "fall_back"`, "when_seats_full only with seat_first"},
+		{`  credential = "seats"`, "value must be one of"},
+		{`  credential = "Bedrock"`, "value must be one of"},
+		{`
+  credential      = "seat_first"
+  when_seats_full = "later"`, "value must be one of"},
+	}
+	steps := make([]resource.TestStep, 0, len(cases))
+	for _, c := range cases {
+		steps = append(steps, resource.TestStep{Config: appConfig(env, name, c.body), PlanOnly: true, ExpectError: expectErr(c.want)})
+	}
+	runTest(t, resource.TestCase{Steps: steps})
+}
+
+// A credential policy that is somehow still unknown at apply is an error,
+// never sent as none: that would take the app's own policy away.
+func TestUnknownCredentialPolicyIsAnError(t *testing.T) {
+	var diags diag.Diagnostics
+	m := appModel{Credential: types.StringUnknown(), WhenSeatsFull: types.StringNull()}
+	if got := policyFromModel(m, &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown credential gave %v, %v", got, diags)
+	}
+	diags = nil
+	m = appModel{Credential: types.StringValue("seat_first"), WhenSeatsFull: types.StringUnknown()}
+	if got := policyFromModel(m, &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown when_seats_full gave %v, %v", got, diags)
+	}
+	diags = nil
+	m = appModel{Credential: types.StringNull(), WhenSeatsFull: types.StringNull()}
+	if got := policyFromModel(m, &diags); got == nil || got.Credential != "" || diags.HasError() {
+		t.Errorf("no policy gave %v, %v; it takes the app's own away", got, diags)
+	}
 }
 
 // A list that is somehow still unknown at apply is an error, never sent as

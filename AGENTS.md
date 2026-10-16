@@ -100,6 +100,11 @@ the examples, and the generated docs. Things worth knowing:
   the sender's `ModifyPlan` replaces the sender for a new prefix only with a
   new name, and refuses one under the same name. Live test runs leave
   tombstones behind; that is expected.
+- An app's credential policy (`credential`, `when_seats_full`) is one
+  thing: AutoPilot sets both from a write that sends `credential` (a
+  `when_seats_full` left out is null) and refuses `when_seats_full` alone.
+  The provider sends both on a change to either (`AppSpec.Policy`), and
+  `credential: null` to take the policy away.
 - A sender's secrets are write-only (`*_wo`). The plan compares
   `client.Fingerprint` of the configured secrets with the stored
   fingerprints; see the comment at the top of `sender_resource.go`.

@@ -648,6 +648,78 @@ func TestUpdateSender_RefusesABranchPrefix(t *testing.T) {
 	}
 }
 
+// The credential policy is sent as one: credential always, as null to take
+// the app's own away, and when_seats_full only when set.
+func TestUpdateApp_SendsTheCredentialPolicyAsOne(t *testing.T) {
+	var bodies []string
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 2})
+	}))
+	ctx := context.Background()
+	for _, policy := range []*CredentialPolicy{
+		{Credential: "seat_first", WhenSeatsFull: "wait"},
+		{Credential: "bedrock"},
+		{},
+	} {
+		if _, err := c.UpdateApp(ctx, "billing", AppSpec{Policy: policy}, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{
+		`{"credential":"seat_first","when_seats_full":"wait"}`,
+		`{"credential":"bedrock"}`,
+		`{"credential":null}`,
+	}
+	for i := range want {
+		if bodies[i] != want[i] {
+			t.Errorf("body %d = %s\nwant      %s", i, bodies[i], want[i])
+		}
+	}
+	if !(AppSpec{}).Empty() {
+		t.Error("a spec without a policy sends nothing")
+	}
+}
+
+// An app read back holds a change's credential policy only when both of
+// its fields match.
+func TestAppSpec_PolicyReflectedIn(t *testing.T) {
+	str := func(s string) *string { return &s }
+	seatFirst := &App{Credential: str("seat_first"), WhenSeatsFull: str("wait")}
+	cases := []struct {
+		spec AppSpec
+		app  *App
+		want bool
+	}{
+		{AppSpec{Policy: &CredentialPolicy{Credential: "seat_first", WhenSeatsFull: "wait"}}, seatFirst, true},
+		{AppSpec{Policy: &CredentialPolicy{Credential: "seat_first", WhenSeatsFull: "fall_back"}}, seatFirst, false},
+		{AppSpec{Policy: &CredentialPolicy{}}, seatFirst, false},
+		{AppSpec{Policy: &CredentialPolicy{}}, &App{}, true},
+		{AppSpec{}, seatFirst, true},
+	}
+	for i, c := range cases {
+		if got := c.spec.reflectedIn(c.app); got != c.want {
+			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// An AutoPilot that predates the credential policy answers without it: the
+// app reads as having none.
+func TestGetApp_WithoutTheCredentialPolicy(t *testing.T) {
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 1})
+	}))
+	a, err := c.GetApp(context.Background(), "billing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Credential != nil || a.WhenSeatsFull != nil {
+		t.Errorf("credential = %v, when_seats_full = %v", a.Credential, a.WhenSeatsFull)
+	}
+}
+
 func TestDo_MethodNotAllowedRefusal(t *testing.T) {
 	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Allow", "GET, POST")

@@ -24,4 +24,9 @@ resource "autopilot_app" "billing" {
 
   # The people who may start work for this app themselves.
   developers = local.developers
+
+  # What its tasks' model calls run on: a Claude seat when one has room,
+  # and Bedrock when every seat is full.
+  credential      = "seat_first"
+  when_seats_full = "fall_back"
 }
