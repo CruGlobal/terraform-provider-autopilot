@@ -34,4 +34,10 @@ resource "autopilot_app" "billing" {
   # and Bedrock when every seat is full.
   credential      = "seat_first"
   when_seats_full = "fall_back"
+
+  # The worker its tasks run in: the ruby image, on a bigger task than the
+  # default of 2 vCPU and 8 GB.
+  worker_image  = "ruby"
+  worker_cpu    = 4096
+  worker_memory = 16384
 }

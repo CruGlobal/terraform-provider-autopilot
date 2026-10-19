@@ -765,3 +765,81 @@ func TestDo_MethodNotAllowedRefusal(t *testing.T) {
 		t.Errorf("err = %v", err)
 	}
 }
+
+// The worker image is sent when set, as null to take the app back to node,
+// and the size as one: both fields always, as null to take it away.
+func TestUpdateApp_SendsTheWorker(t *testing.T) {
+	var bodies []string
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 2})
+	}))
+	ctx := context.Background()
+	str := func(s string) *string { return &s }
+	for _, spec := range []AppSpec{
+		{WorkerImage: str("ruby")},
+		{WorkerImage: str("")},
+		{Size: &WorkerSize{CPU: 4096, Memory: 16384}},
+		{Size: &WorkerSize{}},
+		{WorkerImage: str("go"), Size: &WorkerSize{CPU: 1024, Memory: 2048}},
+	} {
+		if _, err := c.UpdateApp(ctx, "billing", spec, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{
+		`{"worker_image":"ruby"}`,
+		`{"worker_image":null}`,
+		`{"worker_cpu":4096,"worker_memory":16384}`,
+		`{"worker_cpu":null,"worker_memory":null}`,
+		`{"worker_cpu":1024,"worker_image":"go","worker_memory":2048}`,
+	}
+	for i := range want {
+		if bodies[i] != want[i] {
+			t.Errorf("body %d = %s\nwant      %s", i, bodies[i], want[i])
+		}
+	}
+}
+
+// An app read back holds a change's worker only when what it sends matches.
+func TestAppSpec_WorkerReflectedIn(t *testing.T) {
+	str := func(s string) *string { return &s }
+	num := func(n int64) *int64 { return &n }
+	ruby := &App{WorkerImage: str("ruby"), WorkerCPU: num(4096), WorkerMemory: num(16384)}
+	cases := []struct {
+		spec AppSpec
+		app  *App
+		want bool
+	}{
+		{AppSpec{WorkerImage: str("ruby")}, ruby, true},
+		{AppSpec{WorkerImage: str("go")}, ruby, false},
+		{AppSpec{WorkerImage: str("")}, ruby, false},
+		{AppSpec{WorkerImage: str("")}, &App{}, true},
+		{AppSpec{Size: &WorkerSize{CPU: 4096, Memory: 16384}}, ruby, true},
+		{AppSpec{Size: &WorkerSize{CPU: 4096, Memory: 8192}}, ruby, false},
+		{AppSpec{Size: &WorkerSize{}}, ruby, false},
+		{AppSpec{Size: &WorkerSize{}}, &App{}, true},
+		{AppSpec{}, ruby, true},
+	}
+	for i, c := range cases {
+		if got := c.spec.reflectedIn(c.app); got != c.want {
+			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// An AutoPilot that predates the worker answers without it: the app reads
+// as running node at its worker's own size.
+func TestGetApp_WithoutTheWorker(t *testing.T) {
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 1})
+	}))
+	a, err := c.GetApp(context.Background(), "billing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.WorkerImage != nil || a.WorkerCPU != nil || a.WorkerMemory != nil {
+		t.Errorf("worker_image = %v, worker_cpu = %v, worker_memory = %v", a.WorkerImage, a.WorkerCPU, a.WorkerMemory)
+	}
+}

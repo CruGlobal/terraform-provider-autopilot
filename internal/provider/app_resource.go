@@ -3,8 +3,11 @@ package provider
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/CruGlobal/terraform-provider-autopilot/internal/client"
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
@@ -40,6 +43,9 @@ type appModel struct {
 	Developers    types.Set    `tfsdk:"developers"`
 	Credential    types.String `tfsdk:"credential"`
 	WhenSeatsFull types.String `tfsdk:"when_seats_full"`
+	WorkerImage   types.String `tfsdk:"worker_image"`
+	WorkerCPU     types.Int64  `tfsdk:"worker_cpu"`
+	WorkerMemory  types.Int64  `tfsdk:"worker_memory"`
 	LockVersion   types.Int64  `tfsdk:"lock_version"`
 }
 
@@ -67,13 +73,16 @@ var appAPIFields = map[string]string{
 	"developers":      "developers",
 	"credential":      "credential",
 	"when_seats_full": "when_seats_full",
+	"worker_image":    "worker_image",
+	"worker_cpu":      "worker_cpu",
+	"worker_memory":   "worker_memory",
 }
 
 // appToModel maps an app. Every list is optional and left out of the
 // configuration is null, while AutoPilot answers [] for it, so an empty
 // answer stays null where prior (the plan, or the state) was null. The
-// credential policy is null when AutoPilot answers null, as it does for an
-// app without one.
+// credential policy, the worker image and the worker size are null when
+// AutoPilot answers null, as it does for an app without them.
 func appToModel(a *client.App, prior appModel) appModel {
 	return appModel{
 		Name:          types.StringValue(a.Name),
@@ -82,8 +91,38 @@ func appToModel(a *client.App, prior appModel) appModel {
 		Developers:    setOrNull(a.Developers, prior.Developers),
 		Credential:    types.StringPointerValue(a.Credential),
 		WhenSeatsFull: types.StringPointerValue(a.WhenSeatsFull),
+		WorkerImage:   types.StringPointerValue(a.WorkerImage),
+		WorkerCPU:     types.Int64PointerValue(a.WorkerCPU),
+		WorkerMemory:  types.Int64PointerValue(a.WorkerMemory),
 		LockVersion:   types.Int64Value(a.LockVersion),
 	}
+}
+
+// imageFromModel is the worker image the plan holds, as the client sends
+// it: "" for none, which takes the app back to node. A value still unknown
+// at apply is an error, never read as none.
+func imageFromModel(m appModel, diags *diag.Diagnostics) *string {
+	if m.WorkerImage.IsUnknown() {
+		unknownAtApply(diags, "worker_image")
+		return nil
+	}
+	image := m.WorkerImage.ValueString()
+	return &image
+}
+
+// sizeFromModel is the worker size the plan holds, as the client sends it:
+// zero for none, which takes the app's size away. A value still unknown at
+// apply is an error, never read as none.
+func sizeFromModel(m appModel, diags *diag.Diagnostics) *client.WorkerSize {
+	if m.WorkerCPU.IsUnknown() {
+		unknownAtApply(diags, "worker_cpu")
+		return nil
+	}
+	if m.WorkerMemory.IsUnknown() {
+		unknownAtApply(diags, "worker_memory")
+		return nil
+	}
+	return &client.WorkerSize{CPU: m.WorkerCPU.ValueInt64(), Memory: m.WorkerMemory.ValueInt64()}
 }
 
 // policyFromModel is the credential policy the plan holds, as the client
@@ -198,6 +237,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"so review an app's `repos` as you would its access.\n\n" +
 			"`credential` and `when_seats_full` are the app's credential policy: what the model calls of the tasks " +
 			"billed to it run on. A change to either sends both.\n\n" +
+			"`worker_image`, `worker_cpu` and `worker_memory` choose the worker the tasks billed to the app run in: " +
+			"its image, and the size of the AWS Fargate task it runs as. `worker_cpu` and `worker_memory` are one " +
+			"size, set together, and a change to either sends both.\n\n" +
 			"An app with this name that already exists is not taken over, even when its values match: the create " +
 			"fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a " +
 			"gateway's 502, say) before an identical app answered: that attempt may have made the app, and the " +
@@ -291,9 +333,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"credential": schema.StringAttribute{
 				MarkdownDescription: "What the model calls of the tasks billed to this app run on: `bedrock` (Amazon " +
 					"Bedrock, billed per token) or `seat_first` (one of the organization's Claude seats, when one has room). " +
-					"Left out, the app has no policy of its own, and AutoPilot's default applies: `bedrock`, unless " +
-					"AutoPilot's own settings still name the app. AutoPilot uses seats only while its seat mode is on; with " +
-					"it off, every task runs on Bedrock. Removing it from the configuration takes the app's own policy away. " +
+					"Left out, the app has no policy of its own, and AutoPilot's default applies: `bedrock`. AutoPilot " +
+					"uses seats only while its seat mode is on; with it off, every task runs on Bedrock. Removing it from " +
+					"the configuration takes the app's own policy away. " +
 					"The credential is chosen when a task starts, so a change reaches only the tasks that start after it.",
 				Optional:   true,
 				Validators: []validator.String{stringvalidator.OneOf("bedrock", "seat_first")},
@@ -304,6 +346,31 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				Optional:   true,
 				Validators: []validator.String{stringvalidator.OneOf("wait", "fall_back")},
 			},
+			"worker_image": schema.StringAttribute{
+				MarkdownDescription: "The worker image the tasks billed to this app run in: `node`, `ruby`, `python` or " +
+					"`go`. Each is the same worker with that language's tools; `ruby` has Node too, for Rails assets. " +
+					"Choose the app's main language. Left out, the app's tasks run in `node`, and removing it from the " +
+					"configuration takes the app back to `node`. The image is chosen when a task starts, so a change " +
+					"reaches only the tasks that start after it.",
+				Optional:   true,
+				Validators: []validator.String{stringvalidator.OneOf(workerImages...)},
+			},
+			"worker_cpu": schema.Int64Attribute{
+				MarkdownDescription: "The CPU of the AWS Fargate task each of this app's tasks runs in, in CPU units, " +
+					"1024 to a vCPU: `256`, `512`, `1024`, `2048` or `4096`. Set together with `worker_memory`. Left out " +
+					"with it, a task gets AutoPilot's default size, 2 vCPU and 8 GB, and removing both from the " +
+					"configuration takes the app back to it. A bigger task counts against AutoPilot's limits on running " +
+					"tasks and daily spend like any other. The size is chosen when a task starts, so a change reaches " +
+					"only the tasks that start after it.",
+				Optional:   true,
+				Validators: []validator.Int64{int64validator.OneOf(256, 512, 1024, 2048, 4096)},
+			},
+			"worker_memory": schema.Int64Attribute{
+				MarkdownDescription: "The memory of that Fargate task, in MiB, at most 16 GB: one that Fargate allows " +
+					"with `worker_cpu`, which is " + memoryRule + ". Set together with `worker_cpu`.",
+				Optional:   true,
+				Validators: []validator.Int64{int64validator.Between(512, 16384)},
+			},
 			"lock_version": schema.Int64Attribute{
 				MarkdownDescription: "The record's version, which AutoPilot raises on every change. Sent as `If-Match` " +
 					"on updates and deletes.",
@@ -313,14 +380,51 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 	}
 }
 
-// ValidateConfig checks the rule that spans the credential policy's two
-// arguments: when_seats_full with seat_first, and only with it. A value not
-// known yet waits: Terraform validates again at apply.
+// ValidateConfig checks the rules that span two arguments: the credential
+// policy's, and the worker size's. A value not known yet waits: Terraform
+// validates again at apply.
 func (r *appResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	validatePolicy(ctx, req, resp)
+	validateSize(ctx, req, resp)
+}
+
+// validateSize checks the worker size: worker_cpu and worker_memory both or
+// neither, and a pair Fargate runs. A worker_cpu that is none of the sizes
+// is left to its own validator.
+func validateSize(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var cpu, memory types.Int64
+	var diags diag.Diagnostics
+	diags.Append(req.Config.GetAttribute(ctx, path.Root("worker_cpu"), &cpu)...)
+	diags.Append(req.Config.GetAttribute(ctx, path.Root("worker_memory"), &memory)...)
+	resp.Diagnostics.Append(diags...)
+	if diags.HasError() || cpu.IsUnknown() || memory.IsUnknown() {
+		return
+	}
+	allowed, knownCPU := workerSizes[cpu.ValueInt64()]
+	switch {
+	case cpu.IsNull() && memory.IsNull():
+	case cpu.IsNull():
+		resp.Diagnostics.AddAttributeError(path.Root("worker_cpu"), "worker_cpu is required with worker_memory",
+			"worker_cpu and worker_memory are one size: set both, or leave both out for AutoPilot's default size.")
+	case memory.IsNull():
+		resp.Diagnostics.AddAttributeError(path.Root("worker_memory"), "worker_memory is required with worker_cpu",
+			"worker_cpu and worker_memory are one size: set both, or leave both out for AutoPilot's default size.")
+	case knownCPU && !slices.Contains(allowed, memory.ValueInt64()):
+		resp.Diagnostics.AddAttributeError(path.Root("worker_memory"), "worker_memory doesn't go with worker_cpu",
+			"AWS Fargate allows only some memory with each CPU, at most 16 GB here: "+
+				strings.ReplaceAll(memoryRule, "`", "")+".")
+	}
+}
+
+// validatePolicy checks the rule that spans the credential policy's two
+// arguments: when_seats_full with seat_first, and only with it.
+func validatePolicy(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	var credential, whenFull types.String
-	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("credential"), &credential)...)
-	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("when_seats_full"), &whenFull)...)
-	if resp.Diagnostics.HasError() || credential.IsUnknown() || whenFull.IsUnknown() {
+	var diags diag.Diagnostics
+	diags.Append(req.Config.GetAttribute(ctx, path.Root("credential"), &credential)...)
+	diags.Append(req.Config.GetAttribute(ctx, path.Root("when_seats_full"), &whenFull)...)
+	resp.Diagnostics.Append(diags...)
+	if diags.HasError() || credential.IsUnknown() || whenFull.IsUnknown() {
 		return
 	}
 	seatFirst := credential.ValueString() == "seat_first"
@@ -344,7 +448,7 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 	}
 	name := plan.Name.ValueString()
 	// Only what is set is sent; the rest takes AutoPilot's defaults (empty,
-	// and no credential policy of its own).
+	// no credential policy of its own, the node worker at its own size).
 	spec := client.AppSpec{
 		Repos:      stringsFromSet(ctx, plan.Repos, "repos", &resp.Diagnostics),
 		Accepts:    acceptsFromSet(ctx, plan.Accepts, &resp.Diagnostics),
@@ -352,6 +456,12 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 	}
 	if !plan.Credential.IsNull() {
 		spec.Policy = policyFromModel(plan, &resp.Diagnostics)
+	}
+	if !plan.WorkerImage.IsNull() {
+		spec.WorkerImage = imageFromModel(plan, &resp.Diagnostics)
+	}
+	if !plan.WorkerCPU.IsNull() || !plan.WorkerMemory.IsNull() {
+		spec.Size = sizeFromModel(plan, &resp.Diagnostics)
 	}
 	if resp.Diagnostics.HasError() {
 		return
@@ -415,7 +525,8 @@ func (r *appResource) Read(ctx context.Context, req resource.ReadRequest, resp *
 
 // Update sends only what changed. A list removed from the configuration is
 // sent as [], so AutoPilot empties it as the plan says; a credential policy
-// removed is sent as credential null, which takes it away.
+// removed is sent as credential null, which takes it away, and so are a
+// worker image and a worker size removed.
 func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, state appModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -441,6 +552,13 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 	// The two are one policy, so a change to either sends both.
 	if !plan.Credential.Equal(state.Credential) || !plan.WhenSeatsFull.Equal(state.WhenSeatsFull) {
 		spec.Policy = policyFromModel(plan, &resp.Diagnostics)
+	}
+	if !plan.WorkerImage.Equal(state.WorkerImage) {
+		spec.WorkerImage = imageFromModel(plan, &resp.Diagnostics)
+	}
+	// The size is one too, so a change to either sends both.
+	if !plan.WorkerCPU.Equal(state.WorkerCPU) || !plan.WorkerMemory.Equal(state.WorkerMemory) {
+		spec.Size = sizeFromModel(plan, &resp.Diagnostics)
 	}
 	if resp.Diagnostics.HasError() {
 		return

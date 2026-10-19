@@ -515,3 +515,60 @@ func TestUnauthorized_SaysBearer(t *testing.T) {
 		t.Errorf("wrong token: %d, WWW-Authenticate %q", resp.StatusCode, resp.Header.Get("WWW-Authenticate"))
 	}
 }
+
+func TestWorker_Rules(t *testing.T) {
+	s := New(t)
+	refused := []struct {
+		fields map[string]any
+		field  string
+	}{
+		{map[string]any{"worker_image": "rust"}, "/worker_image"},
+		{map[string]any{"worker_image": "Node"}, "/worker_image"},
+		{map[string]any{"worker_image": 1}, "/worker_image"},
+		{map[string]any{"worker_cpu": 4096}, "/worker_memory"},
+		{map[string]any{"worker_memory": 16384}, "/worker_cpu"},
+		{map[string]any{"worker_cpu": 4096, "worker_memory": nil}, "/worker_memory"},
+		{map[string]any{"worker_cpu": "4096", "worker_memory": 16384}, "/worker_cpu"},
+		{map[string]any{"worker_cpu": 4096.5, "worker_memory": 16384}, "/worker_cpu"},
+		{map[string]any{"worker_cpu": -4096, "worker_memory": 16384}, "/worker_cpu"},
+		{map[string]any{"worker_cpu": 0, "worker_memory": 0}, "/worker_cpu"},
+		{map[string]any{"worker_cpu": 8192, "worker_memory": 16384}, "/worker_cpu"},
+		{map[string]any{"worker_cpu": 4096, "worker_memory": 17408}, "/worker_memory"},
+		{map[string]any{"worker_cpu": 4096, "worker_memory": 4096}, "/worker_memory"},
+		{map[string]any{"worker_cpu": 256, "worker_memory": 4096}, "/worker_memory"},
+	}
+	for _, c := range refused {
+		body := map[string]any{"name": "billing"}
+		for k, v := range c.fields {
+			body[k] = v
+		}
+		st, answer := call(t, s, http.MethodPost, "/v1/admin/apps", "", body)
+		expect(t, fmt.Sprint(c.fields), st, http.StatusUnprocessableEntity, answer)
+		if answer["field"] != c.field {
+			t.Errorf("%v: field = %v, want %s", c.fields, answer["field"], c.field)
+		}
+	}
+
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{
+		"name": "billing", "worker_image": "ruby", "worker_cpu": 4096, "worker_memory": 16384,
+	})
+	expect(t, "ruby at 4 vCPU and 16 GB", st, http.StatusCreated, body)
+	if body["worker_image"] != "ruby" || body["worker_cpu"] != float64(4096) || body["worker_memory"] != float64(16384) {
+		t.Errorf("created %v", body)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"developers": []string{}})
+	expect(t, "another field", st, http.StatusOK, body)
+	if body["worker_image"] != "ruby" || body["worker_cpu"] != float64(4096) {
+		t.Errorf("a change without the worker took it: %v", body)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"worker_cpu": nil})
+	expect(t, "size taken away", st, http.StatusOK, body)
+	if body["worker_cpu"] != nil || body["worker_memory"] != nil || body["worker_image"] != "ruby" || body["lock_version"] != float64(2) {
+		t.Errorf("size taken away: %v", body)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"worker_image": nil})
+	expect(t, "back to node", st, http.StatusOK, body)
+	if body["worker_image"] != nil || body["lock_version"] != float64(3) {
+		t.Errorf("back to node: %v", body)
+	}
+}

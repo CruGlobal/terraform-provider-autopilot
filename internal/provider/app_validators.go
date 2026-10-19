@@ -26,6 +26,32 @@ var (
 	loginPattern = regexp.MustCompile(`^[\x21-\x3f\x5b-\x7e]+@[\x21-\x3f\x5b-\x7e]+\.[\x21-\x3f\x5b-\x7e]+$`)
 )
 
+// The worker images an app's tasks may run in.
+var workerImages = []string{"node", "ruby", "python", "go"}
+
+// workerSizes is the memory, in MiB, that AWS Fargate allows with each CPU
+// size, in CPU units, an app's workers may have: at most 4 vCPU and 16 GB.
+var workerSizes = map[int64][]int64{
+	256:  {512, 1024, 2048},
+	512:  gigabytes(1024, 4096),
+	1024: gigabytes(2048, 8192),
+	2048: gigabytes(4096, 16384),
+	4096: gigabytes(8192, 16384),
+}
+
+// gigabytes is from to to MiB, in steps of 1 GB.
+func gigabytes(from, to int64) []int64 {
+	var out []int64
+	for m := from; m <= to; m += 1024 {
+		out = append(out, m)
+	}
+	return out
+}
+
+// memoryRule says which memory goes with which CPU, for docs and errors.
+const memoryRule = "`512`, `1024` or `2048` with `256`; `1024` to `4096` with `512`; `2048` to `8192` with " +
+	"`1024`; `4096` to `16384` with `2048`; `8192` to `16384` with `4096`; each range in steps of `1024`"
+
 // setOrNull maps a list AutoPilot answered with to state. An optional
 // attribute left out of configuration is null in the plan, while AutoPilot
 // answers [] for it, so an empty answer stays null where the prior value

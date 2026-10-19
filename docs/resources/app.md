@@ -8,6 +8,7 @@ description: |-
   Every argument but name is optional and sent only when set. Removing one from the configuration empties it at AutoPilot: an app without accepts accepts no sender. Narrowing or deleting an app takes effect at once: AutoPilot stops the queued and running tasks the app no longer accepts.
   A repository belongs to the first app that claims it. AutoPilot can't tell which app should own one, so review an app's repos as you would its access.
   credential and when_seats_full are the app's credential policy: what the model calls of the tasks billed to it run on. A change to either sends both.
+  worker_image, worker_cpu and worker_memory choose the worker the tasks billed to the app run in: its image, and the size of the AWS Fargate task it runs as. worker_cpu and worker_memory are one size, set together, and a change to either sends both.
   An app with this name that already exists is not taken over, even when its values match: the create fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a gateway's 502, say) before an identical app answered: that attempt may have made the app, and the provider can't tell, so it takes the app as its own. create_before_destroy doesn't fit an app: the name is its key.
   Import by name: terraform import autopilot_app.billing billing.
 ---
@@ -23,6 +24,8 @@ Every argument but `name` is optional and sent only when set. Removing one from 
 A repository belongs to the first app that claims it. AutoPilot can't tell which app should own one, so review an app's `repos` as you would its access.
 
 `credential` and `when_seats_full` are the app's credential policy: what the model calls of the tasks billed to it run on. A change to either sends both.
+
+`worker_image`, `worker_cpu` and `worker_memory` choose the worker the tasks billed to the app run in: its image, and the size of the AWS Fargate task it runs as. `worker_cpu` and `worker_memory` are one size, set together, and a change to either sends both.
 
 An app with this name that already exists is not taken over, even when its values match: the create fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a gateway's 502, say) before an identical app answered: that attempt may have made the app, and the provider can't tell, so it takes the app as its own. `create_before_destroy` doesn't fit an app: the name is its key.
 
@@ -67,6 +70,12 @@ resource "autopilot_app" "billing" {
   # and Bedrock when every seat is full.
   credential      = "seat_first"
   when_seats_full = "fall_back"
+
+  # The worker its tasks run in: the ruby image, on a bigger task than the
+  # default of 2 vCPU and 8 GB.
+  worker_image  = "ruby"
+  worker_cpu    = 4096
+  worker_memory = 16384
 }
 ```
 
@@ -80,10 +89,13 @@ resource "autopilot_app" "billing" {
 ### Optional
 
 - `accepts` (Attributes Set) The senders this app accepts work from, each at most once, with the kinds of task it accepts from each. At most 20. (see [below for nested schema](#nestedatt--accepts))
-- `credential` (String) What the model calls of the tasks billed to this app run on: `bedrock` (Amazon Bedrock, billed per token) or `seat_first` (one of the organization's Claude seats, when one has room). Left out, the app has no policy of its own, and AutoPilot's default applies: `bedrock`, unless AutoPilot's own settings still name the app. AutoPilot uses seats only while its seat mode is on; with it off, every task runs on Bedrock. Removing it from the configuration takes the app's own policy away. The credential is chosen when a task starts, so a change reaches only the tasks that start after it.
+- `credential` (String) What the model calls of the tasks billed to this app run on: `bedrock` (Amazon Bedrock, billed per token) or `seat_first` (one of the organization's Claude seats, when one has room). Left out, the app has no policy of its own, and AutoPilot's default applies: `bedrock`. AutoPilot uses seats only while its seat mode is on; with it off, every task runs on Bedrock. Removing it from the configuration takes the app's own policy away. The credential is chosen when a task starts, so a change reaches only the tasks that start after it.
 - `developers` (Set of String) The people who may start work for this app themselves, through AutoPilot's MCP server: their sign-in logins, which are email addresses, written in lowercase ASCII (AutoPilot refuses anything else). At most 100.
 - `repos` (Set of String) The repositories this app **owns**, as `owner/name`. A repository belongs to at most one app. AutoPilot matches them without regard to case, so no two may differ only in case. At most 50.
 - `when_seats_full` (String) With `credential = "seat_first"`, what a task does when every seat is full: `wait` until one has room, or `fall_back` to Bedrock. Required with `seat_first`, and only allowed with it.
+- `worker_cpu` (Number) The CPU of the AWS Fargate task each of this app's tasks runs in, in CPU units, 1024 to a vCPU: `256`, `512`, `1024`, `2048` or `4096`. Set together with `worker_memory`. Left out with it, a task gets AutoPilot's default size, 2 vCPU and 8 GB, and removing both from the configuration takes the app back to it. A bigger task counts against AutoPilot's limits on running tasks and daily spend like any other. The size is chosen when a task starts, so a change reaches only the tasks that start after it.
+- `worker_image` (String) The worker image the tasks billed to this app run in: `node`, `ruby`, `python` or `go`. Each is the same worker with that language's tools; `ruby` has Node too, for Rails assets. Choose the app's main language. Left out, the app's tasks run in `node`, and removing it from the configuration takes the app back to `node`. The image is chosen when a task starts, so a change reaches only the tasks that start after it.
+- `worker_memory` (Number) The memory of that Fargate task, in MiB, at most 16 GB: one that Fargate allows with `worker_cpu`, which is `512`, `1024` or `2048` with `256`; `1024` to `4096` with `512`; `2048` to `8192` with `1024`; `4096` to `16384` with `2048`; `8192` to `16384` with `4096`; each range in steps of `1024`. Set together with `worker_cpu`.
 
 ### Read-Only
 
