@@ -1346,3 +1346,316 @@ func TestUnknownListIsAnErrorNotEmpty(t *testing.T) {
 		t.Errorf("null repos gave %v, %v; null is simply not sent", got, diags)
 	}
 }
+
+// An app's worker image and size are set, changed and taken away. The size's
+// two arguments are one size, so a change to either sends both, and removing
+// them sends both as null.
+func TestApp_worker(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	big := `
+  worker_image  = "ruby"
+  worker_cpu    = 4096
+  worker_memory = 16384`
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, big),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "worker_image", "ruby"),
+					resource.TestCheckResourceAttr(appRes, "worker_cpu", "4096"),
+					resource.TestCheckResourceAttr(appRes, "worker_memory", "16384"),
+					func(*terraform.State) error {
+						if env.live() {
+							return nil
+						}
+						post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0]
+						body := requestBody(t, post)
+						if body["worker_image"] != "ruby" || body["worker_cpu"] != float64(4096) || body["worker_memory"] != float64(16384) {
+							return fmt.Errorf("the create sent %v", body)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: appConfig(env, name, big),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// The same CPU with less memory still sends both.
+				Config: appConfig(env, name, `
+  worker_image  = "ruby"
+  worker_cpu    = 4096
+  worker_memory = 8192`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "worker_memory", "8192"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					lastAppPatch(t, env, name, map[string]any{"worker_cpu": float64(4096), "worker_memory": float64(8192)}),
+				),
+			},
+			{
+				Config: appConfig(env, name, `  worker_image = "go"`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "worker_image", "go"),
+					resource.TestCheckNoResourceAttr(appRes, "worker_cpu"),
+					resource.TestCheckNoResourceAttr(appRes, "worker_memory"),
+					lastAppPatch(t, env, name, map[string]any{"worker_image": "go", "worker_cpu": nil, "worker_memory": nil}),
+				),
+			},
+			{
+				Config: appConfig(env, name, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "worker_image"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "4"),
+					lastAppPatch(t, env, name, map[string]any{"worker_image": nil}),
+					func(*terraform.State) error {
+						if env.live() {
+							return nil
+						}
+						if v, _ := env.fake.App(name); v.WorkerImage != "" || v.WorkerCPU != 0 || v.WorkerMemory != 0 {
+							return fmt.Errorf("AutoPilot still holds %q, %d, %d", v.WorkerImage, v.WorkerCPU, v.WorkerMemory)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: appConfig(env, name, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A change to another argument leaves the worker out, so the app keeps it.
+func TestApp_workerNotSentWhenUnchanged(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	worker := `
+  worker_image  = "python"
+  worker_cpu    = 1024
+  worker_memory = 4096`
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, name, worker)},
+			{
+				Config: appConfig(env, name, worker+`
+  developers = ["someone@example.com"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, name, map[string]any{"developers": []any{"someone@example.com"}}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(name); v.WorkerImage != "python" || v.WorkerCPU != 1024 || v.WorkerMemory != 4096 {
+							return fmt.Errorf("AutoPilot holds %q, %d, %d", v.WorkerImage, v.WorkerCPU, v.WorkerMemory)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// A worker changed outside Terraform shows as a change, and the apply puts
+// the configured one back; one set outside Terraform on an app that
+// configures none is taken away.
+func TestApp_workerChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name, other := randName(), randName()
+	worker := `
+  worker_image  = "ruby"
+  worker_cpu    = 2048
+  worker_memory = 16384`
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, name, worker)},
+			{
+				PreConfig: func() {
+					env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) {
+						v.WorkerImage, v.WorkerCPU, v.WorkerMemory = "node", 2048, 8192
+					})
+				},
+				Config: appConfig(env, name, worker),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, name, map[string]any{
+						"worker_image": "ruby", "worker_cpu": float64(2048), "worker_memory": float64(16384),
+					}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(name); v.WorkerImage != "ruby" || v.WorkerCPU != 2048 || v.WorkerMemory != 16384 {
+							return fmt.Errorf("AutoPilot holds %q, %d, %d", v.WorkerImage, v.WorkerCPU, v.WorkerMemory)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, other, "")},
+			{
+				PreConfig: func() {
+					env.fake.ChangeAppOutOfBand(other, func(v *autopilottest.AppView) {
+						v.WorkerImage, v.WorkerCPU, v.WorkerMemory = "go", 4096, 16384
+					})
+				},
+				Config: appConfig(env, other, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, other, map[string]any{"worker_image": nil, "worker_cpu": nil, "worker_memory": nil}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(other); v.WorkerImage != "" || v.WorkerCPU != 0 || v.WorkerMemory != 0 {
+							return fmt.Errorf("AutoPilot still holds %q, %d, %d", v.WorkerImage, v.WorkerCPU, v.WorkerMemory)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// An imported app's worker is read into state, so a configuration that sets
+// the same plans nothing.
+func TestApp_importWithWorker(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{Name: name, WorkerImage: "ruby", WorkerCPU: 4096, WorkerMemory: 12288})
+	config := appConfig(env, name, `
+  worker_image  = "ruby"
+  worker_cpu    = 4096
+  worker_memory = 12288`)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             config,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// The worker's rules fail the plan.
+func TestApp_workerPlanTimeValidation(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	cases := []struct {
+		body string
+		want string
+	}{
+		{`  worker_image = "rust"`, "value must be one of"},
+		{`  worker_image = "Node"`, "value must be one of"},
+		{`  worker_cpu = 4096`, "worker_memory is required with worker_cpu"},
+		{`  worker_memory = 16384`, "worker_cpu is required with worker_memory"},
+		{`
+  worker_cpu    = 8192
+  worker_memory = 16384`, "value must be one of"},
+		{`
+  worker_cpu    = 3072
+  worker_memory = 8192`, "value must be one of"},
+		{`
+  worker_cpu    = 4096
+  worker_memory = 30720`, "value must be between 512 and 16384"},
+		{`
+  worker_cpu    = 4096
+  worker_memory = 4096`, "worker_memory doesn't go with worker_cpu"},
+		{`
+  worker_cpu    = 2048
+  worker_memory = 8000`, "worker_memory doesn't go with worker_cpu"},
+		{`
+  worker_cpu    = 256
+  worker_memory = 4096`, "worker_memory doesn't go with worker_cpu"},
+	}
+	steps := make([]resource.TestStep, 0, len(cases))
+	for _, c := range cases {
+		steps = append(steps, resource.TestStep{Config: appConfig(env, name, c.body), PlanOnly: true, ExpectError: expectErr(c.want)})
+	}
+	runTest(t, resource.TestCase{Steps: steps})
+}
+
+// Every size the plan allows is one the fake, like AutoPilot, takes, and
+// every one it refuses, the fake refuses too.
+func TestWorkerSizes_MatchFargate(t *testing.T) {
+	allowed := 0
+	for _, cpu := range []int64{128, 256, 512, 1024, 2048, 3072, 4096, 8192} {
+		for memory := int64(256); memory <= 32768; memory += 256 {
+			var fargate bool
+			switch cpu {
+			case 256:
+				fargate = memory == 512 || memory == 1024 || memory == 2048
+			case 512:
+				fargate = memory >= 1024 && memory <= 4096 && memory%1024 == 0
+			case 1024:
+				fargate = memory >= 2048 && memory <= 8192 && memory%1024 == 0
+			case 2048:
+				fargate = memory >= 4096 && memory <= 16384 && memory%1024 == 0
+			case 4096:
+				fargate = memory >= 8192 && memory <= 30720 && memory%1024 == 0
+			case 8192:
+				fargate = memory >= 16384 && memory <= 61440 && memory%4096 == 0
+			}
+			want := fargate && cpu <= 4096 && memory <= 16384
+			if got := slices.Contains(workerSizes[cpu], memory); got != want {
+				t.Errorf("%d/%d: allowed = %v, want %v", cpu, memory, got, want)
+			}
+			if want {
+				allowed++
+			}
+		}
+	}
+	if allowed != 36 {
+		t.Errorf("%d sizes allowed, want 36", allowed)
+	}
+}
+
+// A worker that is somehow still unknown at apply is an error, never sent as
+// none: that would take the app's image or size away.
+func TestUnknownWorkerIsAnError(t *testing.T) {
+	var diags diag.Diagnostics
+	if got := imageFromModel(appModel{WorkerImage: types.StringUnknown()}, &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown worker_image gave %v, %v", got, diags)
+	}
+	diags = nil
+	m := appModel{WorkerCPU: types.Int64Unknown(), WorkerMemory: types.Int64Value(8192)}
+	if got := sizeFromModel(m, &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown worker_cpu gave %v, %v", got, diags)
+	}
+	diags = nil
+	m = appModel{WorkerCPU: types.Int64Value(2048), WorkerMemory: types.Int64Unknown()}
+	if got := sizeFromModel(m, &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown worker_memory gave %v, %v", got, diags)
+	}
+	diags = nil
+	m = appModel{WorkerImage: types.StringNull(), WorkerCPU: types.Int64Null(), WorkerMemory: types.Int64Null()}
+	if got := imageFromModel(m, &diags); got == nil || *got != "" || diags.HasError() {
+		t.Errorf("no image gave %v, %v; it takes the app back to node", got, diags)
+	}
+	if got := sizeFromModel(m, &diags); got == nil || *got != (client.WorkerSize{}) || diags.HasError() {
+		t.Errorf("no size gave %v, %v; it takes the app's size away", got, diags)
+	}
+}

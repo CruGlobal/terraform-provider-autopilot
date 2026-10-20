@@ -8,7 +8,8 @@ import (
 
 // App is a unit of consent: the repositories it owns, the senders it accepts
 // work from (with the kinds it accepts from each), and the people who may
-// start work for it themselves. It also holds the app's credential policy.
+// start work for it themselves. It also holds the app's credential policy,
+// and the worker its tasks run in.
 type App struct {
 	Name       string   `json:"name"`
 	Repos      []string `json:"repos"`
@@ -20,9 +21,16 @@ type App struct {
 	// WhenSeatsFull is "wait" or "fall_back" with seat_first, and nil
 	// otherwise.
 	WhenSeatsFull *string `json:"when_seats_full"`
-	LockVersion   int64   `json:"lock_version"`
-	CreatedAt     string  `json:"created_at"`
-	UpdatedAt     string  `json:"updated_at"`
+	// WorkerImage is "node", "ruby", "python" or "go", or nil for node (or
+	// when the AutoPilot predates the field).
+	WorkerImage *string `json:"worker_image"`
+	// WorkerCPU and WorkerMemory are the size of the app's workers, in CPU
+	// units and MiB, both or neither. Nil is the worker's own size.
+	WorkerCPU    *int64 `json:"worker_cpu"`
+	WorkerMemory *int64 `json:"worker_memory"`
+	LockVersion  int64  `json:"lock_version"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 func (a *App) recordName() string {
@@ -64,13 +72,28 @@ type CredentialPolicy struct {
 	WhenSeatsFull string
 }
 
+// WorkerSize is the size of an app's workers. AutoPilot takes it as one: a
+// write that sends either field sets both, so one left out is null.
+type WorkerSize struct {
+	// CPU is in CPU units, 1024 to a vCPU, or 0 to take the size away (sent
+	// as null, with Memory).
+	CPU int64
+	// Memory is in MiB, or 0 with CPU 0.
+	Memory int64
+}
+
 // AppSpec is what a create or a change sends. A nil list is not sent at all;
-// an empty, non-nil list is sent as []. A nil Policy is not sent either.
+// an empty, non-nil list is sent as []. A nil Policy, WorkerImage or Size is
+// not sent either.
 type AppSpec struct {
 	Repos      []string
 	Accepts    []Accept
 	Developers []string
 	Policy     *CredentialPolicy
+	// WorkerImage is "node", "ruby", "python" or "go", or "" to take the
+	// app back to node (sent as null).
+	WorkerImage *string
+	Size        *WorkerSize
 }
 
 func (s AppSpec) fields() Fields {
@@ -92,6 +115,20 @@ func (s AppSpec) fields() Fields {
 		}
 		if s.Policy.WhenSeatsFull != "" {
 			f["when_seats_full"] = s.Policy.WhenSeatsFull
+		}
+	}
+	if s.WorkerImage != nil {
+		if *s.WorkerImage == "" {
+			f["worker_image"] = nil
+		} else {
+			f["worker_image"] = *s.WorkerImage
+		}
+	}
+	if s.Size != nil {
+		if s.Size.CPU == 0 {
+			f["worker_cpu"], f["worker_memory"] = nil, nil
+		} else {
+			f["worker_cpu"], f["worker_memory"] = s.Size.CPU, s.Size.Memory
 		}
 	}
 	return f
@@ -152,6 +189,12 @@ func (s AppSpec) reflectedIn(app *App) bool {
 	if s.Policy != nil && (deref(app.Credential) != s.Policy.Credential || deref(app.WhenSeatsFull) != s.Policy.WhenSeatsFull) {
 		return false
 	}
+	if s.WorkerImage != nil && deref(app.WorkerImage) != *s.WorkerImage {
+		return false
+	}
+	if s.Size != nil && (derefInt(app.WorkerCPU) != s.Size.CPU || derefInt(app.WorkerMemory) != s.Size.Memory) {
+		return false
+	}
 	return true
 }
 
@@ -161,6 +204,14 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// derefInt is a nullable number's value, or 0 for null.
+func derefInt(n *int64) int64 {
+	if n == nil {
+		return 0
+	}
+	return *n
 }
 
 const appsPath = "/apps"

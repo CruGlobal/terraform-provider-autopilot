@@ -21,7 +21,7 @@ var (
 	maxRepos        = 50
 	maxAccepts      = 20
 	maxDevelopers   = 100
-	appWritable     = []string{"repos", "accepts", "developers", "credential", "when_seats_full"}
+	appWritable     = []string{"repos", "accepts", "developers", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory"}
 	appReadOnly     = []string{"lock_version", "created_at", "updated_at"}
 	acceptWritable  = []string{"sender", "kinds", "can_decide", "can_auto_merge"}
 	appCreateFields = append([]string{"name"}, appWritable...)
@@ -29,7 +29,28 @@ var (
 	// seat_first, what they do when every seat is full.
 	credentials   = []string{"bedrock", "seat_first"}
 	whenSeatsFull = []string{"wait", "fall_back"}
+	// The worker images an app's tasks may run in.
+	workerImages = []string{"node", "ruby", "python", "go"}
 )
+
+// workerMemory is the memory, in MiB, that Fargate allows with each CPU size
+// an app's workers may have: at most 4 vCPU and 16 GB.
+var workerMemory = map[int64][]int64{
+	256:  {512, 1024, 2048},
+	512:  gigabytes(1024, 4096),
+	1024: gigabytes(2048, 8192),
+	2048: gigabytes(4096, 16384),
+	4096: gigabytes(8192, 16384),
+}
+
+// gigabytes is from to to MiB, in steps of 1 GB.
+func gigabytes(from, to int64) []int64 {
+	var out []int64
+	for m := from; m <= to; m += 1024 {
+		out = append(out, m)
+	}
+	return out
+}
 
 // pullRequestKinds are the kinds whose tasks open a pull request, the only
 // ones auto-merge applies to.
@@ -44,19 +65,24 @@ type Accept struct {
 }
 
 // appRecord is an app as the fake stores it. An empty credential or
-// whenSeatsFull is null: the app has no credential policy of its own.
+// whenSeatsFull is null: the app has no credential policy of its own. An
+// empty workerImage is null (node), and a zero workerCPU and workerMemory
+// are null (the worker's own size).
 type appRecord struct {
 	name                      string
 	repos                     []string
 	accepts                   []Accept
 	developers                []string
 	credential, whenSeatsFull string
+	workerImage               string
+	workerCPU, workerMemory   int64
 	lockVersion               int64
 	createdAt, updatedAt      time.Time
 }
 
-// AppView is a copy of a stored app, for assertions. An empty Credential or
-// WhenSeatsFull is null.
+// AppView is a copy of a stored app, for assertions. An empty Credential,
+// WhenSeatsFull or WorkerImage is null, and so is a zero WorkerCPU or
+// WorkerMemory.
 type AppView struct {
 	Name          string
 	Repos         []string
@@ -64,6 +90,9 @@ type AppView struct {
 	Developers    []string
 	Credential    string
 	WhenSeatsFull string
+	WorkerImage   string
+	WorkerCPU     int64
+	WorkerMemory  int64
 	LockVersion   int64
 }
 
@@ -71,6 +100,7 @@ func (rec *appRecord) view() AppView {
 	return AppView{
 		Name: rec.name, Repos: slices.Clone(rec.repos), Accepts: cloneAccepts(rec.accepts),
 		Developers: slices.Clone(rec.developers), Credential: rec.credential, WhenSeatsFull: rec.whenSeatsFull,
+		WorkerImage: rec.workerImage, WorkerCPU: rec.workerCPU, WorkerMemory: rec.workerMemory,
 		LockVersion: rec.lockVersion,
 	}
 }
@@ -118,6 +148,9 @@ func (rec *appRecord) json() map[string]any {
 		"developers":      sortedUnique(rec.developers),
 		"credential":      nullable(rec.credential),
 		"when_seats_full": nullable(rec.whenSeatsFull),
+		"worker_image":    nullable(rec.workerImage),
+		"worker_cpu":      nullableInt(rec.workerCPU),
+		"worker_memory":   nullableInt(rec.workerMemory),
 		"lock_version":    rec.lockVersion,
 		"created_at":      timestamp(rec.createdAt),
 		"updated_at":      timestamp(rec.updatedAt),
@@ -132,6 +165,14 @@ func nullable(s string) any {
 	return s
 }
 
+// nullableInt is 0 as null, and any other number as itself.
+func nullableInt(n int64) any {
+	if n == 0 {
+		return nil
+	}
+	return n
+}
+
 // --- test controls ----------------------------------------------------------
 
 // SeedApp stores an app directly, as if another root made it.
@@ -142,6 +183,7 @@ func (s *Server) SeedApp(v AppView) {
 	s.apps[v.Name] = &appRecord{
 		name: v.Name, repos: sortedUniqueFold(v.Repos), accepts: sortAccepts(v.Accepts),
 		developers: sortedUnique(v.Developers), credential: v.Credential, whenSeatsFull: v.WhenSeatsFull,
+		workerImage: v.WorkerImage, workerCPU: v.WorkerCPU, workerMemory: v.WorkerMemory,
 		lockVersion: 1, createdAt: now, updatedAt: now,
 	}
 }
@@ -170,6 +212,7 @@ func (s *Server) ChangeAppOutOfBand(name string, change func(v *AppView)) {
 	change(&v)
 	rec.repos, rec.accepts, rec.developers = sortedUniqueFold(v.Repos), sortAccepts(v.Accepts), sortedUnique(v.Developers)
 	rec.credential, rec.whenSeatsFull = v.Credential, v.WhenSeatsFull
+	rec.workerImage, rec.workerCPU, rec.workerMemory = v.WorkerImage, v.WorkerCPU, v.WorkerMemory
 	rec.lockVersion++
 	rec.updatedAt = time.Now()
 }
@@ -252,13 +295,19 @@ func (s *Server) appRoutes(mux *http.ServeMux) {
 
 // appFields are the writable fields of an app, as read from a body. A nil
 // list was not sent. policySent says the body sent credential, which sets
-// both credential and whenSeatsFull ("" for null).
+// both credential and whenSeatsFull ("" for null). imageSent says it sent
+// worker_image ("" for null), and sizeSent that it sent worker_cpu or
+// worker_memory, which sets both (0 for null).
 type appFields struct {
 	repos                     []string
 	accepts                   []Accept
 	developers                []string
 	policySent                bool
 	credential, whenSeatsFull string
+	imageSent                 bool
+	workerImage               string
+	sizeSent                  bool
+	workerCPU, workerMemory   int64
 }
 
 func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
@@ -404,7 +453,57 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 	} else if sentWhen {
 		return f, invalid("/when_seats_full", "is sent with credential: a write that sends credential sets both")
 	}
+	if raw, ok := obj["worker_image"]; ok {
+		image, ref := oneOrNull(raw, "/worker_image", workerImages)
+		if ref != nil {
+			return f, ref
+		}
+		f.imageSent, f.workerImage = true, image
+	}
+	// The worker's size is one too: a write that sends either field sets
+	// both, so one left out is null.
+	rawCPU, sentCPU := obj["worker_cpu"]
+	rawMemory, sentMemory := obj["worker_memory"]
+	if sentCPU || sentMemory {
+		var cpu, memory int64
+		var ref *refusal
+		if sentCPU {
+			if cpu, ref = wholeOrNull(rawCPU, "/worker_cpu", "is CPU units, 1024 to a vCPU, or null"); ref != nil {
+				return f, ref
+			}
+		}
+		if sentMemory {
+			if memory, ref = wholeOrNull(rawMemory, "/worker_memory", "is MiB, or null"); ref != nil {
+				return f, ref
+			}
+		}
+		allowed, knownCPU := workerMemory[cpu]
+		switch {
+		case cpu == 0 && memory == 0:
+		case cpu == 0:
+			return f, invalid("/worker_cpu", "is sent with worker_memory: the two are one size, set together")
+		case memory == 0:
+			return f, invalid("/worker_memory", "is sent with worker_cpu: the two are one size, set together")
+		case !knownCPU:
+			return f, invalid("/worker_cpu", "is 256, 512, 1024, 2048, 4096 or null")
+		case !slices.Contains(allowed, memory):
+			return f, invalid("/worker_memory", "is MiB that Fargate allows with worker_cpu, at most 16 GB")
+		}
+		f.sizeSent, f.workerCPU, f.workerMemory = true, cpu, memory
+	}
 	return f, nil
+}
+
+// wholeOrNull reads a whole number above zero, or null as 0.
+func wholeOrNull(raw json.RawMessage, pointer, message string) (int64, *refusal) {
+	var out *int64
+	if err := json.Unmarshal(raw, &out); err != nil || (out != nil && *out <= 0) {
+		return 0, invalid(pointer, message)
+	}
+	if out == nil {
+		return 0, nil
+	}
+	return *out, nil
 }
 
 // oneOrNull reads one of allowed, or null as "".
@@ -427,7 +526,9 @@ func (rec *appRecord) holds(f appFields) bool {
 	return (f.repos == nil || slices.Equal(f.repos, rec.repos)) &&
 		(f.accepts == nil || acceptsEqual(f.accepts, rec.accepts)) &&
 		(f.developers == nil || slices.Equal(f.developers, rec.developers)) &&
-		(!f.policySent || (f.credential == rec.credential && f.whenSeatsFull == rec.whenSeatsFull))
+		(!f.policySent || (f.credential == rec.credential && f.whenSeatsFull == rec.whenSeatsFull)) &&
+		(!f.imageSent || f.workerImage == rec.workerImage) &&
+		(!f.sizeSent || (f.workerCPU == rec.workerCPU && f.workerMemory == rec.workerMemory))
 }
 
 // repoOwner names the app other than except that owns repo, matched without
@@ -490,7 +591,8 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 	now := time.Now()
 	if existing, ok := s.apps[name]; ok {
 		same := slices.Equal(existing.repos, repos) && acceptsEqual(existing.accepts, accepts) && slices.Equal(existing.developers, devs) &&
-			existing.credential == f.credential && existing.whenSeatsFull == f.whenSeatsFull
+			existing.credential == f.credential && existing.whenSeatsFull == f.whenSeatsFull &&
+			existing.workerImage == f.workerImage && existing.workerCPU == f.workerCPU && existing.workerMemory == f.workerMemory
 		if !same {
 			return 0, nil, &refusal{http.StatusConflict, "name_taken", "an app with this name exists with other fields", "/name"}
 		}
@@ -500,7 +602,9 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 		return 0, nil, ref
 	}
 	rec := &appRecord{name: name, repos: repos, accepts: accepts, developers: devs,
-		credential: f.credential, whenSeatsFull: f.whenSeatsFull, lockVersion: 1, createdAt: now, updatedAt: now}
+		credential: f.credential, whenSeatsFull: f.whenSeatsFull,
+		workerImage: f.workerImage, workerCPU: f.workerCPU, workerMemory: f.workerMemory,
+		lockVersion: 1, createdAt: now, updatedAt: now}
 	s.apps[name] = rec
 	return http.StatusCreated, rec.json(), nil
 }
@@ -558,6 +662,12 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 	}
 	if f.policySent && (f.credential != rec.credential || f.whenSeatsFull != rec.whenSeatsFull) {
 		rec.credential, rec.whenSeatsFull, changed = f.credential, f.whenSeatsFull, true
+	}
+	if f.imageSent && f.workerImage != rec.workerImage {
+		rec.workerImage, changed = f.workerImage, true
+	}
+	if f.sizeSent && (f.workerCPU != rec.workerCPU || f.workerMemory != rec.workerMemory) {
+		rec.workerCPU, rec.workerMemory, changed = f.workerCPU, f.workerMemory, true
 	}
 	if changed {
 		rec.lockVersion++

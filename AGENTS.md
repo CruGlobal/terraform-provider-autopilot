@@ -105,6 +105,13 @@ the examples, and the generated docs. Things worth knowing:
   `when_seats_full` left out is null) and refuses `when_seats_full` alone.
   The provider sends both on a change to either (`AppSpec.Policy`), and
   `credential: null` to take the policy away.
+- An app's worker size (`worker_cpu`, `worker_memory`) is one thing too:
+  AutoPilot sets both from a write that sends either, refuses one without
+  the other, and takes only the pairs AWS Fargate allows, up to 4 vCPU and
+  16 GB (`workerSizes` in `app_validators.go`, checked at plan time). The
+  provider sends both on a change to either (`AppSpec.Size`), and both as
+  null to take the size away. `worker_image` is sent on its own, as null to
+  take the app back to `node`.
 - A sender's secrets are write-only (`*_wo`). The plan compares
   `client.Fingerprint` of the configured secrets with the stored
   fingerprints; see the comment at the top of `sender_resource.go`.
