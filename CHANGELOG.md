@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.2.0...v0.3.0) (2026-10-20)
+
+
+### Added
+
+* **app:** choose each app's worker image and size ([#9](https://github.com/CruGlobal/terraform-provider-autopilot/issues/9)) ([f18ed9b](https://github.com/CruGlobal/terraform-provider-autopilot/commit/f18ed9bbd96ac5e5ebcd2d7884c13150fab6454b))
+
 ## [0.2.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.1.0...v0.2.0) (2026-10-16)
 
 
