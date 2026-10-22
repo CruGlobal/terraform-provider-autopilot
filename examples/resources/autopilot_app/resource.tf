@@ -25,10 +25,23 @@ resource "autopilot_app" "billing" {
       sender = "monitor"
       kinds  = ["fix-error"]
     },
+    {
+      # Pull request reviews the developers start from GitHub. They only
+      # comment, so this entry can't set can_decide.
+      sender = "autopilot-github"
+      kinds  = ["review-pr"]
+    },
   ]
 
   # The people who may start work for this app themselves.
   developers = local.developers
+
+  # Each developer's GitHub login, so a review they start from GitHub runs
+  # in their name. Every developer here must be in developers too.
+  github_logins = [
+    { login = "example-first-dev", developer = "first.developer@example.com" },
+    { login = "example-second-dev", developer = "second.developer@example.com" },
+  ]
 
   # What its tasks' model calls run on: a Claude seat when one has room,
   # and Bedrock when every seat is full.

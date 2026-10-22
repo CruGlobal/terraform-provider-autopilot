@@ -159,7 +159,13 @@ func TestAccepts_CanAutoMerge(t *testing.T) {
 
 func TestDevelopers_LowercaseASCIIOnly(t *testing.T) {
 	s := New(t)
-	for _, bad := range []string{"Someone@example.com", "someone@Example.com", "someoné@example.com", "someone", "some one@example.com"} {
+	for _, bad := range []string{
+		"Someone@example.com", "someone@Example.com", "someoné@example.com", "someone", "some one@example.com",
+		// AutoPilot's own rule refuses these too.
+		"someone@example.com.", "someone@.example.com", "someone@example..com", "someone@example",
+		"some!one@example.com", "some,one@example.com", "{someone}@example.com", "@example.com",
+		strings.Repeat("a", 65) + "@example.com", "someone@example.com@example.com",
+	} {
 		st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "developers": []string{bad}})
 		expect(t, bad, st, http.StatusUnprocessableEntity, body)
 		if body["field"] != "/developers/0" {
@@ -570,5 +576,166 @@ func TestWorker_Rules(t *testing.T) {
 	expect(t, "back to node", st, http.StatusOK, body)
 	if body["worker_image"] != nil || body["lock_version"] != float64(3) {
 		t.Errorf("back to node: %v", body)
+	}
+}
+
+// GitHub logins: each a lowercase GitHub login paired with one of the app's
+// developers, each login at most once, at most 100, kept sorted by login.
+func TestGitHubLogins_Rules(t *testing.T) {
+	s := New(t)
+	dev := []string{"alice@example.org"}
+	pair := func(login, developer string) map[string]any {
+		return map[string]any{"login": login, "developer": developer}
+	}
+	refused := []struct {
+		what   string
+		body   map[string]any
+		field  string
+		wanted string
+	}{
+		{"uppercase", map[string]any{"github_logins": []any{pair("Alice", "alice@example.org")}}, "/github_logins/0/login", ""},
+		{"a leading -", map[string]any{"github_logins": []any{pair("-alice", "alice@example.org")}}, "/github_logins/0/login", ""},
+		{"a leading _", map[string]any{"github_logins": []any{pair("_alice", "alice@example.org")}}, "/github_logins/0/login", ""},
+		{"a dot", map[string]any{"github_logins": []any{pair("alice.gh", "alice@example.org")}}, "/github_logins/0/login", ""},
+		{"40 characters", map[string]any{"github_logins": []any{pair(strings.Repeat("a", 40), "alice@example.org")}}, "/github_logins/0/login", ""},
+		{"empty", map[string]any{"github_logins": []any{pair("", "alice@example.org")}}, "/github_logins/0/login", ""},
+		{"a developer in uppercase", map[string]any{"github_logins": []any{pair("alice", "Alice@example.org")}}, "/github_logins/0/developer", ""},
+		{"a developer not an email", map[string]any{"github_logins": []any{pair("alice", "alice")}}, "/github_logins/0/developer", ""},
+		{"no login", map[string]any{"github_logins": []any{map[string]any{"developer": "alice@example.org"}}}, "/github_logins/0/login", ""},
+		{"no developer", map[string]any{"github_logins": []any{map[string]any{"login": "alice"}}}, "/github_logins/0/developer", ""},
+		{"an unknown field", map[string]any{"github_logins": []any{map[string]any{"login": "alice", "developer": "alice@example.org", "admin": true}}}, "/github_logins/0/admin", ""},
+		{"not a list", map[string]any{"github_logins": "alice"}, "/github_logins", ""},
+		{"not an object", map[string]any{"github_logins": []any{"alice"}}, "/github_logins/0", ""},
+		// AutoPilot reads an entry's fields in sorted order, developer first.
+		{"both wrong", map[string]any{"github_logins": []any{pair("BAD", "BAD")}}, "/github_logins/0/developer", ""},
+		{"a developer AutoPilot's rule refuses", map[string]any{"developers": []string{"alice@example.org"},
+			"github_logins": []any{pair("alice", "alice@example.org.")}}, "/github_logins/0/developer", ""},
+		// It reads every field before it pairs logins with developers.
+		{"unpaired, and another field wrong", map[string]any{"worker_image": "bogus",
+			"github_logins": []any{pair("alice", "alice@example.org")}}, "/worker_image", ""},
+		{"one login, two developers", map[string]any{"developers": []string{"alice@example.org", "bob@example.org"},
+			"github_logins": []any{pair("alice", "alice@example.org"), pair("alice", "bob@example.org")}}, "/github_logins/1/login", ""},
+		{"no developers", map[string]any{"github_logins": []any{pair("alice", "alice@example.org")}}, "/github_logins/0", "developer the app doesn't list"},
+		{"someone not a developer", map[string]any{"developers": dev,
+			"github_logins": []any{pair("alice", "alice@example.org"), pair("bob", "bob@example.org")}}, "/github_logins/1", "developer the app doesn't list"},
+	}
+	for _, c := range refused {
+		body := map[string]any{"name": "billing"}
+		for k, v := range c.body {
+			body[k] = v
+		}
+		st, answer := call(t, s, http.MethodPost, "/v1/admin/apps", "", body)
+		expect(t, c.what, st, http.StatusUnprocessableEntity, answer)
+		if answer["field"] != c.field {
+			t.Errorf("%s: field = %v, want %s", c.what, answer["field"], c.field)
+		}
+		if msg, _ := answer["message"].(string); !strings.Contains(msg, c.wanted) {
+			t.Errorf("%s: message = %q", c.what, msg)
+		}
+	}
+	many := make([]any, 0, 101)
+	for i := range 101 {
+		many = append(many, pair(fmt.Sprintf("login-%d", i), "alice@example.org"))
+	}
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "developers": dev, "github_logins": many})
+	expect(t, "101 logins", st, http.StatusUnprocessableEntity, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "developers": dev, "github_logins": many[:100]})
+	expect(t, "100 logins", st, http.StatusCreated, body)
+	s.RemoveApp("billing")
+
+	// Kept sorted by login, an entry sent twice exactly once.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{
+		"name": "billing", "developers": []string{"alice@example.org", "bob@example.org"},
+		"github_logins": []any{pair("bob_work", "bob@example.org"), pair(strings.Repeat("a", 39), "alice@example.org"), pair("bob_work", "bob@example.org"), pair("0bob", "bob@example.org")},
+	})
+	expect(t, "create", st, http.StatusCreated, body)
+	logins, _ := body["github_logins"].([]any)
+	if len(logins) != 3 {
+		t.Fatalf("github_logins = %v", body["github_logins"])
+	}
+	if first, _ := logins[0].(map[string]any); first["login"] != "0bob" || first["developer"] != "bob@example.org" {
+		t.Errorf("github_logins = %v, want sorted by login", logins)
+	}
+
+	// A create for the name with other logins is not a retry of the one
+	// that made it; with the same ones, it is.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{
+		"name": "billing", "developers": []string{"alice@example.org", "bob@example.org"},
+		"github_logins": []any{pair("0bob", "bob@example.org")},
+	})
+	expect(t, "a create with other logins", st, http.StatusConflict, body)
+	if body["code"] != "name_taken" {
+		t.Errorf("code = %v", body["code"])
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{
+		"name": "billing", "developers": []string{"alice@example.org", "bob@example.org"},
+		"github_logins": []any{pair("0bob", "bob@example.org"), pair("bob_work", "bob@example.org"), pair(strings.Repeat("a", 39), "alice@example.org")},
+	})
+	expect(t, "the same create again", st, http.StatusOK, body)
+
+	// A change that sends one of the two is checked against the record.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"github_logins": []any{pair("carol", "carol@example.org")}})
+	expect(t, "a login for someone not a developer", st, http.StatusUnprocessableEntity, body)
+	if body["field"] != "/github_logins" {
+		t.Errorf("field = %v", body["field"])
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"developers": []string{"alice@example.org"}})
+	expect(t, "a developer taken out who still has logins", st, http.StatusUnprocessableEntity, body)
+	if body["field"] != "/developers" {
+		t.Errorf("field = %v", body["field"])
+	}
+	// One that sends both is checked at the entry.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{
+		"developers": []string{"alice@example.org"}, "github_logins": []any{pair("alice", "alice@example.org"), pair("bob", "bob@example.org")},
+	})
+	expect(t, "both, one unpaired", st, http.StatusUnprocessableEntity, body)
+	if body["field"] != "/github_logins/1" {
+		t.Errorf("field = %v", body["field"])
+	}
+	// Taking a developer and their logins out in one change is fine.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{
+		"developers": []string{"alice@example.org"}, "github_logins": []any{pair("alice", "alice@example.org")},
+	})
+	expect(t, "a developer and their logins out", st, http.StatusOK, body)
+	if body["lock_version"] != float64(2) {
+		t.Errorf("lock_version = %v", body["lock_version"])
+	}
+
+	// A record left with a login for someone gone, as an older AutoPilot
+	// could leave it, still takes a change that sends neither.
+	s.ChangeAppOutOfBand("billing", func(v *AppView) { v.Developers = nil })
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"repos": []string{"example-org/billing"}})
+	expect(t, "a change that sends neither", st, http.StatusOK, body)
+}
+
+// Reviews started from GitHub only comment: no app may let autopilot-github
+// decide, and no sender in the ledger may take its name.
+func TestGitHubSender_NeverDecides(t *testing.T) {
+	s := New(t)
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{
+		map[string]any{"sender": "autopilot-github", "kinds": []string{"review-pr"}, "can_decide": true},
+	}})
+	expect(t, "can_decide for autopilot-github", st, http.StatusUnprocessableEntity, body)
+	if body["field"] != "/accepts/0/can_decide" {
+		t.Errorf("field = %v", body["field"])
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{
+		map[string]any{"sender": "autopilot-github", "kinds": []string{"review-pr"}},
+	}})
+	expect(t, "autopilot-github for review-pr", st, http.StatusCreated, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/senders", "", map[string]any{
+		"name": "autopilot-github", "request_secret": randomSecret(t), "callback_secret": randomSecret(t)})
+	expect(t, "a sender named autopilot-github", st, http.StatusConflict, body)
+	if body["code"] != "name_reserved" {
+		t.Errorf("code = %v", body["code"])
+	}
+	// Nor the branch prefix of a sender built into AutoPilot.
+	for _, prefix := range []string{"autopilot-github/", "mcp/"} {
+		st, body = call(t, s, http.MethodPost, "/v1/admin/senders", "", map[string]any{
+			"name": "tracker", "branch_prefix": prefix, "request_secret": randomSecret(t), "callback_secret": randomSecret(t)})
+		expect(t, "the branch prefix "+prefix, st, http.StatusConflict, body)
+		if body["code"] != "branch_prefix_taken" || body["field"] != "/branch_prefix" {
+			t.Errorf("%s: code = %v, field = %v", prefix, body["code"], body["field"])
+		}
 	}
 }

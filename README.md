@@ -21,7 +21,7 @@ application keeps its own records next to the rest of its infrastructure.
 | Resource | Manages |
 | --- | --- |
 | `autopilot_sender` | A system that sends AutoPilot tasks: the hosts its callbacks may go to, the kinds of task it may send, the prefix its branches start with, and its two secrets (write-only). |
-| `autopilot_app` | A unit of consent: the repositories it owns, the senders it accepts work from with the kinds it accepts from each, and the people who may start work for it themselves. |
+| `autopilot_app` | A unit of consent: the repositories it owns, the senders it accepts work from with the kinds it accepts from each, and the people who may start work for it themselves, with their GitHub logins. |
 
 AutoPilot takes a sender's task only when the app the task is billed to, and
 the app that owns each repository the task touches, accept that sender for

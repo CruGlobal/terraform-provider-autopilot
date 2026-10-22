@@ -20,6 +20,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 )
 
 var (
@@ -41,6 +42,7 @@ type appModel struct {
 	Repos         types.Set    `tfsdk:"repos"`
 	Accepts       types.Set    `tfsdk:"accepts"`
 	Developers    types.Set    `tfsdk:"developers"`
+	GitHubLogins  types.Set    `tfsdk:"github_logins"`
 	Credential    types.String `tfsdk:"credential"`
 	WhenSeatsFull types.String `tfsdk:"when_seats_full"`
 	WorkerImage   types.String `tfsdk:"worker_image"`
@@ -65,12 +67,25 @@ var acceptAttrTypes = map[string]attr.Type{
 
 var acceptObjectType = types.ObjectType{AttrTypes: acceptAttrTypes}
 
+type gitHubLoginModel struct {
+	Login     types.String `tfsdk:"login"`
+	Developer types.String `tfsdk:"developer"`
+}
+
+var gitHubLoginAttrTypes = map[string]attr.Type{
+	"login":     types.StringType,
+	"developer": types.StringType,
+}
+
+var gitHubLoginObjectType = types.ObjectType{AttrTypes: gitHubLoginAttrTypes}
+
 // appAPIFields maps the API's field names to this resource's attributes.
 var appAPIFields = map[string]string{
 	"name":            "name",
 	"repos":           "repos",
 	"accepts":         "accepts",
 	"developers":      "developers",
+	"github_logins":   "github_logins",
 	"credential":      "credential",
 	"when_seats_full": "when_seats_full",
 	"worker_image":    "worker_image",
@@ -89,6 +104,7 @@ func appToModel(a *client.App, prior appModel) appModel {
 		Repos:         setOrNull(a.Repos, prior.Repos),
 		Accepts:       acceptsToSet(a.Accepts, prior.Accepts),
 		Developers:    setOrNull(a.Developers, prior.Developers),
+		GitHubLogins:  gitHubLoginsToSet(a.GitHubLogins, prior.GitHubLogins),
 		Credential:    types.StringPointerValue(a.Credential),
 		WhenSeatsFull: types.StringPointerValue(a.WhenSeatsFull),
 		WorkerImage:   types.StringPointerValue(a.WorkerImage),
@@ -188,6 +204,48 @@ func autoMergeSetFalse(prior types.Set) map[string]bool {
 	return out
 }
 
+// gitHubLoginsToSet maps the GitHub logins AutoPilot answered with to
+// state. Left out of the configuration is null, while AutoPilot answers []
+// (or nothing, when it predates the field), so an empty answer stays null
+// where prior was null.
+func gitHubLoginsToSet(logins []client.GitHubLogin, prior types.Set) types.Set {
+	if len(logins) == 0 && prior.IsNull() {
+		return types.SetNull(gitHubLoginObjectType)
+	}
+	elems := make([]attr.Value, 0, len(logins))
+	for _, l := range logins {
+		elems = append(elems, types.ObjectValueMust(gitHubLoginAttrTypes, map[string]attr.Value{
+			"login":     types.StringValue(l.Login),
+			"developer": types.StringValue(l.Developer),
+		}))
+	}
+	return types.SetValueMust(gitHubLoginObjectType, elems)
+}
+
+// gitHubLoginsFromSet returns a known set's entries. A null set gives nil
+// (not sent); a known empty set gives an empty, non-nil slice, which the
+// client sends as []. An unknown set is an error, never read as empty.
+func gitHubLoginsFromSet(ctx context.Context, set types.Set, diags *diag.Diagnostics) []client.GitHubLogin {
+	if set.IsUnknown() {
+		unknownAtApply(diags, "github_logins")
+		return nil
+	}
+	if set.IsNull() {
+		return nil
+	}
+	var models []gitHubLoginModel
+	diags.Append(set.ElementsAs(ctx, &models, false)...)
+	out := make([]client.GitHubLogin, 0, len(models))
+	for _, m := range models {
+		if !known(m.Login) || !known(m.Developer) {
+			unknownAtApply(diags, "github_logins")
+			return nil
+		}
+		out = append(out, client.GitHubLogin{Login: m.Login.ValueString(), Developer: m.Developer.ValueString()})
+	}
+	return out
+}
+
 // acceptsFromSet returns a known set's entries. A null set gives nil (not
 // sent); a known empty set gives an empty, non-nil slice, which the client
 // sends as []. An unknown set is an error, never read as empty: an empty
@@ -226,7 +284,7 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "An app: a unit of consent. It owns repositories, names the senders it accepts work " +
 			"from with the kinds of task it accepts from each, and names the people who may start work for it " +
-			"themselves.\n\n" +
+			"themselves, with their GitHub logins.\n\n" +
 			"AutoPilot takes a sender's task only when the app the task is billed to, and the app that owns each " +
 			"repository the task touches, accept that sender for that kind. An app may accept a sender that " +
 			"doesn't exist yet, so the app and the sender can be applied in either order.\n\n" +
@@ -295,7 +353,7 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 						"can_decide": schema.BoolAttribute{
 							MarkdownDescription: "Whether that sender's `review-pr` tasks may approve or request changes on " +
 								"this app's repositories, which can count as a required review. Only with `review-pr` in " +
-								"`kinds`. Defaults to `false`.",
+								"`kinds`, and never for `autopilot-github`, whose reviews only comment. Defaults to `false`.",
 							Optional: true,
 							Computed: true,
 							Default:  booldefault.StaticBool(false),
@@ -321,13 +379,46 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			},
 			"developers": schema.SetAttribute{
 				MarkdownDescription: "The people who may start work for this app themselves, through AutoPilot's MCP " +
-					"server: their sign-in logins, which are email addresses, written in lowercase ASCII (AutoPilot refuses " +
-					"anything else). At most 100.",
+					"server, or from GitHub with a login in `github_logins`: their sign-in logins, which are email " +
+					"addresses, written in lowercase ASCII (AutoPilot refuses anything else). At most 100.",
 				ElementType: types.StringType,
 				Optional:    true,
 				Validators: []validator.Set{
 					setvalidator.SizeAtMost(100),
-					setvalidator.ValueStringsAre(stringvalidator.RegexMatches(loginPattern, "must be an email address in lowercase ASCII")),
+					setvalidator.ValueStringsAre(emailValidator{}),
+				},
+			},
+			"github_logins": schema.SetNestedAttribute{
+				MarkdownDescription: "The GitHub logins of this app's developers, for pull request reviews started from " +
+					"GitHub: each pairs a GitHub login with one of `developers`, and a review started from GitHub by that " +
+					"login runs in that developer's name. This decides who can start reviews in a developer's name, so " +
+					"review each pair as you would `developers`. Every `developer` here must also be in `developers`, so " +
+					"take someone's logins out in the same change that takes them out of `developers`. A developer may " +
+					"have more than one login, and each login belongs to one developer. At most 100. Keep it up to date " +
+					"when someone renames their GitHub account: the old login no longer matches them, and someone else " +
+					"may take it. Reviews from GitHub also need the app to accept the `autopilot-github` sender for " +
+					"`review-pr`.",
+				Optional: true,
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: map[string]schema.Attribute{
+						"login": schema.StringAttribute{
+							MarkdownDescription: "A GitHub login, written in lowercase (AutoPilot refuses uppercase): a " +
+								"letter or digit, then letters, digits, `-` and `_`, at most 39 characters.",
+							Required: true,
+							Validators: []validator.String{stringvalidator.RegexMatches(gitHubLoginPattern,
+								"must be a GitHub login in lowercase: a letter or digit, then letters, digits, - and _, at most 39 characters")},
+						},
+						"developer": schema.StringAttribute{
+							MarkdownDescription: "The developer that login belongs to: their sign-in login, an email " +
+								"address in lowercase ASCII, as it is written in `developers`.",
+							Required:   true,
+							Validators: []validator.String{emailValidator{}},
+						},
+					},
+				},
+				Validators: []validator.Set{
+					setvalidator.SizeAtMost(100),
+					gitHubLoginsValidator{},
 				},
 			},
 			"credential": schema.StringAttribute{
@@ -381,11 +472,52 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 }
 
 // ValidateConfig checks the rules that span two arguments: the credential
-// policy's, and the worker size's. A value not known yet waits: Terraform
-// validates again at apply.
+// policy's, the worker size's, and that each GitHub login's developer is one
+// of the developers. A value not known yet waits: Terraform validates again
+// at apply.
 func (r *appResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	validatePolicy(ctx, req, resp)
 	validateSize(ctx, req, resp)
+	validateGitHubLogins(ctx, req, resp)
+}
+
+// validateGitHubLogins checks that every developer github_logins names is in
+// developers, as AutoPilot does on each write that sends either. It waits
+// while developers, or a developer it would check, is not known yet.
+func validateGitHubLogins(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var developers, logins types.Set
+	var diags diag.Diagnostics
+	diags.Append(req.Config.GetAttribute(ctx, path.Root("developers"), &developers)...)
+	diags.Append(req.Config.GetAttribute(ctx, path.Root("github_logins"), &logins)...)
+	resp.Diagnostics.Append(diags...)
+	if diags.HasError() || developers.IsUnknown() || logins.IsNull() || logins.IsUnknown() {
+		return
+	}
+	listed := map[string]bool{}
+	for _, elem := range developers.Elements() {
+		s, ok := elem.(types.String)
+		if !ok || s.IsUnknown() {
+			return
+		}
+		listed[s.ValueString()] = true
+	}
+	for _, elem := range logins.Elements() {
+		obj, ok := elem.(types.Object)
+		if !ok || obj.IsNull() || obj.IsUnknown() {
+			continue
+		}
+		var m gitHubLoginModel
+		if d := obj.As(ctx, &m, basetypes.ObjectAsOptions{}); d.HasError() || !known(m.Developer) {
+			continue
+		}
+		if developer := m.Developer.ValueString(); !listed[developer] {
+			resp.Diagnostics.AddAttributeError(path.Root("github_logins"), "GitHub login for someone not in developers",
+				fmt.Sprintf("The GitHub login %q is paired with %q, who isn't in developers. Each login's developer "+
+					"must be one of the app's developers: add %q to developers, or take the login out. To take "+
+					"someone out of developers, take their GitHub logins out in the same change.",
+					m.Login.ValueString(), developer, developer))
+		}
+	}
 }
 
 // validateSize checks the worker size: worker_cpu and worker_memory both or
@@ -450,9 +582,10 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 	// Only what is set is sent; the rest takes AutoPilot's defaults (empty,
 	// no credential policy of its own, the node worker at its own size).
 	spec := client.AppSpec{
-		Repos:      stringsFromSet(ctx, plan.Repos, "repos", &resp.Diagnostics),
-		Accepts:    acceptsFromSet(ctx, plan.Accepts, &resp.Diagnostics),
-		Developers: stringsFromSet(ctx, plan.Developers, "developers", &resp.Diagnostics),
+		Repos:        stringsFromSet(ctx, plan.Repos, "repos", &resp.Diagnostics),
+		Accepts:      acceptsFromSet(ctx, plan.Accepts, &resp.Diagnostics),
+		Developers:   stringsFromSet(ctx, plan.Developers, "developers", &resp.Diagnostics),
+		GitHubLogins: gitHubLoginsFromSet(ctx, plan.GitHubLogins, &resp.Diagnostics),
 	}
 	if !plan.Credential.IsNull() {
 		spec.Policy = policyFromModel(plan, &resp.Diagnostics)
@@ -549,6 +682,15 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 	if !plan.Developers.Equal(state.Developers) {
 		spec.Developers = orEmptyStrings(stringsFromSet(ctx, plan.Developers, "developers", &resp.Diagnostics))
 	}
+	// Sent with developers or apart: AutoPilot checks the pairs against what
+	// the change leaves, so taking a developer and their logins out in one
+	// change sends both in one write.
+	if !plan.GitHubLogins.Equal(state.GitHubLogins) {
+		spec.GitHubLogins = gitHubLoginsFromSet(ctx, plan.GitHubLogins, &resp.Diagnostics)
+		if spec.GitHubLogins == nil {
+			spec.GitHubLogins = []client.GitHubLogin{}
+		}
+	}
 	// The two are one policy, so a change to either sends both.
 	if !plan.Credential.Equal(state.Credential) || !plan.WhenSeatsFull.Equal(state.WhenSeatsFull) {
 		spec.Policy = policyFromModel(plan, &resp.Diagnostics)
@@ -639,9 +781,10 @@ func (r *appResource) ImportState(ctx context.Context, req resource.ImportStateR
 		return
 	}
 	state := appToModel(a, appModel{
-		Repos:      types.SetNull(types.StringType),
-		Accepts:    types.SetNull(acceptObjectType),
-		Developers: types.SetNull(types.StringType),
+		Repos:        types.SetNull(types.StringType),
+		Accepts:      types.SetNull(acceptObjectType),
+		Developers:   types.SetNull(types.StringType),
+		GitHubLogins: types.SetNull(gitHubLoginObjectType),
 	})
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }

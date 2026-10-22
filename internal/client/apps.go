@@ -7,14 +7,18 @@ import (
 )
 
 // App is a unit of consent: the repositories it owns, the senders it accepts
-// work from (with the kinds it accepts from each), and the people who may
-// start work for it themselves. It also holds the app's credential policy,
-// and the worker its tasks run in.
+// work from (with the kinds it accepts from each), the people who may start
+// work for it themselves, and their GitHub logins. It also holds the app's
+// credential policy, and the worker its tasks run in.
 type App struct {
 	Name       string   `json:"name"`
 	Repos      []string `json:"repos"`
 	Accepts    []Accept `json:"accepts"`
 	Developers []string `json:"developers"`
+	// GitHubLogins pairs GitHub logins with the developers they belong to,
+	// for reviews started from GitHub. Nil when the AutoPilot predates the
+	// field.
+	GitHubLogins []GitHubLogin `json:"github_logins"`
 	// Credential is "bedrock" or "seat_first", or nil when the app has no
 	// credential policy of its own (or the AutoPilot predates the field).
 	Credential *string `json:"credential"`
@@ -60,6 +64,16 @@ type Accept struct {
 	CanAutoMerge bool `json:"can_auto_merge"`
 }
 
+// GitHubLogin is one developer's GitHub login. A review started from GitHub
+// by that login runs in the developer's name.
+type GitHubLogin struct {
+	// Login is a GitHub login, in lowercase.
+	Login string `json:"login"`
+	// Developer is one of the app's developers: their sign-in login, an
+	// email address in lowercase.
+	Developer string `json:"developer"`
+}
+
 // CredentialPolicy is an app's credential policy. AutoPilot takes it as one:
 // a write that sends credential sets when_seats_full too, so a
 // when_seats_full left out is null.
@@ -86,10 +100,11 @@ type WorkerSize struct {
 // an empty, non-nil list is sent as []. A nil Policy, WorkerImage or Size is
 // not sent either.
 type AppSpec struct {
-	Repos      []string
-	Accepts    []Accept
-	Developers []string
-	Policy     *CredentialPolicy
+	Repos        []string
+	Accepts      []Accept
+	Developers   []string
+	GitHubLogins []GitHubLogin
+	Policy       *CredentialPolicy
 	// WorkerImage is "node", "ruby", "python" or "go", or "" to take the
 	// app back to node (sent as null).
 	WorkerImage *string
@@ -106,6 +121,9 @@ func (s AppSpec) fields() Fields {
 	}
 	if s.Developers != nil {
 		f["developers"] = sortedUnique(s.Developers)
+	}
+	if s.GitHubLogins != nil {
+		f["github_logins"] = normalizeGitHubLogins(s.GitHubLogins)
 	}
 	if s.Policy != nil {
 		if s.Policy.Credential == "" {
@@ -171,12 +189,31 @@ func normalizeAccepts(accepts []Accept) []Accept {
 	return out
 }
 
+// normalizeGitHubLogins is GitHub logins as the API keeps them: sorted by
+// login, an entry listed twice exactly kept once. nil stays nil (not sent);
+// an empty list stays an empty, non-nil list (sent as []). Two entries for
+// one login with different developers are both kept, for AutoPilot to
+// refuse; the plan refuses them first.
+func normalizeGitHubLogins(logins []GitHubLogin) []GitHubLogin {
+	if logins == nil {
+		return nil
+	}
+	out := slices.Clone(logins)
+	slices.SortFunc(out, func(x, y GitHubLogin) int {
+		return cmp.Or(cmp.Compare(x.Login, y.Login), cmp.Compare(x.Developer, y.Developer))
+	})
+	return slices.Compact(out)
+}
+
 // reflectedIn reports whether an app holds everything the spec sends.
 func (s AppSpec) reflectedIn(app *App) bool {
 	if s.Repos != nil && !slices.Equal(sortedUnique(s.Repos), sortedUnique(app.Repos)) {
 		return false
 	}
 	if s.Developers != nil && !slices.Equal(sortedUnique(s.Developers), sortedUnique(app.Developers)) {
+		return false
+	}
+	if s.GitHubLogins != nil && !slices.Equal(normalizeGitHubLogins(s.GitHubLogins), normalizeGitHubLogins(app.GitHubLogins)) {
 		return false
 	}
 	if s.Accepts != nil && !slices.EqualFunc(normalizeAccepts(s.Accepts), normalizeAccepts(app.Accepts),

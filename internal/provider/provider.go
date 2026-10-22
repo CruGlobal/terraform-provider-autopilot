@@ -68,7 +68,8 @@ func (p *autopilotProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 			"- A **sender** (`autopilot_sender`) is a system that sends tasks: the hosts its callbacks may go to, " +
 			"the kinds of task it may send, the prefix its branches start with, and its two secrets.\n" +
 			"- An **app** (`autopilot_app`) is a unit of consent: the repositories it owns, the senders it accepts " +
-			"work from and the kinds it accepts from each, and the people who may start work for it themselves.\n\n" +
+			"work from and the kinds it accepts from each, and the people who may start work for it themselves, " +
+			"with their GitHub logins.\n\n" +
 			"## Authentication\n\n" +
 			"The provider authenticates with an AutoPilot **admin token**, sent as a bearer token. AutoPilot keeps " +
 			"only the token's SHA-256, so it cannot show you the token; whoever set it up holds it. To keep it out " +

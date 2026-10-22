@@ -89,7 +89,7 @@ func New(t testing.TB) *Server {
 		token:    DefaultToken,
 		senders:  map[string]*senderRecord{},
 		apps:     map[string]*appRecord{},
-		reserved: map[string]bool{"autopilot": true, "autopilot-mcp": true},
+		reserved: map[string]bool{"autopilot": true, "autopilot-mcp": true, "autopilot-github": true},
 	}
 	mux := http.NewServeMux()
 	s.senderRoutes(mux)

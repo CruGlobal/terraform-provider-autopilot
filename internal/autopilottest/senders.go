@@ -16,6 +16,10 @@ import (
 // and grows; these are enough to exercise the rules.
 var KnownKinds = []string{"fix-error", "implement-work-item", "research", "review-pr"}
 
+// builtInPrefixes are the branch prefixes of the senders built into
+// AutoPilot, the MCP's and GitHub's, which no sender in the ledger may take.
+var builtInPrefixes = []string{"mcp/", "autopilot-github/"}
+
 // DefaultKinds is what a sender may send when its create names no kinds.
 var DefaultKinds = []string{"implement-work-item"}
 
@@ -555,7 +559,8 @@ func (s *Server) createSender(r *http.Request) (int, map[string]any, *refusal) {
 		}
 		return http.StatusOK, existing.json(now), nil
 	}
-	if s.prefixTaken(prefix, name) {
+	// The built-in senders' prefixes are taken too.
+	if s.prefixTaken(prefix, name) || slices.Contains(builtInPrefixes, prefix) {
 		return 0, nil, prefixTaken
 	}
 	rec := &senderRecord{

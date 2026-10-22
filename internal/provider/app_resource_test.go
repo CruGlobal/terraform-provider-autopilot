@@ -206,6 +206,7 @@ func TestApp_onlyName(t *testing.T) {
 					resource.TestCheckNoResourceAttr(appRes, "repos.#"),
 					resource.TestCheckNoResourceAttr(appRes, "accepts.#"),
 					resource.TestCheckNoResourceAttr(appRes, "developers.#"),
+					resource.TestCheckNoResourceAttr(appRes, "github_logins.#"),
 					func(*terraform.State) error {
 						if env.live() {
 							return nil
@@ -233,24 +234,26 @@ func TestApp_onlyName(t *testing.T) {
 func TestApp_removingArgumentsEmptiesThem(t *testing.T) {
 	env := newTestEnv(t)
 	env.requireFake(t)
-	name := randName()
+	name, dev := randName(), randLogin()
 	repos, _ := env.liveRepos(2)
 	runTest(t, resource.TestCase{
 		Steps: []resource.TestStep{
 			{
 				Config: appConfig(env, name, fmt.Sprintf(`
-  repos      = %s
-  accepts    = [{ sender = %q, kinds = ["research"] }]
-  developers = [%q]`, hcl(repos...), randName(), randLogin())),
+  repos         = %s
+  accepts       = [{ sender = %q, kinds = ["research"] }]
+  developers    = [%q]
+  github_logins = [{ login = "someone-gh", developer = %q }]`, hcl(repos...), randName(), dev, dev)),
 			},
 			{
 				Config: appConfig(env, name, ""),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckNoResourceAttr(appRes, "repos.#"),
 					resource.TestCheckNoResourceAttr(appRes, "accepts.#"),
+					resource.TestCheckNoResourceAttr(appRes, "github_logins.#"),
 					func(*terraform.State) error {
 						v, _ := env.fake.App(name)
-						if len(v.Repos)+len(v.Accepts)+len(v.Developers) != 0 {
+						if len(v.Repos)+len(v.Accepts)+len(v.Developers)+len(v.GitHubLogins) != 0 {
 							return fmt.Errorf("AutoPilot still holds %+v", v)
 						}
 						return nil
@@ -480,14 +483,15 @@ func TestApp_repoTaken(t *testing.T) {
 
 func TestApp_import(t *testing.T) {
 	env := newTestEnv(t)
-	name := randName()
+	name, dev := randName(), randLogin()
 	runTest(t, resource.TestCase{
 		CheckDestroy: checkAppsGone(t, env),
 		Steps: []resource.TestStep{
 			{
 				Config: appConfig(env, name, fmt.Sprintf(`
-  accepts    = [{ sender = %q, kinds = ["review-pr"], can_decide = true }]
-  developers = [%q]`, randName(), randLogin())),
+  accepts       = [{ sender = %q, kinds = ["review-pr"], can_decide = true }]
+  developers    = [%q]
+  github_logins = [{ login = %q, developer = %q }]`, randName(), dev, randGitHubLogin(), dev)),
 			},
 			{
 				ResourceName:                         appRes,
@@ -657,6 +661,9 @@ func TestApp_planTimeValidation(t *testing.T) {
 		{`  developers = ["Someone@example.com"]`, "must be an email address in lowercase ASCII"},
 		{`  developers = ["someoné@example.com"]`, "must be an email address in lowercase ASCII"},
 		{`  developers = ["someone"]`, "must be an email address"},
+		{`  developers = ["someone@example.com."]`, "must be an email address in lowercase ASCII"},
+		{`  developers = ["someone@example..com"]`, "must be an email address in lowercase ASCII"},
+		{`  developers = ["some!one@example.com"]`, "must be an email address in lowercase ASCII"},
 	}
 	steps := make([]resource.TestStep, 0, len(cases)+1)
 	for _, c := range cases {
@@ -990,9 +997,10 @@ func TestApp_importThenEmptyLists(t *testing.T) {
 	name := randName()
 	env.fake.SeedApp(autopilottest.AppView{Name: name})
 	config := appConfig(env, name, `
-  repos      = []
-  accepts    = []
-  developers = []`)
+  repos         = []
+  accepts       = []
+  developers    = []
+  github_logins = []`)
 	runTest(t, resource.TestCase{
 		Steps: []resource.TestStep{
 			{
@@ -1011,6 +1019,7 @@ func TestApp_importThenEmptyLists(t *testing.T) {
 					resource.TestCheckResourceAttr(appRes, "repos.#", "0"),
 					resource.TestCheckResourceAttr(appRes, "accepts.#", "0"),
 					resource.TestCheckResourceAttr(appRes, "developers.#", "0"),
+					resource.TestCheckResourceAttr(appRes, "github_logins.#", "0"),
 					// Sending [] for what is already empty changes nothing.
 					resource.TestCheckResourceAttr(appRes, "lock_version", "1"),
 				),
@@ -1657,5 +1666,443 @@ func TestUnknownWorkerIsAnError(t *testing.T) {
 	}
 	if got := sizeFromModel(m, &diags); got == nil || *got != (client.WorkerSize{}) || diags.HasError() {
 		t.Errorf("no size gave %v, %v; it takes the app's size away", got, diags)
+	}
+}
+
+// randGitHubLogin is a GitHub login with a random suffix, so live runs never
+// collide.
+func randGitHubLogin() string {
+	return "tfacc-" + acctest.RandStringFromCharSet(10, "abcdefghijklmnopqrstuvwxyz0123456789")
+}
+
+// gitHubLoginsHCL renders pairs (login, developer, login, developer, ...) as
+// a github_logins argument.
+func gitHubLoginsHCL(pairs ...string) string {
+	entries := make([]string, 0, len(pairs)/2)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		entries = append(entries, fmt.Sprintf("    { login = %q, developer = %q },", pairs[i], pairs[i+1]))
+	}
+	return "  github_logins = [\n" + strings.Join(entries, "\n") + "\n  ]"
+}
+
+// An app's GitHub logins are set, changed with its developers in one write,
+// and taken away.
+func TestApp_gitHubLogins(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	devA, devB := randLogin(), randLogin()
+	loginA, loginB, loginC := randGitHubLogin(), randGitHubLogin(), randGitHubLogin()
+	accepts := `  accepts = [{ sender = "autopilot-github", kinds = ["review-pr"] }]`
+	first := accepts + "\n  developers = " + hcl(devA, devB) + "\n" + gitHubLoginsHCL(loginA, devA, loginB, devB)
+	// devB leaves, with their login, and devA gains a second login.
+	second := accepts + "\n  developers = " + hcl(devA) + "\n" + gitHubLoginsHCL(loginA, devA, loginC, devA)
+	third := accepts + "\n  developers = " + hcl(devA)
+	sortedPairs := func(pairs ...string) []any {
+		type pair struct{ login, developer string }
+		var ps []pair
+		for i := 0; i+1 < len(pairs); i += 2 {
+			ps = append(ps, pair{pairs[i], pairs[i+1]})
+		}
+		slices.SortFunc(ps, func(x, y pair) int { return strings.Compare(x.login, y.login) })
+		out := []any{}
+		for _, p := range ps {
+			out = append(out, map[string]any{"login": p.login, "developer": p.developer})
+		}
+		return out
+	}
+
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, first),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "github_logins.#", "2"),
+					resource.TestCheckTypeSetElemNestedAttrs(appRes, "github_logins.*", map[string]string{"login": loginA, "developer": devA}),
+					resource.TestCheckTypeSetElemNestedAttrs(appRes, "github_logins.*", map[string]string{"login": loginB, "developer": devB}),
+					func(*terraform.State) error {
+						if env.live() {
+							return nil
+						}
+						post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0]
+						if got := requestBody(t, post)["github_logins"]; !reflect.DeepEqual(got, sortedPairs(loginA, devA, loginB, devB)) {
+							return fmt.Errorf("the create sent github_logins %v", got)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: appConfig(env, name, first),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: appConfig(env, name, second),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "github_logins.#", "2"),
+					resource.TestCheckTypeSetElemNestedAttrs(appRes, "github_logins.*", map[string]string{"login": loginC, "developer": devA}),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					lastAppPatch(t, env, name, map[string]any{
+						"developers":    []any{devA},
+						"github_logins": sortedPairs(loginA, devA, loginC, devA),
+					}),
+				),
+			},
+			{
+				Config: appConfig(env, name, second),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Removing github_logins empties it, and leaves the developers.
+				Config: appConfig(env, name, third),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "github_logins.#"),
+					resource.TestCheckResourceAttr(appRes, "developers.#", "1"),
+					lastAppPatch(t, env, name, map[string]any{"github_logins": []any{}}),
+				),
+			},
+			{
+				Config: appConfig(env, name, third),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A change to another argument leaves github_logins out, so the app keeps
+// them; and an app that never sets them never sends them.
+func TestApp_gitHubLoginsNotSentWhenUnchanged(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	logins := `
+  developers = ["alice@example.org"]
+` + gitHubLoginsHCL("alice-gh", "alice@example.org")
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, name, logins)},
+			{
+				Config: appConfig(env, name, logins+`
+  worker_image = "go"`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, name, map[string]any{"worker_image": "go"}),
+					func(*terraform.State) error {
+						want := []autopilottest.GitHubLogin{{Login: "alice-gh", Developer: "alice@example.org"}}
+						if v, _ := env.fake.App(name); !slices.Equal(v.GitHubLogins, want) {
+							return fmt.Errorf("AutoPilot holds %v", v.GitHubLogins)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// GitHub logins changed outside Terraform show as a change, and the apply
+// puts the configured ones back; ones set outside Terraform on an app that
+// configures none are taken away.
+func TestApp_gitHubLoginsChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name, other := randName(), randName()
+	config := `
+  developers = ["alice@example.org", "bob@example.org"]
+` + gitHubLoginsHCL("alice-gh", "alice@example.org")
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, name, config)},
+			{
+				PreConfig: func() {
+					env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) {
+						// The login now starts reviews in someone else's name.
+						v.GitHubLogins = []autopilottest.GitHubLogin{{Login: "alice-gh", Developer: "bob@example.org"}}
+					})
+				},
+				Config: appConfig(env, name, config),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, name, map[string]any{"github_logins": []any{
+						map[string]any{"login": "alice-gh", "developer": "alice@example.org"},
+					}}),
+					func(*terraform.State) error {
+						want := []autopilottest.GitHubLogin{{Login: "alice-gh", Developer: "alice@example.org"}}
+						if v, _ := env.fake.App(name); !slices.Equal(v.GitHubLogins, want) {
+							return fmt.Errorf("AutoPilot holds %v", v.GitHubLogins)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, other, `  developers = ["alice@example.org"]`)},
+			{
+				PreConfig: func() {
+					env.fake.ChangeAppOutOfBand(other, func(v *autopilottest.AppView) {
+						v.GitHubLogins = []autopilottest.GitHubLogin{{Login: "someone-else", Developer: "alice@example.org"}}
+					})
+				},
+				Config: appConfig(env, other, `  developers = ["alice@example.org"]`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "github_logins.#"),
+					lastAppPatch(t, env, other, map[string]any{"github_logins": []any{}}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(other); len(v.GitHubLogins) != 0 {
+							return fmt.Errorf("AutoPilot still holds %v", v.GitHubLogins)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// An imported app's GitHub logins are read into state, so a configuration
+// that sets the same plans nothing.
+func TestApp_importWithGitHubLogins(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{
+		Name:       name,
+		Developers: []string{"alice@example.org"},
+		GitHubLogins: []autopilottest.GitHubLogin{
+			{Login: "alice-gh", Developer: "alice@example.org"},
+			{Login: "alice_work", Developer: "alice@example.org"},
+		},
+	})
+	config := appConfig(env, name, `
+  developers = ["alice@example.org"]
+`+gitHubLoginsHCL("alice_work", "alice@example.org", "alice-gh", "alice@example.org"))
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             config,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// The rules for GitHub logins fail the plan.
+func TestApp_gitHubLoginsPlanTimeValidation(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	devs := `  developers = ["alice@example.org", "bob@example.org"]
+`
+	cases := []struct {
+		body string
+		want string
+	}{
+		{devs + gitHubLoginsHCL("Alice-GH", "alice@example.org"), "must be a GitHub login in lowercase"},
+		{devs + gitHubLoginsHCL("-alice", "alice@example.org"), "must be a GitHub login in lowercase"},
+		{devs + gitHubLoginsHCL("_alice", "alice@example.org"), "must be a GitHub login in lowercase"},
+		{devs + gitHubLoginsHCL("alice.gh", "alice@example.org"), "must be a GitHub login in lowercase"},
+		{devs + gitHubLoginsHCL("alice@example.org", "alice@example.org"), "must be a GitHub login in lowercase"},
+		{devs + gitHubLoginsHCL(strings.Repeat("a", 40), "alice@example.org"), "must be a GitHub login in lowercase"},
+		{devs + gitHubLoginsHCL("", "alice@example.org"), "must be a GitHub login in lowercase"},
+		{devs + gitHubLoginsHCL("alice-gh", "Alice@example.org"), "must be an email address in lowercase ASCII"},
+		{devs + gitHubLoginsHCL("alice-gh", "alice"), "must be an email address in lowercase ASCII"},
+		{devs + gitHubLoginsHCL("alice-gh", "alice@example.org", "alice-gh", "bob@example.org"), "GitHub login listed twice"},
+		{devs + gitHubLoginsHCL("carol-gh", "carol@example.org"), "GitHub login for someone not in developers"},
+		{gitHubLoginsHCL("alice-gh", "alice@example.org"), "GitHub login for someone not in developers"},
+		{`  developers = []
+` + gitHubLoginsHCL("alice-gh", "alice@example.org"), "GitHub login for someone not in developers"},
+		{`  accepts = [{ sender = "autopilot-github", kinds = ["review-pr"], can_decide = true }]`, "can_decide for autopilot-github"},
+	}
+	steps := make([]resource.TestStep, 0, len(cases)+2)
+	for _, c := range cases {
+		steps = append(steps, resource.TestStep{Config: appConfig(env, name, c.body), PlanOnly: true, ExpectError: expectErr(c.want)})
+	}
+	many := make([]string, 0, 202)
+	for i := range 101 {
+		many = append(many, fmt.Sprintf("login-%d", i), "alice@example.org")
+	}
+	steps = append(steps, resource.TestStep{Config: appConfig(env, name, devs+gitHubLoginsHCL(many...)), PlanOnly: true,
+		ExpectError: expectErr("must contain at most 100 elements")})
+	// What AutoPilot takes, the plan takes: a 39-character login, one that
+	// starts with a digit, _ inside one, and a developer with two logins.
+	// The plan is for a new app, so it is not empty.
+	steps = append(steps, resource.TestStep{
+		Config: appConfig(env, name, devs+`  accepts = [{ sender = "autopilot-github", kinds = ["review-pr"], can_decide = false }]
+`+gitHubLoginsHCL(strings.Repeat("a", 39), "alice@example.org", "0alice_work", "alice@example.org", "bob", "bob@example.org")),
+		PlanOnly:           true,
+		ExpectNonEmptyPlan: true,
+	})
+	runTest(t, resource.TestCase{Steps: steps})
+}
+
+// A developer not known at plan time waits: the plan passes, and the apply
+// checks the pair once the developer is known.
+func TestApp_gitHubLoginsWithADeveloperNotKnownYet(t *testing.T) {
+	env := newTestEnv(t)
+	name, login := randName(), randGitHubLogin()
+	dev, other := randLogin(), randLogin()
+	config := func(developer, paired string) string {
+		return env.providerConfig() + fmt.Sprintf(`
+resource "terraform_data" "dev" {
+  input = %q
+}
+
+resource "autopilot_app" "test" {
+  name          = %q
+  developers    = [terraform_data.dev.output]
+  github_logins = [{ login = %q, developer = %q }]
+}
+`, developer, name, login, paired)
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(dev, dev),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "developers.0", dev),
+					resource.TestCheckResourceAttr(appRes, "github_logins.0.developer", dev),
+				),
+			},
+			{
+				// The new developer is unknown until terraform_data is
+				// replaced, so the plan passes and the apply refuses.
+				Config:      config(other, dev),
+				ExpectError: expectErr("GitHub login for someone not in developers"),
+			},
+		},
+	})
+}
+
+// The GitHub login rule is AutoPilot's, character for character.
+func TestGitHubLoginPattern(t *testing.T) {
+	for login, want := range map[string]bool{
+		"a":                     true,
+		"0":                     true,
+		"octocat":               true,
+		"octo-cat":              true,
+		"octo_cat":              true,
+		"octocat-":              true,
+		"0octocat":              true,
+		strings.Repeat("a", 39): true,
+		strings.Repeat("a", 40): false,
+		"":                      false,
+		"Octocat":               false,
+		"OCTOCAT":               false,
+		"-octocat":              false,
+		"_octocat":              false,
+		"octo.cat":              false,
+		"octo cat":              false,
+		"octocat[bot]":          false,
+		"octocät":               false,
+		"octocat\n":             false,
+	} {
+		if got := gitHubLoginPattern.MatchString(login); got != want {
+			t.Errorf("%q: matches = %v, want %v", login, got, want)
+		}
+	}
+}
+
+// The developer rule is AutoPilot's, step for step: what it takes, the plan
+// takes, and what it refuses, the plan refuses.
+func TestValidEmail(t *testing.T) {
+	for email, want := range map[string]bool{
+		"someone@example.com":                    true,
+		"some.one+ap@example.com":                true,
+		"some_one%x-y@mail.example.co":           true,
+		"0@a.b":                                  true,
+		strings.Repeat("a", 64) + "@example.com": true,
+		strings.Repeat("a", 65) + "@example.com": false,
+		"a@" + strings.Repeat("b", 248) + ".com": true,
+		"a@" + strings.Repeat("b", 249) + ".com": false,
+		"":                                       false,
+		"someone":                                false,
+		"@example.com":                           false,
+		"someone@":                               false,
+		"someone@example":                        false,
+		"someone@.example.com":                   false,
+		"someone@example.com.":                   false,
+		"someone@example..com":                   false,
+		"someone@example.com@example.com":        false,
+		"Someone@example.com":                    false,
+		"someone@Example.com":                    false,
+		"someoné@example.com":                    false,
+		"some one@example.com":                   false,
+		"some!one@example.com":                   false,
+		"some,one@example.com":                   false,
+		"{someone}@example.com":                  false,
+		"some..one@example.com":                  true,
+		".someone@example.com":                   true,
+	} {
+		if got := validEmail(email); got != want {
+			t.Errorf("%q: valid = %v, want %v", email, got, want)
+		}
+	}
+}
+
+// GitHub logins AutoPilot answered with map to state as the other lists do:
+// none stays null where the configuration left them out.
+func TestGitHubLoginsToSet(t *testing.T) {
+	null := types.SetNull(gitHubLoginObjectType)
+	empty := types.SetValueMust(gitHubLoginObjectType, nil)
+	if got := gitHubLoginsToSet(nil, null); !got.IsNull() {
+		t.Errorf("none, left out: %v, want null", got)
+	}
+	if got := gitHubLoginsToSet([]client.GitHubLogin{}, null); !got.IsNull() {
+		t.Errorf("[], left out: %v, want null", got)
+	}
+	if got := gitHubLoginsToSet(nil, empty); got.IsNull() || len(got.Elements()) != 0 {
+		t.Errorf("none, configured []: %v, want []", got)
+	}
+	got := gitHubLoginsToSet([]client.GitHubLogin{{Login: "alice-gh", Developer: "alice@example.org"}}, null)
+	if got.IsNull() || len(got.Elements()) != 1 {
+		t.Errorf("one, left out: %v, want it in state", got)
+	}
+}
+
+// GitHub logins that are somehow still unknown at apply are an error, never
+// sent as []: that would take every login away.
+func TestUnknownGitHubLoginsAreAnError(t *testing.T) {
+	ctx := context.Background()
+	var diags diag.Diagnostics
+	if got := gitHubLoginsFromSet(ctx, types.SetUnknown(gitHubLoginObjectType), &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown github_logins gave %v, %v", got, diags)
+	}
+	diags = nil
+	withUnknown := types.SetValueMust(gitHubLoginObjectType, []attr.Value{
+		types.ObjectValueMust(gitHubLoginAttrTypes, map[string]attr.Value{
+			"login": types.StringValue("alice-gh"), "developer": types.StringUnknown(),
+		}),
+	})
+	if got := gitHubLoginsFromSet(ctx, withUnknown, &diags); got != nil || !diags.HasError() {
+		t.Errorf("a developer unknown gave %v, %v", got, diags)
+	}
+	diags = nil
+	if got := gitHubLoginsFromSet(ctx, types.SetNull(gitHubLoginObjectType), &diags); got != nil || diags.HasError() {
+		t.Errorf("null github_logins gave %v, %v; null is simply not sent", got, diags)
 	}
 }

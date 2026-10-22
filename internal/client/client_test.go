@@ -843,3 +843,82 @@ func TestGetApp_WithoutTheWorker(t *testing.T) {
 		t.Errorf("worker_image = %v, worker_cpu = %v, worker_memory = %v", a.WorkerImage, a.WorkerCPU, a.WorkerMemory)
 	}
 }
+
+// GitHub logins are sent only when set, as [] when empty, sorted by login,
+// with an entry listed twice exactly sent once.
+func TestAppSpec_SendsGitHubLogins(t *testing.T) {
+	var bodies []string
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 2})
+	}))
+	ctx := context.Background()
+	for _, spec := range []AppSpec{
+		{},
+		{GitHubLogins: []GitHubLogin{}},
+		{GitHubLogins: []GitHubLogin{
+			{Login: "zed", Developer: "zed@example.org"},
+			{Login: "alice-gh", Developer: "alice@example.org"},
+			{Login: "zed", Developer: "zed@example.org"},
+			{Login: "alice_work", Developer: "alice@example.org"},
+		}},
+	} {
+		if _, err := c.UpdateApp(ctx, "billing", spec, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{
+		`{}`,
+		`{"github_logins":[]}`,
+		`{"github_logins":[{"login":"alice-gh","developer":"alice@example.org"},{"login":"alice_work","developer":"alice@example.org"},{"login":"zed","developer":"zed@example.org"}]}`,
+	}
+	for i := range want {
+		if bodies[i] != want[i] {
+			t.Errorf("body %d = %s\nwant      %s", i, bodies[i], want[i])
+		}
+	}
+	if !(AppSpec{}).Empty() || (AppSpec{GitHubLogins: []GitHubLogin{}}).Empty() {
+		t.Error("a nil list sends nothing, and an empty one sends []")
+	}
+}
+
+// An app read back holds a change's GitHub logins only when the pairs match,
+// in any order.
+func TestAppSpec_GitHubLoginsReflectedIn(t *testing.T) {
+	alice := GitHubLogin{Login: "alice-gh", Developer: "alice@example.org"}
+	bob := GitHubLogin{Login: "bob-gh", Developer: "bob@example.org"}
+	held := &App{GitHubLogins: []GitHubLogin{alice, bob}}
+	cases := []struct {
+		spec AppSpec
+		app  *App
+		want bool
+	}{
+		{AppSpec{GitHubLogins: []GitHubLogin{bob, alice}}, held, true},
+		{AppSpec{GitHubLogins: []GitHubLogin{alice}}, held, false},
+		{AppSpec{GitHubLogins: []GitHubLogin{alice, {Login: "bob-gh", Developer: "alice@example.org"}}}, held, false},
+		{AppSpec{GitHubLogins: []GitHubLogin{}}, held, false},
+		{AppSpec{GitHubLogins: []GitHubLogin{}}, &App{}, true},
+		{AppSpec{}, held, true},
+	}
+	for i, c := range cases {
+		if got := c.spec.reflectedIn(c.app); got != c.want {
+			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// An AutoPilot that predates github_logins answers without it: the app reads
+// as having none.
+func TestGetApp_WithoutGitHubLogins(t *testing.T) {
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 1})
+	}))
+	a, err := c.GetApp(context.Background(), "billing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.GitHubLogins != nil {
+		t.Errorf("github_logins = %v", a.GitHubLogins)
+	}
+}
