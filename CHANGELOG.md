@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.3.0...v0.3.1) (2026-10-22)
+
+
+### Changed
+
+* build with Go 1.26.10 ([#12](https://github.com/CruGlobal/terraform-provider-autopilot/issues/12)) ([7ca5e4f](https://github.com/CruGlobal/terraform-provider-autopilot/commit/7ca5e4fe844ae9870a4873644d53741819303c0c))
+
 ## [0.3.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.2.0...v0.3.0) (2026-10-20)
 
 
