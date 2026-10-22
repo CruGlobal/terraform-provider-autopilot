@@ -112,6 +112,15 @@ the examples, and the generated docs. Things worth knowing:
   provider sends both on a change to either (`AppSpec.Size`), and both as
   null to take the size away. `worker_image` is sent on its own, as null to
   take the app back to `node`.
+- An app's `github_logins` pairs each GitHub login (lowercase, at most 39
+  characters) with one of its `developers`. AutoPilot refuses a write that
+  sends `developers` or `github_logins` and leaves a pair whose developer
+  isn't in `developers`, so the plan checks that (`validateGitHubLogins`),
+  and a change to both goes out in one `PATCH`. It also refuses
+  `can_decide = true` on an `accepts` entry for `autopilot-github`, the
+  sender built in for reviews started from GitHub (`acceptsValidator`).
+  `developers` and each pair's `developer` are checked with AutoPilot's own
+  email rule, step for step (`validEmail`, in the provider and the fake).
 - A sender's secrets are write-only (`*_wo`). The plan compares
   `client.Fingerprint` of the configured secrets with the stored
   fingerprints; see the comment at the top of `sender_resource.go`.

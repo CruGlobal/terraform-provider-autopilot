@@ -3,7 +3,7 @@
 page_title: "autopilot Provider"
 description: |-
   The autopilot provider manages the records that say who may send work to an AutoPilot, and what each app allows, through AutoPilot's admin API. AutoPilot runs AI agents on work that senders such as issue trackers send it, and opens pull requests a person reviews.
-  A sender (autopilot_sender) is a system that sends tasks: the hosts its callbacks may go to, the kinds of task it may send, the prefix its branches start with, and its two secrets.An app (autopilot_app) is a unit of consent: the repositories it owns, the senders it accepts work from and the kinds it accepts from each, and the people who may start work for it themselves.
+  A sender (autopilot_sender) is a system that sends tasks: the hosts its callbacks may go to, the kinds of task it may send, the prefix its branches start with, and its two secrets.An app (autopilot_app) is a unit of consent: the repositories it owns, the senders it accepts work from and the kinds it accepts from each, and the people who may start work for it themselves, with their GitHub logins.
   Authentication
   The provider authenticates with an AutoPilot admin token, sent as a bearer token. AutoPilot keeps only the token's SHA-256, so it cannot show you the token; whoever set it up holds it. To keep it out of configuration, set both AUTOPILOT_ENDPOINT and AUTOPILOT_TOKEN in the environment and leave both out of the provider block.
   The provider takes the endpoint and the token from one place, so that a token meant for one AutoPilot is never sent to another:
@@ -18,7 +18,7 @@ description: |-
 The `autopilot` provider manages the records that say who may send work to an AutoPilot, and what each app allows, through AutoPilot's admin API. AutoPilot runs AI agents on work that senders such as issue trackers send it, and opens pull requests a person reviews.
 
 - A **sender** (`autopilot_sender`) is a system that sends tasks: the hosts its callbacks may go to, the kinds of task it may send, the prefix its branches start with, and its two secrets.
-- An **app** (`autopilot_app`) is a unit of consent: the repositories it owns, the senders it accepts work from and the kinds it accepts from each, and the people who may start work for it themselves.
+- An **app** (`autopilot_app`) is a unit of consent: the repositories it owns, the senders it accepts work from and the kinds it accepts from each, and the people who may start work for it themselves, with their GitHub logins.
 
 ## Authentication
 

@@ -3,7 +3,7 @@
 page_title: "autopilot_app Resource - autopilot"
 subcategory: ""
 description: |-
-  An app: a unit of consent. It owns repositories, names the senders it accepts work from with the kinds of task it accepts from each, and names the people who may start work for it themselves.
+  An app: a unit of consent. It owns repositories, names the senders it accepts work from with the kinds of task it accepts from each, and names the people who may start work for it themselves, with their GitHub logins.
   AutoPilot takes a sender's task only when the app the task is billed to, and the app that owns each repository the task touches, accept that sender for that kind. An app may accept a sender that doesn't exist yet, so the app and the sender can be applied in either order.
   Every argument but name is optional and sent only when set. Removing one from the configuration empties it at AutoPilot: an app without accepts accepts no sender. Narrowing or deleting an app takes effect at once: AutoPilot stops the queued and running tasks the app no longer accepts.
   A repository belongs to the first app that claims it. AutoPilot can't tell which app should own one, so review an app's repos as you would its access.
@@ -15,7 +15,7 @@ description: |-
 
 # autopilot_app (Resource)
 
-An app: a unit of consent. It owns repositories, names the senders it accepts work from with the kinds of task it accepts from each, and names the people who may start work for it themselves.
+An app: a unit of consent. It owns repositories, names the senders it accepts work from with the kinds of task it accepts from each, and names the people who may start work for it themselves, with their GitHub logins.
 
 AutoPilot takes a sender's task only when the app the task is billed to, and the app that owns each repository the task touches, accept that sender for that kind. An app may accept a sender that doesn't exist yet, so the app and the sender can be applied in either order.
 
@@ -61,10 +61,23 @@ resource "autopilot_app" "billing" {
       sender = "monitor"
       kinds  = ["fix-error"]
     },
+    {
+      # Pull request reviews the developers start from GitHub. They only
+      # comment, so this entry can't set can_decide.
+      sender = "autopilot-github"
+      kinds  = ["review-pr"]
+    },
   ]
 
   # The people who may start work for this app themselves.
   developers = local.developers
+
+  # Each developer's GitHub login, so a review they start from GitHub runs
+  # in their name. Every developer here must be in developers too.
+  github_logins = [
+    { login = "example-first-dev", developer = "first.developer@example.com" },
+    { login = "example-second-dev", developer = "second.developer@example.com" },
+  ]
 
   # What its tasks' model calls run on: a Claude seat when one has room,
   # and Bedrock when every seat is full.
@@ -90,7 +103,8 @@ resource "autopilot_app" "billing" {
 
 - `accepts` (Attributes Set) The senders this app accepts work from, each at most once, with the kinds of task it accepts from each. At most 20. (see [below for nested schema](#nestedatt--accepts))
 - `credential` (String) What the model calls of the tasks billed to this app run on: `bedrock` (Amazon Bedrock, billed per token) or `seat_first` (one of the organization's Claude seats, when one has room). Left out, the app has no policy of its own, and AutoPilot's default applies: `bedrock`. AutoPilot uses seats only while its seat mode is on; with it off, every task runs on Bedrock. Removing it from the configuration takes the app's own policy away. The credential is chosen when a task starts, so a change reaches only the tasks that start after it.
-- `developers` (Set of String) The people who may start work for this app themselves, through AutoPilot's MCP server: their sign-in logins, which are email addresses, written in lowercase ASCII (AutoPilot refuses anything else). At most 100.
+- `developers` (Set of String) The people who may start work for this app themselves, through AutoPilot's MCP server, or from GitHub with a login in `github_logins`: their sign-in logins, which are email addresses, written in lowercase ASCII (AutoPilot refuses anything else). At most 100.
+- `github_logins` (Attributes Set) The GitHub logins of this app's developers, for pull request reviews started from GitHub: each pairs a GitHub login with one of `developers`, and a review started from GitHub by that login runs in that developer's name. This decides who can start reviews in a developer's name, so review each pair as you would `developers`. Every `developer` here must also be in `developers`, so take someone's logins out in the same change that takes them out of `developers`. A developer may have more than one login, and each login belongs to one developer. At most 100. Keep it up to date when someone renames their GitHub account: the old login no longer matches them, and someone else may take it. Reviews from GitHub also need the app to accept the `autopilot-github` sender for `review-pr`. (see [below for nested schema](#nestedatt--github_logins))
 - `repos` (Set of String) The repositories this app **owns**, as `owner/name`. A repository belongs to at most one app. AutoPilot matches them without regard to case, so no two may differ only in case. At most 50.
 - `when_seats_full` (String) With `credential = "seat_first"`, what a task does when every seat is full: `wait` until one has room, or `fall_back` to Bedrock. Required with `seat_first`, and only allowed with it.
 - `worker_cpu` (Number) The CPU of the AWS Fargate task each of this app's tasks runs in, in CPU units, 1024 to a vCPU: `256`, `512`, `1024`, `2048` or `4096`. Set together with `worker_memory`. Left out with it, a task gets AutoPilot's default size, 2 vCPU and 8 GB, and removing both from the configuration takes the app back to it. A bigger task counts against AutoPilot's limits on running tasks and daily spend like any other. The size is chosen when a task starts, so a change reaches only the tasks that start after it.
@@ -112,7 +126,16 @@ Required:
 Optional:
 
 - `can_auto_merge` (Boolean) Whether GitHub's auto-merge may be turned on for the pull requests that sender's `implement-work-item` and `fix-error` tasks open on this app's repositories, when the task asks for it. AutoPilot never merges: GitHub merges each pull request once the repository's own settings and ruleset allow it, which means the repository allows auto-merge and its required checks and reviews pass. Off, a person merges. Only with `implement-work-item` or `fix-error` in `kinds`. Off unless set: leaving it out is the same as `false`. Turning it off, or removing the entry or the app, leaves auto-merge on for a pull request that already has it, and GitHub still merges that pull request: turn auto-merge off on the pull request in GitHub.
-- `can_decide` (Boolean) Whether that sender's `review-pr` tasks may approve or request changes on this app's repositories, which can count as a required review. Only with `review-pr` in `kinds`. Defaults to `false`.
+- `can_decide` (Boolean) Whether that sender's `review-pr` tasks may approve or request changes on this app's repositories, which can count as a required review. Only with `review-pr` in `kinds`, and never for `autopilot-github`, whose reviews only comment. Defaults to `false`.
+
+
+<a id="nestedatt--github_logins"></a>
+### Nested Schema for `github_logins`
+
+Required:
+
+- `developer` (String) The developer that login belongs to: their sign-in login, an email address in lowercase ASCII, as it is written in `developers`.
+- `login` (String) A GitHub login, written in lowercase (AutoPilot refuses uppercase): a letter or digit, then letters, digits, `-` and `_`, at most 39 characters.
 
 ## Import
 

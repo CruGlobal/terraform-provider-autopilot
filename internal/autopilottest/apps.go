@@ -13,18 +13,21 @@ import (
 var (
 	appNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 	repoPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$`)
-	// A login in lowercase ASCII: printable ASCII but uppercase, @ and space,
-	// then @, then a domain with a dot.
-	loginPattern    = regexp.MustCompile(`^[\x21-\x3f\x5b-\x7e]+@[\x21-\x3f\x5b-\x7e]+\.[\x21-\x3f\x5b-\x7e]+$`)
-	maxAppName      = 64
-	reviewKind      = "review-pr"
-	maxRepos        = 50
-	maxAccepts      = 20
-	maxDevelopers   = 100
-	appWritable     = []string{"repos", "accepts", "developers", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory"}
-	appReadOnly     = []string{"lock_version", "created_at", "updated_at"}
-	acceptWritable  = []string{"sender", "kinds", "can_decide", "can_auto_merge"}
-	appCreateFields = append([]string{"name"}, appWritable...)
+	// The characters of a developer's login (see validEmail).
+	emailCharacters = regexp.MustCompile(`^[a-z0-9._%+@-]+$`)
+	// A GitHub login in lowercase ASCII: a letter or digit, then letters,
+	// digits, - and _, at most 39.
+	gitHubLoginPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,38}$`)
+	maxAppName         = 64
+	reviewKind         = "review-pr"
+	maxRepos           = 50
+	maxAccepts         = 20
+	maxDevelopers      = 100
+	maxGitHubLogins    = 100
+	appWritable        = []string{"repos", "accepts", "developers", "github_logins", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory"}
+	appReadOnly        = []string{"lock_version", "created_at", "updated_at"}
+	acceptWritable     = []string{"sender", "kinds", "can_decide", "can_auto_merge"}
+	appCreateFields    = append([]string{"name"}, appWritable...)
 	// An app's credential policy: what its tasks run on, and with
 	// seat_first, what they do when every seat is full.
 	credentials   = []string{"bedrock", "seat_first"}
@@ -56,6 +59,53 @@ func gigabytes(from, to int64) []int64 {
 // ones auto-merge applies to.
 var pullRequestKinds = []string{"implement-work-item", "fix-error"}
 
+// gitHubSender is the sender built into AutoPilot for reviews started from
+// GitHub. Its reviews only comment, so no app may let it decide.
+const gitHubSender = "autopilot-github"
+
+// GitHubLogin is one developer's GitHub login.
+type GitHubLogin struct {
+	Login     string
+	Developer string
+}
+
+// validEmail is AutoPilot's rule for a developer's login, an email address
+// in lowercase ASCII: at most 254 characters; a local part of 1 to 64 before
+// the first @; a domain after it with a dot, that doesn't start or end with
+// one, has no two in a row and no other @; and only emailCharacters.
+func validEmail(text string) bool {
+	at := strings.IndexByte(text, '@')
+	if at < 0 {
+		return false
+	}
+	local, domain := text[:at], text[at+1:]
+	return len(text) <= 254 && len(local) >= 1 && len(local) <= 64 &&
+		strings.Contains(domain, ".") && !strings.HasPrefix(domain, ".") && !strings.HasSuffix(domain, ".") &&
+		!strings.Contains(domain, "..") && !strings.Contains(domain, "@") &&
+		emailCharacters.MatchString(text)
+}
+
+// sortLogins is logins sorted by login, as AutoPilot keeps them.
+func sortLogins(in []GitHubLogin) []GitHubLogin {
+	out := slices.Clone(in)
+	if out == nil {
+		out = []GitHubLogin{}
+	}
+	slices.SortFunc(out, func(x, y GitHubLogin) int { return cmp.Compare(x.Login, y.Login) })
+	return out
+}
+
+// unmappedLogin is the first of logins whose developer isn't in developers,
+// or nil.
+func unmappedLogin(logins []GitHubLogin, developers []string) *GitHubLogin {
+	for i := range logins {
+		if !slices.Contains(developers, logins[i].Developer) {
+			return &logins[i]
+		}
+	}
+	return nil
+}
+
 // Accept is one sender an app accepts work from.
 type Accept struct {
 	Sender       string
@@ -73,6 +123,7 @@ type appRecord struct {
 	repos                     []string
 	accepts                   []Accept
 	developers                []string
+	githubLogins              []GitHubLogin
 	credential, whenSeatsFull string
 	workerImage               string
 	workerCPU, workerMemory   int64
@@ -88,6 +139,7 @@ type AppView struct {
 	Repos         []string
 	Accepts       []Accept
 	Developers    []string
+	GitHubLogins  []GitHubLogin
 	Credential    string
 	WhenSeatsFull string
 	WorkerImage   string
@@ -99,7 +151,8 @@ type AppView struct {
 func (rec *appRecord) view() AppView {
 	return AppView{
 		Name: rec.name, Repos: slices.Clone(rec.repos), Accepts: cloneAccepts(rec.accepts),
-		Developers: slices.Clone(rec.developers), Credential: rec.credential, WhenSeatsFull: rec.whenSeatsFull,
+		Developers: slices.Clone(rec.developers), GitHubLogins: slices.Clone(rec.githubLogins),
+		Credential: rec.credential, WhenSeatsFull: rec.whenSeatsFull,
 		WorkerImage: rec.workerImage, WorkerCPU: rec.workerCPU, WorkerMemory: rec.workerMemory,
 		LockVersion: rec.lockVersion,
 	}
@@ -141,11 +194,16 @@ func (rec *appRecord) json() map[string]any {
 			"sender": a.Sender, "kinds": a.Kinds, "can_decide": a.CanDecide, "can_auto_merge": a.CanAutoMerge,
 		})
 	}
+	logins := make([]any, 0, len(rec.githubLogins))
+	for _, l := range sortLogins(rec.githubLogins) {
+		logins = append(logins, map[string]any{"login": l.Login, "developer": l.Developer})
+	}
 	return map[string]any{
 		"name":            rec.name,
 		"repos":           sortedUnique(rec.repos),
 		"accepts":         accepts,
 		"developers":      sortedUnique(rec.developers),
+		"github_logins":   logins,
 		"credential":      nullable(rec.credential),
 		"when_seats_full": nullable(rec.whenSeatsFull),
 		"worker_image":    nullable(rec.workerImage),
@@ -182,7 +240,8 @@ func (s *Server) SeedApp(v AppView) {
 	now := time.Now()
 	s.apps[v.Name] = &appRecord{
 		name: v.Name, repos: sortedUniqueFold(v.Repos), accepts: sortAccepts(v.Accepts),
-		developers: sortedUnique(v.Developers), credential: v.Credential, whenSeatsFull: v.WhenSeatsFull,
+		developers: sortedUnique(v.Developers), githubLogins: sortLogins(v.GitHubLogins),
+		credential: v.Credential, whenSeatsFull: v.WhenSeatsFull,
 		workerImage: v.WorkerImage, workerCPU: v.WorkerCPU, workerMemory: v.WorkerMemory,
 		lockVersion: 1, createdAt: now, updatedAt: now,
 	}
@@ -211,6 +270,7 @@ func (s *Server) ChangeAppOutOfBand(name string, change func(v *AppView)) {
 	v := rec.view()
 	change(&v)
 	rec.repos, rec.accepts, rec.developers = sortedUniqueFold(v.Repos), sortAccepts(v.Accepts), sortedUnique(v.Developers)
+	rec.githubLogins = sortLogins(v.GitHubLogins)
 	rec.credential, rec.whenSeatsFull = v.Credential, v.WhenSeatsFull
 	rec.workerImage, rec.workerCPU, rec.workerMemory = v.WorkerImage, v.WorkerCPU, v.WorkerMemory
 	rec.lockVersion++
@@ -299,9 +359,13 @@ func (s *Server) appRoutes(mux *http.ServeMux) {
 // worker_image ("" for null), and sizeSent that it sent worker_cpu or
 // worker_memory, which sets both (0 for null).
 type appFields struct {
-	repos                     []string
-	accepts                   []Accept
-	developers                []string
+	repos      []string
+	accepts    []Accept
+	developers []string
+	// githubLogins is nil when not sent. loginAt is where each login was
+	// first sent, as a pointer, for a refusal to name.
+	githubLogins              []GitHubLogin
+	loginAt                   map[string]string
 	policySent                bool
 	credential, whenSeatsFull string
 	imageSent                 bool
@@ -390,6 +454,10 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 			if canDecide && !slices.Contains(kinds, reviewKind) {
 				return f, invalid(at+"/can_decide", "can_decide is only for an entry whose kinds include review-pr")
 			}
+			// Reviews started from GitHub only comment.
+			if canDecide && sender == gitHubSender {
+				return f, invalid(at+"/can_decide", "is false for autopilot-github: reviews started from GitHub only comment")
+			}
 			canAutoMerge := false
 			if rawMerge, ok := e["can_auto_merge"]; ok {
 				if canAutoMerge, ref = boolValue(rawMerge, at+"/can_auto_merge"); ref != nil {
@@ -422,11 +490,18 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 			return f, invalid("/developers", "an app has at most 100 developers")
 		}
 		for i, d := range devs {
-			if !loginPattern.MatchString(d) {
+			if !validEmail(d) {
 				return f, invalid("/developers/"+itoa(i), "a developer is their login: an email address in lowercase ASCII")
 			}
 		}
 		f.developers = sortedUnique(devs)
+	}
+	if raw, ok := obj["github_logins"]; ok {
+		logins, at, ref := readGitHubLogins(raw)
+		if ref != nil {
+			return f, ref
+		}
+		f.githubLogins, f.loginAt = logins, at
 	}
 	// The credential policy is one: a write that sends credential sets both
 	// fields, and when_seats_full means nothing without it.
@@ -491,7 +566,78 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 		}
 		f.sizeSent, f.workerCPU, f.workerMemory = true, cpu, memory
 	}
+	// Once every field is read: a write that sends both developers and
+	// github_logins is checked here, at the entry; one that sends only one of
+	// them is checked against the record.
+	if f.githubLogins != nil && f.developers != nil {
+		if l := unmappedLogin(f.githubLogins, f.developers); l != nil {
+			return f, invalid(f.loginAt[l.Login], "names a developer the app doesn't list: each GitHub login's developer is one of the app's developers")
+		}
+	}
 	return f, nil
+}
+
+// readGitHubLogins reads github_logins: a list of {login, developer}, each
+// login at most once (an entry sent twice exactly is kept once), at most 100,
+// sorted by login. at says where each login was first sent.
+func readGitHubLogins(raw json.RawMessage) ([]GitHubLogin, map[string]string, *refusal) {
+	var entries []json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil || entries == nil {
+		return nil, nil, invalid("/github_logins", "is a list of GitHub logins, each with the developer it is")
+	}
+	out := []GitHubLogin{}
+	at, developerOf := map[string]string{}, map[string]string{}
+	for i, rawEntry := range entries {
+		base := "/github_logins/" + itoa(i)
+		var e map[string]json.RawMessage
+		if err := json.Unmarshal(rawEntry, &e); err != nil || e == nil {
+			return nil, nil, invalid(base, "is an object with login and developer")
+		}
+		// AutoPilot reads an entry's fields in sorted order, so the first
+		// field it names is the first wrong one in that order.
+		keys := make([]string, 0, len(e))
+		for k := range e {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		var login, developer *string
+		for _, k := range keys {
+			switch k {
+			case "developer":
+				d, ref := stringValue(e[k], base+"/developer")
+				if ref != nil || !validEmail(d) {
+					return nil, nil, invalid(base+"/developer", "a developer is an email address in lowercase ASCII")
+				}
+				developer = &d
+			case "login":
+				l, ref := stringValue(e[k], base+"/login")
+				if ref != nil || !gitHubLoginPattern.MatchString(l) {
+					return nil, nil, invalid(base+"/login", "a GitHub login in lowercase: a letter or digit, then letters, digits, - and _, at most 39 characters")
+				}
+				login = &l
+			default:
+				return nil, nil, &refusal{http.StatusUnprocessableEntity, "invalid_attribute", "AutoPilot doesn't know this field", base + "/" + k}
+			}
+		}
+		if login == nil {
+			return nil, nil, invalid(base+"/login", "is required")
+		}
+		if developer == nil {
+			return nil, nil, invalid(base+"/developer", "is required")
+		}
+		if prior, seen := developerOf[*login]; seen {
+			if prior != *developer {
+				return nil, nil, invalid(base+"/login", "is listed twice: each GitHub login is one developer")
+			}
+			continue
+		}
+		developerOf[*login], at[*login] = *developer, base
+		out = append(out, GitHubLogin{Login: *login, Developer: *developer})
+	}
+	if len(out) > maxGitHubLogins {
+		return nil, nil, invalid("/github_logins", "lists at most 100 GitHub logins")
+	}
+	return sortLogins(out), at, nil
 }
 
 // wholeOrNull reads a whole number above zero, or null as 0.
@@ -526,6 +672,7 @@ func (rec *appRecord) holds(f appFields) bool {
 	return (f.repos == nil || slices.Equal(f.repos, rec.repos)) &&
 		(f.accepts == nil || acceptsEqual(f.accepts, rec.accepts)) &&
 		(f.developers == nil || slices.Equal(f.developers, rec.developers)) &&
+		(f.githubLogins == nil || slices.Equal(f.githubLogins, rec.githubLogins)) &&
 		(!f.policySent || (f.credential == rec.credential && f.whenSeatsFull == rec.whenSeatsFull)) &&
 		(!f.imageSent || f.workerImage == rec.workerImage) &&
 		(!f.sizeSent || (f.workerCPU == rec.workerCPU && f.workerMemory == rec.workerMemory))
@@ -588,9 +735,16 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 	if accepts == nil {
 		accepts = []Accept{}
 	}
+	logins := sortLogins(f.githubLogins)
+	// Each GitHub login's developer is one of the app's developers; a
+	// create that sends no developers has none.
+	if l := unmappedLogin(logins, devs); l != nil {
+		return 0, nil, invalid(f.loginAt[l.Login], "names a developer the app doesn't list: each GitHub login's developer is one of the app's developers")
+	}
 	now := time.Now()
 	if existing, ok := s.apps[name]; ok {
 		same := slices.Equal(existing.repos, repos) && acceptsEqual(existing.accepts, accepts) && slices.Equal(existing.developers, devs) &&
+			slices.Equal(existing.githubLogins, logins) &&
 			existing.credential == f.credential && existing.whenSeatsFull == f.whenSeatsFull &&
 			existing.workerImage == f.workerImage && existing.workerCPU == f.workerCPU && existing.workerMemory == f.workerMemory
 		if !same {
@@ -601,7 +755,7 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 	if ref := s.refuseTakenRepos(repos, name); ref != nil {
 		return 0, nil, ref
 	}
-	rec := &appRecord{name: name, repos: repos, accepts: accepts, developers: devs,
+	rec := &appRecord{name: name, repos: repos, accepts: accepts, developers: devs, githubLogins: logins,
 		credential: f.credential, whenSeatsFull: f.whenSeatsFull,
 		workerImage: f.workerImage, workerCPU: f.workerCPU, workerMemory: f.workerMemory,
 		lockVersion: 1, createdAt: now, updatedAt: now}
@@ -645,6 +799,24 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 		}
 		return nil, staleRefusal()
 	}
+	// Each GitHub login's developer is one of the app's developers, by what
+	// the change leaves. Only a change that sends one of the two is held to
+	// it, so a record an older AutoPilot left that way takes other changes.
+	if (f.developers != nil || f.githubLogins != nil) && !rec.holds(f) {
+		developers, logins := rec.developers, rec.githubLogins
+		if f.developers != nil {
+			developers = f.developers
+		}
+		if f.githubLogins != nil {
+			logins = f.githubLogins
+		}
+		if unmappedLogin(logins, developers) != nil {
+			if f.githubLogins != nil {
+				return nil, invalid("/github_logins", "names a developer the app doesn't list: each GitHub login's developer is one of the app's developers")
+			}
+			return nil, invalid("/developers", "takes out a developer that github_logins still names; take their GitHub logins out too")
+		}
+	}
 	if ref := s.refuseTakenRepos(f.repos, name); ref != nil {
 		return nil, ref
 	}
@@ -659,6 +831,9 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 	}
 	if f.developers != nil && !slices.Equal(f.developers, rec.developers) {
 		rec.developers, changed = f.developers, true
+	}
+	if f.githubLogins != nil && !slices.Equal(f.githubLogins, rec.githubLogins) {
+		rec.githubLogins, changed = f.githubLogins, true
 	}
 	if f.policySent && (f.credential != rec.credential || f.whenSeatsFull != rec.whenSeatsFull) {
 		rec.credential, rec.whenSeatsFull, changed = f.credential, f.whenSeatsFull, true

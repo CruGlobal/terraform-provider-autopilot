@@ -20,11 +20,56 @@ var (
 	appNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 	// A repository: owner/name.
 	repoPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$`)
-	// A developer's login: an email address in lowercase ASCII, which is all
-	// AutoPilot takes. Printable ASCII but uppercase, @ and space, then @,
-	// then a domain with a dot.
-	loginPattern = regexp.MustCompile(`^[\x21-\x3f\x5b-\x7e]+@[\x21-\x3f\x5b-\x7e]+\.[\x21-\x3f\x5b-\x7e]+$`)
+	// The characters of a developer's login: lowercase ASCII letters, digits
+	// and ._%+@- (see validEmail).
+	emailCharacters = regexp.MustCompile(`^[a-z0-9._%+@-]+$`)
+	// A GitHub login, as AutoPilot takes one: in lowercase ASCII, a letter or
+	// digit, then letters, digits, - and _ (an enterprise's managed users
+	// have _), at most 39 characters.
+	gitHubLoginPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,38}$`)
 )
+
+// gitHubSender is the sender built into AutoPilot for pull request reviews
+// started from GitHub. Those reviews only comment, so AutoPilot refuses
+// can_decide for it.
+const gitHubSender = "autopilot-github"
+
+// validEmail is AutoPilot's own rule for a developer's login, an email
+// address in lowercase ASCII, step for step: at most 254 characters; a local
+// part of 1 to 64 before the first @; a domain after it with a dot, that
+// doesn't start or end with one, has no two in a row and no other @; and
+// only the characters emailCharacters allows.
+func validEmail(text string) bool {
+	at := strings.IndexByte(text, '@')
+	if at < 0 {
+		return false
+	}
+	local, domain := text[:at], text[at+1:]
+	return len(text) <= 254 && len(local) >= 1 && len(local) <= 64 &&
+		strings.Contains(domain, ".") && !strings.HasPrefix(domain, ".") && !strings.HasSuffix(domain, ".") &&
+		!strings.Contains(domain, "..") && !strings.Contains(domain, "@") &&
+		emailCharacters.MatchString(text)
+}
+
+// emailValidator refuses a developer's login AutoPilot would refuse.
+type emailValidator struct{}
+
+func (emailValidator) Description(context.Context) string {
+	return "an email address in lowercase ASCII"
+}
+
+func (v emailValidator) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
+
+func (emailValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if value := req.ConfigValue.ValueString(); !validEmail(value) {
+		resp.Diagnostics.AddAttributeError(req.Path, "Invalid developer",
+			fmt.Sprintf("%q must be an email address in lowercase ASCII, which is all AutoPilot takes: letters, "+
+				"digits and ._%%+- before the @, and a domain with a dot after it.", value))
+	}
+}
 
 // The worker images an app's tasks may run in.
 var workerImages = []string{"node", "ruby", "python", "go"}
@@ -98,9 +143,46 @@ func (v noCaseRepeatsValidator) ValidateSet(ctx context.Context, req validator.S
 	}
 }
 
+// gitHubLoginsValidator refuses a GitHub login listed with two developers.
+// A set already keeps an entry listed twice exactly once.
+type gitHubLoginsValidator struct{}
+
+func (gitHubLoginsValidator) Description(context.Context) string {
+	return "each GitHub login at most once"
+}
+
+func (v gitHubLoginsValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (gitHubLoginsValidator) ValidateSet(ctx context.Context, req validator.SetRequest, resp *validator.SetResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	seen := map[string]bool{}
+	for _, elem := range req.ConfigValue.Elements() {
+		obj, ok := elem.(types.Object)
+		if !ok || obj.IsNull() || obj.IsUnknown() {
+			continue
+		}
+		var m gitHubLoginModel
+		if diags := obj.As(ctx, &m, basetypes.ObjectAsOptions{}); diags.HasError() || !known(m.Login) {
+			continue
+		}
+		login := m.Login.ValueString()
+		if seen[login] {
+			resp.Diagnostics.AddAttributeError(req.Path, "GitHub login listed twice",
+				fmt.Sprintf("The GitHub login %q is paired with more than one developer. Each login belongs to one "+
+					"developer; keep one of its entries.", login))
+		}
+		seen[login] = true
+	}
+}
+
 // acceptsValidator checks the rules that span an accepts entry or the whole
-// set: each sender at most once, can_decide only with review-pr, and
-// can_auto_merge only with a kind that opens a pull request.
+// set: each sender at most once, can_decide only with review-pr and never for
+// autopilot-github, and can_auto_merge only with a kind that opens a pull
+// request.
 type acceptsValidator struct{}
 
 // pullRequestKinds are the kinds whose tasks open a pull request, the only
@@ -108,7 +190,7 @@ type acceptsValidator struct{}
 var pullRequestKinds = []string{"implement-work-item", "fix-error"}
 
 func (acceptsValidator) Description(context.Context) string {
-	return "each sender at most once; can_decide only with review-pr in kinds; " +
+	return "each sender at most once; can_decide only with review-pr in kinds, and never for autopilot-github; " +
 		"can_auto_merge only with implement-work-item or fix-error in kinds"
 }
 
@@ -141,6 +223,11 @@ func (acceptsValidator) ValidateSet(ctx context.Context, req validator.SetReques
 			resp.Diagnostics.AddAttributeError(req.Path, "can_decide without review-pr",
 				fmt.Sprintf("The entry for %q sets can_decide, which only applies to review-pr tasks, but its kinds "+
 					"don't include review-pr. Add review-pr to its kinds, or leave can_decide out.", m.Sender.ValueString()))
+		}
+		if isTrue(m.CanDecide) && known(m.Sender) && m.Sender.ValueString() == gitHubSender {
+			resp.Diagnostics.AddAttributeError(req.Path, "can_decide for autopilot-github",
+				"The entry for \"autopilot-github\" sets can_decide = true. Reviews started from GitHub only comment, "+
+					"so AutoPilot refuses to let them approve or request changes. Leave can_decide out of that entry.")
 		}
 		if isTrue(m.CanAutoMerge) && lacksKind(m.Kinds, pullRequestKinds...) {
 			resp.Diagnostics.AddAttributeError(req.Path, "can_auto_merge without a pull request kind",
