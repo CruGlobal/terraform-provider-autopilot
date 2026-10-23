@@ -62,6 +62,10 @@ type Accept struct {
 	// requests that sender's implement-work-item and fix-error tasks open on
 	// the app's repositories, when the task asks for it.
 	CanAutoMerge bool `json:"can_auto_merge"`
+	// CanDecideOwnPR lets a deciding review that a built-in sender makes for
+	// a person decide on a pull request that may be that person's own, too.
+	// False when the AutoPilot predates the field.
+	CanDecideOwnPR bool `json:"can_decide_own_pr"`
 }
 
 // GitHubLogin is one developer's GitHub login. A review started from GitHub
@@ -156,10 +160,10 @@ func (s AppSpec) fields() Fields {
 func (s AppSpec) Empty() bool { return len(s.fields()) == 0 }
 
 // acceptsBody is accepts as the API keeps them: sorted by sender, each with
-// its kinds sorted. can_decide and can_auto_merge are sent only when true, so
-// an entry whose kinds don't allow one never carries it, and an AutoPilot that
-// predates can_auto_merge still takes an entry without it; false is the API's
-// default for both.
+// its kinds sorted. can_decide, can_auto_merge and can_decide_own_pr are sent
+// only when true, so an entry that doesn't allow one never carries it, and an
+// AutoPilot that predates can_auto_merge or can_decide_own_pr still takes an
+// entry without it; false is the API's default for all three.
 func acceptsBody(accepts []Accept) []map[string]any {
 	sorted := normalizeAccepts(accepts)
 	out := make([]map[string]any, 0, len(sorted))
@@ -170,6 +174,9 @@ func acceptsBody(accepts []Accept) []map[string]any {
 		}
 		if a.CanAutoMerge {
 			entry["can_auto_merge"] = true
+		}
+		if a.CanDecideOwnPR {
+			entry["can_decide_own_pr"] = true
 		}
 		out = append(out, entry)
 	}
@@ -183,7 +190,10 @@ func normalizeAccepts(accepts []Accept) []Accept {
 		if kinds == nil {
 			kinds = []string{}
 		}
-		out = append(out, Accept{Sender: a.Sender, Kinds: kinds, CanDecide: a.CanDecide, CanAutoMerge: a.CanAutoMerge})
+		out = append(out, Accept{
+			Sender: a.Sender, Kinds: kinds,
+			CanDecide: a.CanDecide, CanAutoMerge: a.CanAutoMerge, CanDecideOwnPR: a.CanDecideOwnPR,
+		})
 	}
 	slices.SortFunc(out, func(x, y Accept) int { return cmp.Compare(x.Sender, y.Sender) })
 	return out
@@ -219,7 +229,7 @@ func (s AppSpec) reflectedIn(app *App) bool {
 	if s.Accepts != nil && !slices.EqualFunc(normalizeAccepts(s.Accepts), normalizeAccepts(app.Accepts),
 		func(x, y Accept) bool {
 			return x.Sender == y.Sender && x.CanDecide == y.CanDecide && x.CanAutoMerge == y.CanAutoMerge &&
-				slices.Equal(x.Kinds, y.Kinds)
+				x.CanDecideOwnPR == y.CanDecideOwnPR && slices.Equal(x.Kinds, y.Kinds)
 		}) {
 		return false
 	}
