@@ -350,13 +350,15 @@ func TestCreateApp_SendsOnlyWhatIsSet(t *testing.T) {
 			{Sender: "tracker", Kinds: []string{"review-pr", "implement-work-item"}, CanDecide: true},
 			{Sender: "monitor", Kinds: []string{"fix-error"}},
 			{Sender: "planner", Kinds: []string{"implement-work-item"}, CanAutoMerge: true},
+			{Sender: "autopilot-mcp", Kinds: []string{"review-pr"}, CanDecide: true, CanDecideOwnPR: true},
+			{Sender: "autopilot-github", Kinds: []string{"review-pr"}, CanDecide: true},
 		},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
 		`{"name":"billing"}`,
-		`{"accepts":[{"kinds":["fix-error"],"sender":"monitor"},{"can_auto_merge":true,"kinds":["implement-work-item"],"sender":"planner"},{"can_decide":true,"kinds":["implement-work-item","review-pr"],"sender":"tracker"}],"name":"billing","repos":[]}`,
+		`{"accepts":[{"can_decide":true,"kinds":["review-pr"],"sender":"autopilot-github"},{"can_decide":true,"can_decide_own_pr":true,"kinds":["review-pr"],"sender":"autopilot-mcp"},{"kinds":["fix-error"],"sender":"monitor"},{"can_auto_merge":true,"kinds":["implement-work-item"],"sender":"planner"},{"can_decide":true,"kinds":["implement-work-item","review-pr"],"sender":"tracker"}],"name":"billing","repos":[]}`,
 	}
 	for i := range want {
 		if bodies[i] != want[i] {
@@ -905,6 +907,47 @@ func TestAppSpec_GitHubLoginsReflectedIn(t *testing.T) {
 		if got := c.spec.reflectedIn(c.app); got != c.want {
 			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
 		}
+	}
+}
+
+// An app read back holds a change's accepts only when each entry's flags
+// match, can_decide_own_pr among them.
+func TestAppSpec_AcceptsReflectedIn(t *testing.T) {
+	mcp := func(ownPR bool) Accept {
+		return Accept{Sender: "autopilot-mcp", Kinds: []string{"review-pr"}, CanDecide: true, CanDecideOwnPR: ownPR}
+	}
+	held := &App{Accepts: []Accept{mcp(true)}}
+	cases := []struct {
+		spec AppSpec
+		app  *App
+		want bool
+	}{
+		{AppSpec{Accepts: []Accept{mcp(true)}}, held, true},
+		{AppSpec{Accepts: []Accept{mcp(false)}}, held, false},
+		{AppSpec{Accepts: []Accept{mcp(true)}}, &App{Accepts: []Accept{mcp(false)}}, false},
+		{AppSpec{}, held, true},
+	}
+	for i, c := range cases {
+		if got := c.spec.reflectedIn(c.app); got != c.want {
+			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// An AutoPilot that predates can_decide_own_pr answers without it: the
+// entry reads as having it off.
+func TestGetApp_WithoutCanDecideOwnPR(t *testing.T) {
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 1, "accepts": []any{
+			map[string]any{"sender": "autopilot-mcp", "kinds": []string{"review-pr"}, "can_decide": true, "can_auto_merge": false},
+		}})
+	}))
+	a, err := c.GetApp(context.Background(), "billing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a.Accepts) != 1 || !a.Accepts[0].CanDecide || a.Accepts[0].CanDecideOwnPR {
+		t.Errorf("accepts = %+v", a.Accepts)
 	}
 }
 

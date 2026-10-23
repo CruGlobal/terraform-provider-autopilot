@@ -405,6 +405,125 @@ func (env *testEnv) checkAutoMerge(t *testing.T, name string, want map[string]bo
 	return nil
 }
 
+// can_decide_own_pr is sent only when true, as can_auto_merge is, so an
+// AutoPilot that predates it still takes an entry that leaves it off.
+func TestApp_canDecideOwnPRSentOnlyWhenTrue(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, `
+  accepts = [
+    { sender = "autopilot-github", kinds = ["review-pr"], can_decide = true, can_decide_own_pr = false },
+    { sender = "autopilot-mcp", kinds = ["review-pr"], can_decide = true, can_decide_own_pr = true },
+  ]`),
+				Check: func(*terraform.State) error {
+					post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0]
+					accepts, _ := requestBody(t, post)["accepts"].([]any)
+					if len(accepts) != 2 {
+						return fmt.Errorf("accepts = %v", accepts)
+					}
+					first, _ := accepts[0].(map[string]any)
+					second, _ := accepts[1].(map[string]any)
+					if _, ok := first["can_decide_own_pr"]; ok {
+						return fmt.Errorf("can_decide_own_pr false was sent")
+					}
+					if first["can_decide"] != true {
+						return fmt.Errorf("can_decide true was not sent for autopilot-github")
+					}
+					if second["can_decide_own_pr"] != true {
+						return fmt.Errorf("can_decide_own_pr true was not sent")
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// can_decide_own_pr is off unless set, is kept when set, and is turned off
+// again by false or by leaving it out. A review from GitHub may decide.
+func TestApp_canDecideOwnPRLifecycle(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	config := func(ownPR string) string {
+		return appConfig(env, name, fmt.Sprintf(`
+  accepts = [
+    { sender = "autopilot-mcp", kinds = ["review-pr"], can_decide = true%s },
+    { sender = "autopilot-github", kinds = ["review-pr"], can_decide = true },
+  ]`, ownPR))
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(", can_decide_own_pr = true"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckTypeSetElemNestedAttrs(appRes, "accepts.*", map[string]string{
+						"sender": "autopilot-mcp", "can_decide": "true", "can_decide_own_pr": "true",
+					}),
+					resource.TestCheckTypeSetElemNestedAttrs(appRes, "accepts.*", map[string]string{
+						"sender": "autopilot-github", "can_decide": "true",
+					}),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "1"),
+					// Left out, it is off at AutoPilot.
+					func(*terraform.State) error {
+						return env.checkOwnPR(t, name, map[string]bool{"autopilot-mcp": true, "autopilot-github": false})
+					},
+				),
+			},
+			{
+				Config: config(", can_decide_own_pr = false"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckTypeSetElemNestedAttrs(appRes, "accepts.*", map[string]string{
+						"sender": "autopilot-mcp", "can_decide": "true", "can_decide_own_pr": "false",
+					}),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					func(*terraform.State) error {
+						return env.checkOwnPR(t, name, map[string]bool{"autopilot-mcp": false, "autopilot-github": false})
+					},
+				),
+			},
+			{
+				Config: config(", can_decide_own_pr = true"),
+				Check: func(*terraform.State) error {
+					return env.checkOwnPR(t, name, map[string]bool{"autopilot-mcp": true})
+				},
+			},
+			{
+				// Taken out of the configuration, it is turned off.
+				Config: config(""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					return env.checkOwnPR(t, name, map[string]bool{"autopilot-mcp": false, "autopilot-github": false})
+				},
+			},
+		},
+	})
+}
+
+// checkOwnPR reads the app from AutoPilot, the fake or a live one, and checks
+// each sender's can_decide_own_pr there.
+func (env *testEnv) checkOwnPR(t *testing.T, name string, want map[string]bool) error {
+	app, err := env.apiClient(t).GetApp(context.Background(), name)
+	if err != nil {
+		return err
+	}
+	for _, a := range app.Accepts {
+		if on, ok := want[a.Sender]; ok && a.CanDecideOwnPR != on {
+			return fmt.Errorf("%s: can_decide_own_pr = %v at AutoPilot, want %v", a.Sender, a.CanDecideOwnPR, on)
+		}
+	}
+	return nil
+}
+
 func TestApp_lostCreateAnswerIsSentAgain(t *testing.T) {
 	env := newTestEnv(t)
 	env.requireFake(t)
@@ -650,6 +769,11 @@ func TestApp_planTimeValidation(t *testing.T) {
 		{`  accepts = [{ sender = "tracker", kinds = ["research"], can_decide = true }]`, "can_decide without review-pr"},
 		{`  accepts = [{ sender = "tracker", kinds = ["research"], can_auto_merge = true }]`, "can_auto_merge without a pull request kind"},
 		{`  accepts = [{ sender = "tracker", kinds = ["review-pr"], can_auto_merge = true }]`, "can_auto_merge without a pull request kind"},
+		{`  accepts = [{ sender = "autopilot-mcp", kinds = ["review-pr"], can_decide_own_pr = true }]`, "can_decide_own_pr without can_decide"},
+		{`  accepts = [{ sender = "autopilot-github", kinds = ["review-pr"], can_decide = false, can_decide_own_pr = true }]`,
+			"can_decide_own_pr without can_decide"},
+		{`  accepts = [{ sender = "tracker", kinds = ["review-pr"], can_decide = true, can_decide_own_pr = true }]`,
+			"can_decide_own_pr for a sender not built in"},
 		{`  accepts = [
     { sender = "tracker", kinds = ["research"] },
     { sender = "tracker", kinds = ["fix-error"] },
@@ -711,6 +835,42 @@ resource "autopilot_app" "test" {
 	})
 }
 
+// can_decide_own_pr with a can_decide not known at plan time waits for it:
+// the plan passes, and the apply refuses it once can_decide is known to be
+// false.
+func TestApp_canDecideOwnPRWithCanDecideNotKnownYet(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	config := func(decide bool) string {
+		return env.providerConfig() + fmt.Sprintf(`
+resource "terraform_data" "decide" {
+  input = %t
+}
+
+resource "autopilot_app" "test" {
+  name    = %q
+  accepts = [{ sender = "autopilot-mcp", kinds = ["review-pr"], can_decide = terraform_data.decide.output, can_decide_own_pr = true }]
+}
+`, decide, name)
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "accepts.0.can_decide", "true"),
+					resource.TestCheckResourceAttr(appRes, "accepts.0.can_decide_own_pr", "true"),
+				),
+			},
+			{
+				Config:      config(false),
+				ExpectError: expectErr("can_decide_own_pr without can_decide"),
+			},
+		},
+	})
+}
+
 // can_auto_merge with a kind not known at plan time waits for the kind too.
 func TestApp_canAutoMergeWithAKindNotKnownYet(t *testing.T) {
 	env := newTestEnv(t)
@@ -751,10 +911,11 @@ func TestAcceptsValidator_UnknownKind(t *testing.T) {
 	ctx := context.Background()
 	entry := func(kinds ...attr.Value) attr.Value {
 		return types.ObjectValueMust(acceptAttrTypes, map[string]attr.Value{
-			"sender":         types.StringValue("tracker"),
-			"kinds":          types.SetValueMust(types.StringType, kinds),
-			"can_decide":     types.BoolValue(true),
-			"can_auto_merge": types.BoolValue(false),
+			"sender":            types.StringValue("tracker"),
+			"kinds":             types.SetValueMust(types.StringType, kinds),
+			"can_decide":        types.BoolValue(true),
+			"can_auto_merge":    types.BoolValue(false),
+			"can_decide_own_pr": types.BoolNull(),
 		})
 	}
 	cases := []struct {
@@ -787,10 +948,11 @@ func TestAcceptsValidator_AutoMergeUnknownKind(t *testing.T) {
 	ctx := context.Background()
 	entry := func(kinds ...attr.Value) attr.Value {
 		return types.ObjectValueMust(acceptAttrTypes, map[string]attr.Value{
-			"sender":         types.StringValue("tracker"),
-			"kinds":          types.SetValueMust(types.StringType, kinds),
-			"can_decide":     types.BoolValue(false),
-			"can_auto_merge": types.BoolValue(true),
+			"sender":            types.StringValue("tracker"),
+			"kinds":             types.SetValueMust(types.StringType, kinds),
+			"can_decide":        types.BoolValue(false),
+			"can_auto_merge":    types.BoolValue(true),
+			"can_decide_own_pr": types.BoolNull(),
 		})
 	}
 	cases := []struct {
@@ -804,6 +966,50 @@ func TestAcceptsValidator_AutoMergeUnknownKind(t *testing.T) {
 		{"fix-error beside research", entry(types.StringValue("research"), types.StringValue("fix-error")), false},
 		{"review-pr only", entry(types.StringValue("review-pr")), true},
 		{"research only", entry(types.StringValue("research")), true},
+	}
+	for _, c := range cases {
+		req := validator.SetRequest{
+			Path:        path.Root("accepts"),
+			ConfigValue: types.SetValueMust(acceptObjectType, []attr.Value{c.entry}),
+		}
+		var resp validator.SetResponse
+		acceptsValidator{}.ValidateSet(ctx, req, &resp)
+		if resp.Diagnostics.HasError() != c.refused {
+			t.Errorf("%s: refused = %v, want %v (%v)", c.name, resp.Diagnostics.HasError(), c.refused, resp.Diagnostics)
+		}
+	}
+}
+
+// can_decide_own_pr is refused without can_decide (left out is false) and
+// for a sender not built into AutoPilot, and waits while either is unknown.
+func TestAcceptsValidator_OwnPR(t *testing.T) {
+	ctx := context.Background()
+	entry := func(sender types.String, canDecide, ownPR types.Bool) attr.Value {
+		return types.ObjectValueMust(acceptAttrTypes, map[string]attr.Value{
+			"sender":            sender,
+			"kinds":             types.SetValueMust(types.StringType, []attr.Value{types.StringValue("review-pr")}),
+			"can_decide":        canDecide,
+			"can_auto_merge":    types.BoolNull(),
+			"can_decide_own_pr": ownPR,
+		})
+	}
+	mcp, gh, tracker := types.StringValue("autopilot-mcp"), types.StringValue("autopilot-github"), types.StringValue("tracker")
+	on, off := types.BoolValue(true), types.BoolValue(false)
+	cases := []struct {
+		name    string
+		entry   attr.Value
+		refused bool
+	}{
+		{"the MCP, with can_decide", entry(mcp, on, on), false},
+		{"GitHub, with can_decide", entry(gh, on, on), false},
+		{"can_decide left out", entry(mcp, types.BoolNull(), on), true},
+		{"can_decide false", entry(gh, off, on), true},
+		{"can_decide not known yet", entry(mcp, types.BoolUnknown(), on), false},
+		{"a sender in the ledger", entry(tracker, on, on), true},
+		{"a sender not known yet", entry(types.StringUnknown(), on, on), false},
+		{"off, for a sender in the ledger", entry(tracker, off, off), false},
+		{"left out", entry(tracker, off, types.BoolNull()), false},
+		{"not known yet", entry(tracker, off, types.BoolUnknown()), false},
 	}
 	for _, c := range cases {
 		req := validator.SetRequest{
@@ -981,6 +1187,35 @@ func TestApp_canAutoMergeWidenedOutsideTerraformIsPutBack(t *testing.T) {
 				Check: func(*terraform.State) error {
 					if v, _ := env.fake.App(name); len(v.Accepts) != 1 || v.Accepts[0].CanAutoMerge {
 						return fmt.Errorf("accepts = %+v, want can_auto_merge off again", v.Accepts)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// can_decide_own_pr turned on outside Terraform shows as a change, and the
+// apply turns it off again.
+func TestApp_canDecideOwnPRWidenedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	config := appConfig(env, name, `  accepts = [{ sender = "autopilot-github", kinds = ["review-pr"], can_decide = true }]`)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config},
+			{
+				PreConfig: func() {
+					env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) { v.Accepts[0].CanDecideOwnPR = true })
+				},
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					if v, _ := env.fake.App(name); len(v.Accepts) != 1 || v.Accepts[0].CanDecideOwnPR || !v.Accepts[0].CanDecide {
+						return fmt.Errorf("accepts = %+v, want can_decide_own_pr off again", v.Accepts)
 					}
 					return nil
 				},
@@ -1911,6 +2146,52 @@ func TestApp_importWithGitHubLogins(t *testing.T) {
 	})
 }
 
+// An imported app's can_decide_own_pr is read into state, so a
+// configuration that sets it plans nothing, and one that leaves it out plans
+// turning it off.
+func TestApp_importWithCanDecideOwnPR(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{
+		Name: name,
+		Accepts: []autopilottest.Accept{
+			{Sender: "autopilot-mcp", Kinds: []string{"review-pr"}, CanDecide: true, CanDecideOwnPR: true},
+		},
+	})
+	entry := `  accepts = [{ sender = "autopilot-mcp", kinds = ["review-pr"], can_decide = true%s }]`
+	on := appConfig(env, name, fmt.Sprintf(entry, ", can_decide_own_pr = true"))
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             on,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: on,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: appConfig(env, name, fmt.Sprintf(entry, "")),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					if v, _ := env.fake.App(name); len(v.Accepts) != 1 || v.Accepts[0].CanDecideOwnPR || !v.Accepts[0].CanDecide {
+						return fmt.Errorf("accepts = %+v, want can_decide_own_pr off", v.Accepts)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
 // The rules for GitHub logins fail the plan.
 func TestApp_gitHubLoginsPlanTimeValidation(t *testing.T) {
 	env := newTestEnv(t)
@@ -1935,7 +2216,6 @@ func TestApp_gitHubLoginsPlanTimeValidation(t *testing.T) {
 		{gitHubLoginsHCL("alice-gh", "alice@example.org"), "GitHub login for someone not in developers"},
 		{`  developers = []
 ` + gitHubLoginsHCL("alice-gh", "alice@example.org"), "GitHub login for someone not in developers"},
-		{`  accepts = [{ sender = "autopilot-github", kinds = ["review-pr"], can_decide = true }]`, "can_decide for autopilot-github"},
 	}
 	steps := make([]resource.TestStep, 0, len(cases)+2)
 	for _, c := range cases {
@@ -1948,10 +2228,14 @@ func TestApp_gitHubLoginsPlanTimeValidation(t *testing.T) {
 	steps = append(steps, resource.TestStep{Config: appConfig(env, name, devs+gitHubLoginsHCL(many...)), PlanOnly: true,
 		ExpectError: expectErr("must contain at most 100 elements")})
 	// What AutoPilot takes, the plan takes: a 39-character login, one that
-	// starts with a digit, _ inside one, and a developer with two logins.
-	// The plan is for a new app, so it is not empty.
+	// starts with a digit, _ inside one, a developer with two logins, and
+	// reviews from GitHub and the MCP that may decide, on the asker's own pull
+	// request too. The plan is for a new app, so it is not empty.
 	steps = append(steps, resource.TestStep{
-		Config: appConfig(env, name, devs+`  accepts = [{ sender = "autopilot-github", kinds = ["review-pr"], can_decide = false }]
+		Config: appConfig(env, name, devs+`  accepts = [
+    { sender = "autopilot-github", kinds = ["review-pr"], can_decide = true },
+    { sender = "autopilot-mcp", kinds = ["review-pr"], can_decide = true, can_decide_own_pr = true },
+  ]
 `+gitHubLoginsHCL(strings.Repeat("a", 39), "alice@example.org", "0alice_work", "alice@example.org", "bob", "bob@example.org")),
 		PlanOnly:           true,
 		ExpectNonEmptyPlan: true,

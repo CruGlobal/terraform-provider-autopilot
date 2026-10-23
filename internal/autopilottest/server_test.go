@@ -157,6 +157,70 @@ func TestAccepts_CanAutoMerge(t *testing.T) {
 	expect(t, "two entries for one sender, apart in can_auto_merge", st, http.StatusUnprocessableEntity, body)
 }
 
+// can_decide_own_pr is true only with can_decide true and only for a sender
+// built into AutoPilot, is false unless sent, is kept and answered, and two
+// entries for one sender that differ only in it are refused.
+func TestAccepts_CanDecideOwnPR(t *testing.T) {
+	s := New(t)
+	refused := []struct {
+		name  string
+		entry map[string]any
+	}{
+		{"without can_decide", map[string]any{"sender": "autopilot-mcp", "kinds": []string{"review-pr"}, "can_decide_own_pr": true}},
+		{"with can_decide false", map[string]any{"sender": "autopilot-github", "kinds": []string{"review-pr"},
+			"can_decide": false, "can_decide_own_pr": true}},
+		{"for a sender in the ledger", map[string]any{"sender": "tracker", "kinds": []string{"review-pr"},
+			"can_decide": true, "can_decide_own_pr": true}},
+		{"not a flag", map[string]any{"sender": "autopilot-mcp", "kinds": []string{"review-pr"},
+			"can_decide": true, "can_decide_own_pr": "yes"}},
+		{"null", map[string]any{"sender": "autopilot-mcp", "kinds": []string{"review-pr"},
+			"can_decide": true, "can_decide_own_pr": nil}},
+	}
+	for _, c := range refused {
+		st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{c.entry}})
+		expect(t, "can_decide_own_pr "+c.name, st, http.StatusUnprocessableEntity, body)
+		if body["field"] != "/accepts/0/can_decide_own_pr" {
+			t.Errorf("%s: field = %v", c.name, body["field"])
+		}
+	}
+
+	on := func(sender string) map[string]any {
+		return map[string]any{"sender": sender, "kinds": []string{"review-pr"}, "can_decide": true, "can_decide_own_pr": true}
+	}
+	plain := map[string]any{"sender": "tracker", "kinds": []string{"review-pr"}, "can_decide": true}
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{
+		on("autopilot-github"), on("autopilot-mcp"), plain,
+	}})
+	expect(t, "can_decide_own_pr for the built-in senders", st, http.StatusCreated, body)
+	v, _ := s.App("billing")
+	if len(v.Accepts) != 3 || !v.Accepts[0].CanDecideOwnPR || !v.Accepts[1].CanDecideOwnPR || v.Accepts[2].CanDecideOwnPR {
+		t.Errorf("accepts = %+v, want can_decide_own_pr kept for the built-in senders only", v.Accepts)
+	}
+	accepts, _ := body["accepts"].([]any)
+	if len(accepts) != 3 {
+		t.Fatalf("accepts = %v", accepts)
+	}
+	for i, want := range []any{true, true, false} {
+		if entry, _ := accepts[i].(map[string]any); entry["can_decide_own_pr"] != want {
+			t.Errorf("accepts[%d] = %v, want can_decide_own_pr %v answered", i, entry, want)
+		}
+	}
+
+	// false is taken anywhere: without can_decide, and for a sender in the
+	// ledger.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "ledger", "accepts": []any{
+		map[string]any{"sender": "autopilot-mcp", "kinds": []string{"review-pr"}, "can_decide_own_pr": false},
+		map[string]any{"sender": "tracker", "kinds": []string{"research"}, "can_decide_own_pr": false},
+	}})
+	expect(t, "can_decide_own_pr false", st, http.StatusCreated, body)
+
+	off := map[string]any{"sender": "autopilot-mcp", "kinds": []string{"review-pr"}, "can_decide": true}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "payroll", "accepts": []any{on("autopilot-mcp"), off}})
+	expect(t, "two entries for one sender, apart in can_decide_own_pr", st, http.StatusUnprocessableEntity, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "payroll", "accepts": []any{on("autopilot-mcp"), on("autopilot-mcp")}})
+	expect(t, "one entry sent twice exactly", st, http.StatusCreated, body)
+}
+
 func TestDevelopers_LowercaseASCIIOnly(t *testing.T) {
 	s := New(t)
 	for _, bad := range []string{
@@ -708,18 +772,18 @@ func TestGitHubLogins_Rules(t *testing.T) {
 	expect(t, "a change that sends neither", st, http.StatusOK, body)
 }
 
-// Reviews started from GitHub only comment: no app may let autopilot-github
-// decide, and no sender in the ledger may take its name.
-func TestGitHubSender_NeverDecides(t *testing.T) {
+// An app may let reviews started from GitHub decide, as it may the MCP's,
+// and no sender in the ledger may take autopilot-github's name.
+func TestGitHubSender_MayDecide(t *testing.T) {
 	s := New(t)
 	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{
 		map[string]any{"sender": "autopilot-github", "kinds": []string{"review-pr"}, "can_decide": true},
 	}})
-	expect(t, "can_decide for autopilot-github", st, http.StatusUnprocessableEntity, body)
-	if body["field"] != "/accepts/0/can_decide" {
-		t.Errorf("field = %v", body["field"])
+	expect(t, "can_decide for autopilot-github", st, http.StatusCreated, body)
+	if v, _ := s.App("billing"); len(v.Accepts) != 1 || !v.Accepts[0].CanDecide {
+		t.Errorf("accepts = %+v, want can_decide kept", v.Accepts)
 	}
-	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "payroll", "accepts": []any{
 		map[string]any{"sender": "autopilot-github", "kinds": []string{"review-pr"}},
 	}})
 	expect(t, "autopilot-github for review-pr", st, http.StatusCreated, body)

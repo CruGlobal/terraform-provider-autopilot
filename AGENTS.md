@@ -116,11 +116,15 @@ the examples, and the generated docs. Things worth knowing:
   characters) with one of its `developers`. AutoPilot refuses a write that
   sends `developers` or `github_logins` and leaves a pair whose developer
   isn't in `developers`, so the plan checks that (`validateGitHubLogins`),
-  and a change to both goes out in one `PATCH`. It also refuses
-  `can_decide = true` on an `accepts` entry for `autopilot-github`, the
-  sender built in for reviews started from GitHub (`acceptsValidator`).
-  `developers` and each pair's `developer` are checked with AutoPilot's own
-  email rule, step for step (`validEmail`, in the provider and the fake).
+  and a change to both goes out in one `PATCH`. `developers` and each
+  pair's `developer` are checked with AutoPilot's own email rule, step for
+  step (`validEmail`, in the provider and the fake).
+- An `accepts` entry's `can_decide_own_pr` lets a deciding review decide on
+  a pull request that may be the asker's own. AutoPilot takes it only with
+  `can_decide = true`, and only for the senders built into it,
+  `autopilot-mcp` and `autopilot-github`, whose reviews run for a person
+  (`builtInSenders`, checked by `acceptsValidator`). Like `can_auto_merge`,
+  it is optional with no default and sent only when true.
 - A sender's secrets are write-only (`*_wo`). The plan compares
   `client.Fingerprint` of the configured secrets with the stored
   fingerprints; see the comment at the top of `sender_resource.go`.

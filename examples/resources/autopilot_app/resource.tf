@@ -26,10 +26,14 @@ resource "autopilot_app" "billing" {
       kinds  = ["fix-error"]
     },
     {
-      # Pull request reviews the developers start from GitHub. They only
-      # comment, so this entry can't set can_decide.
+      # Pull request reviews the developers start from GitHub.
       sender = "autopilot-github"
       kinds  = ["review-pr"]
+      # Let them approve or request changes. On a pull request that may be
+      # the asker's own they still only comment, unless can_decide_own_pr
+      # is set to true as well. That check goes by the pull request's author
+      # alone, so read can_decide's caveats before turning this on.
+      can_decide = true
     },
   ]
 

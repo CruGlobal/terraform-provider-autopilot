@@ -52,17 +52,19 @@ type appModel struct {
 }
 
 type acceptModel struct {
-	Sender       types.String `tfsdk:"sender"`
-	Kinds        types.Set    `tfsdk:"kinds"`
-	CanDecide    types.Bool   `tfsdk:"can_decide"`
-	CanAutoMerge types.Bool   `tfsdk:"can_auto_merge"`
+	Sender         types.String `tfsdk:"sender"`
+	Kinds          types.Set    `tfsdk:"kinds"`
+	CanDecide      types.Bool   `tfsdk:"can_decide"`
+	CanAutoMerge   types.Bool   `tfsdk:"can_auto_merge"`
+	CanDecideOwnPR types.Bool   `tfsdk:"can_decide_own_pr"`
 }
 
 var acceptAttrTypes = map[string]attr.Type{
-	"sender":         types.StringType,
-	"kinds":          types.SetType{ElemType: types.StringType},
-	"can_decide":     types.BoolType,
-	"can_auto_merge": types.BoolType,
+	"sender":            types.StringType,
+	"kinds":             types.SetType{ElemType: types.StringType},
+	"can_decide":        types.BoolType,
+	"can_auto_merge":    types.BoolType,
+	"can_decide_own_pr": types.BoolType,
 }
 
 var acceptObjectType = types.ObjectType{AttrTypes: acceptAttrTypes}
@@ -160,32 +162,38 @@ func acceptsToSet(accepts []client.Accept, prior types.Set) types.Set {
 	if len(accepts) == 0 && prior.IsNull() {
 		return types.SetNull(acceptObjectType)
 	}
-	saysFalse := autoMergeSetFalse(prior)
+	autoMergeFalse := flagSetFalse(prior, "can_auto_merge")
+	ownPRFalse := flagSetFalse(prior, "can_decide_own_pr")
 	elems := make([]attr.Value, 0, len(accepts))
 	for _, a := range accepts {
-		// can_auto_merge off stays null unless prior set it to false.
-		autoMerge := types.BoolValue(a.CanAutoMerge)
-		if !a.CanAutoMerge && !saysFalse[a.Sender] {
-			autoMerge = types.BoolNull()
-		}
 		elems = append(elems, types.ObjectValueMust(acceptAttrTypes, map[string]attr.Value{
-			"sender":         types.StringValue(a.Sender),
-			"kinds":          setFromStrings(a.Kinds),
-			"can_decide":     types.BoolValue(a.CanDecide),
-			"can_auto_merge": autoMerge,
+			"sender":            types.StringValue(a.Sender),
+			"kinds":             setFromStrings(a.Kinds),
+			"can_decide":        types.BoolValue(a.CanDecide),
+			"can_auto_merge":    optionalFlag(a.CanAutoMerge, autoMergeFalse[a.Sender]),
+			"can_decide_own_pr": optionalFlag(a.CanDecideOwnPR, ownPRFalse[a.Sender]),
 		}))
 	}
 	return types.SetValueMust(acceptObjectType, elems)
 }
 
-// autoMergeSetFalse names the senders whose entry in prior (the plan, or the
-// state) sets can_auto_merge to false. That attribute is optional and has no
-// default, so off is null unless the configuration says false. A second
-// default in a set's element would be wrong: the framework finds an
-// element's configuration by the element's whole value, which a computed
-// value taken from the state changes, and then it would apply can_decide's
-// default over a can_decide the configuration sets.
-func autoMergeSetFalse(prior types.Set) map[string]bool {
+// optionalFlag maps an optional flag with no default: off stays null unless
+// prior set it to false.
+func optionalFlag(on, priorSaysFalse bool) types.Bool {
+	if !on && !priorSaysFalse {
+		return types.BoolNull()
+	}
+	return types.BoolValue(on)
+}
+
+// flagSetFalse names the senders whose entry in prior (the plan, or the
+// state) sets the flag name to false. can_auto_merge and can_decide_own_pr
+// are optional and have no default, so off is null unless the configuration
+// says false. A second default in a set's element would be wrong: the
+// framework finds an element's configuration by the element's whole value,
+// which a computed value taken from the state changes, and then it would
+// apply can_decide's default over a can_decide the configuration sets.
+func flagSetFalse(prior types.Set, name string) map[string]bool {
 	out := map[string]bool{}
 	if prior.IsNull() || prior.IsUnknown() {
 		return out
@@ -196,7 +204,7 @@ func autoMergeSetFalse(prior types.Set) map[string]bool {
 			continue
 		}
 		sender, _ := obj.Attributes()["sender"].(types.String)
-		flag, _ := obj.Attributes()["can_auto_merge"].(types.Bool)
+		flag, _ := obj.Attributes()[name].(types.Bool)
 		if known(sender) && !flag.IsNull() && !flag.IsUnknown() && !flag.ValueBool() {
 			out[sender.ValueString()] = true
 		}
@@ -263,10 +271,11 @@ func acceptsFromSet(ctx context.Context, set types.Set, diags *diag.Diagnostics)
 	out := make([]client.Accept, 0, len(models))
 	for _, m := range models {
 		out = append(out, client.Accept{
-			Sender:       m.Sender.ValueString(),
-			Kinds:        stringsFromSet(ctx, m.Kinds, "accepts", diags),
-			CanDecide:    m.CanDecide.ValueBool(),
-			CanAutoMerge: m.CanAutoMerge.ValueBool(),
+			Sender:         m.Sender.ValueString(),
+			Kinds:          stringsFromSet(ctx, m.Kinds, "accepts", diags),
+			CanDecide:      m.CanDecide.ValueBool(),
+			CanAutoMerge:   m.CanAutoMerge.ValueBool(),
+			CanDecideOwnPR: m.CanDecideOwnPR.ValueBool(),
 		})
 	}
 	return out
@@ -353,7 +362,15 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 						"can_decide": schema.BoolAttribute{
 							MarkdownDescription: "Whether that sender's `review-pr` tasks may approve or request changes on " +
 								"this app's repositories, which can count as a required review. Only with `review-pr` in " +
-								"`kinds`, and never for `autopilot-github`, whose reviews only comment. Defaults to `false`.",
+								"`kinds`. For `autopilot-mcp` and `autopilot-github`, whose reviews run for the person who " +
+								"asked, a review of a pull request that may be that person's own only comments, unless " +
+								"`can_decide_own_pr` is set too. That check goes by the pull request's author alone, so it " +
+								"doesn't stop a developer who pushes their own commits onto someone else's pull request, or " +
+								"a bot's, and then asks: the review may approve their code. GitHub's \"require approval of " +
+								"the most recent reviewable push\" doesn't stop that either, since AutoPilot isn't the pusher, " +
+								"and GitHub keeps an approval through later pushes unless the branch dismisses stale " +
+								"approvals. On a repository where one approval alone lets a pull request merge, keep that in " +
+								"mind before turning this on. Defaults to `false`.",
 							Optional: true,
 							Computed: true,
 							Default:  booldefault.StaticBool(false),
@@ -368,6 +385,26 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 								"same as `false`. Turning it off, or removing the entry or the app, leaves auto-merge on " +
 								"for a pull request that already has it, and GitHub still merges that pull request: turn " +
 								"auto-merge off on the pull request in GitHub.",
+							Optional: true,
+						},
+						"can_decide_own_pr": schema.BoolAttribute{
+							MarkdownDescription: "Whether, with `can_decide`, a review that sender makes for a person may " +
+								"also approve or request changes on a pull request that may be that person's own. Off, such " +
+								"a review only comments. Only for `autopilot-mcp` and `autopilot-github`, whose reviews run " +
+								"for a person (the one who asked on AutoPilot's MCP server, or the developer who asked on " +
+								"GitHub, with the label or the command), and only with `can_decide = true`. A pull request may be " +
+								"the asker's own when its author is a GitHub login that `github_logins` pairs with them, " +
+								"compared without regard to case, or when AutoPilot can't tell: GitHub names no author, or " +
+								"`github_logins` pairs no login with them. So with this off, a review decides only for an " +
+								"asker who has a login in `github_logins`, and only on a pull request whose author isn't one " +
+								"of their logins there. An author no login is paired with reads as someone else's, even when " +
+								"it is another account of the asker's, so pair every login a developer uses. It goes by the " +
+								"author alone, which leaves open what `can_decide` describes: commits pushed onto someone " +
+								"else's pull request. Turning it on lets a developer get an approval of their own pull " +
+								"request that can count as a required review, so set it only where that is acceptable. Off " +
+								"unless set: leaving it out is the same as `false`. When it is turned off, a deciding review " +
+								"of what may be the asker's own pull request that is still queued or running is refused or " +
+								"stopped; ask for the review again.",
 							Optional: true,
 						},
 					},
@@ -394,10 +431,14 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					"login runs in that developer's name. This decides who can start reviews in a developer's name, so " +
 					"review each pair as you would `developers`. Every `developer` here must also be in `developers`, so " +
 					"take someone's logins out in the same change that takes them out of `developers`. A developer may " +
-					"have more than one login, and each login belongs to one developer. At most 100. Keep it up to date " +
-					"when someone renames their GitHub account: the old login no longer matches them, and someone else " +
-					"may take it. Reviews from GitHub also need the app to accept the `autopilot-github` sender for " +
-					"`review-pr`.",
+					"have more than one login, and each login belongs to one developer. At most 100. It also decides " +
+					"which pull requests count as a developer's own, for reviews from the MCP and from GitHub alike " +
+					"(`can_decide_own_pr`): one whose author isn't among a developer's logins here reads as someone " +
+					"else's, unless that developer has no login here at all. So a missing, wrong or stale pair can let " +
+					"a review approve someone's own work: pair every login a developer uses. Keep it up to date when " +
+					"someone renames their GitHub account: the old login no longer matches them, their pull requests " +
+					"under the new login read as someone else's, and someone else may take the old login. Reviews from " +
+					"GitHub also need the app to accept the `autopilot-github` sender for `review-pr`.",
 				Optional: true,
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{

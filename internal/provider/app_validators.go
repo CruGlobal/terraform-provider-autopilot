@@ -29,10 +29,12 @@ var (
 	gitHubLoginPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,38}$`)
 )
 
-// gitHubSender is the sender built into AutoPilot for pull request reviews
-// started from GitHub. Those reviews only comment, so AutoPilot refuses
-// can_decide for it.
-const gitHubSender = "autopilot-github"
+// builtInSenders are the senders built into AutoPilot, whose reviews run for
+// a person: autopilot-mcp, for the one who asked on AutoPilot's MCP server,
+// and autopilot-github, for the developer who started a pull request review
+// from GitHub. Only their entries may set can_decide_own_pr, since only for
+// them can AutoPilot tell whether a pull request may be the asker's own.
+var builtInSenders = []string{"autopilot-mcp", "autopilot-github"}
 
 // validEmail is AutoPilot's own rule for a developer's login, an email
 // address in lowercase ASCII, step for step: at most 254 characters; a local
@@ -180,9 +182,9 @@ func (gitHubLoginsValidator) ValidateSet(ctx context.Context, req validator.SetR
 }
 
 // acceptsValidator checks the rules that span an accepts entry or the whole
-// set: each sender at most once, can_decide only with review-pr and never for
-// autopilot-github, and can_auto_merge only with a kind that opens a pull
-// request.
+// set: each sender at most once, can_decide only with review-pr,
+// can_decide_own_pr only with can_decide and only for a sender built into
+// AutoPilot, and can_auto_merge only with a kind that opens a pull request.
 type acceptsValidator struct{}
 
 // pullRequestKinds are the kinds whose tasks open a pull request, the only
@@ -190,8 +192,9 @@ type acceptsValidator struct{}
 var pullRequestKinds = []string{"implement-work-item", "fix-error"}
 
 func (acceptsValidator) Description(context.Context) string {
-	return "each sender at most once; can_decide only with review-pr in kinds, and never for autopilot-github; " +
-		"can_auto_merge only with implement-work-item or fix-error in kinds"
+	return "each sender at most once; can_decide only with review-pr in kinds; can_decide_own_pr only with " +
+		"can_decide, and only for autopilot-mcp and autopilot-github; can_auto_merge only with implement-work-item " +
+		"or fix-error in kinds"
 }
 
 func (v acceptsValidator) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
@@ -224,10 +227,17 @@ func (acceptsValidator) ValidateSet(ctx context.Context, req validator.SetReques
 				fmt.Sprintf("The entry for %q sets can_decide, which only applies to review-pr tasks, but its kinds "+
 					"don't include review-pr. Add review-pr to its kinds, or leave can_decide out.", m.Sender.ValueString()))
 		}
-		if isTrue(m.CanDecide) && known(m.Sender) && m.Sender.ValueString() == gitHubSender {
-			resp.Diagnostics.AddAttributeError(req.Path, "can_decide for autopilot-github",
-				"The entry for \"autopilot-github\" sets can_decide = true. Reviews started from GitHub only comment, "+
-					"so AutoPilot refuses to let them approve or request changes. Leave can_decide out of that entry.")
+		// can_decide left out is false (its default); one not known yet waits.
+		if isTrue(m.CanDecideOwnPR) && !m.CanDecide.IsUnknown() && !m.CanDecide.ValueBool() {
+			resp.Diagnostics.AddAttributeError(req.Path, "can_decide_own_pr without can_decide",
+				fmt.Sprintf("The entry for %q sets can_decide_own_pr, which only widens can_decide, but can_decide "+
+					"isn't true. Set can_decide = true too, or leave can_decide_own_pr out.", m.Sender.ValueString()))
+		}
+		if isTrue(m.CanDecideOwnPR) && known(m.Sender) && !slices.Contains(builtInSenders, m.Sender.ValueString()) {
+			resp.Diagnostics.AddAttributeError(req.Path, "can_decide_own_pr for a sender not built in",
+				fmt.Sprintf("The entry for %q sets can_decide_own_pr, which AutoPilot takes only for autopilot-mcp "+
+					"and autopilot-github, whose reviews run for a person. Leave can_decide_own_pr out of that entry.",
+					m.Sender.ValueString()))
 		}
 		if isTrue(m.CanAutoMerge) && lacksKind(m.Kinds, pullRequestKinds...) {
 			resp.Diagnostics.AddAttributeError(req.Path, "can_auto_merge without a pull request kind",

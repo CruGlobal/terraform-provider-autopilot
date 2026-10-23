@@ -26,7 +26,7 @@ var (
 	maxGitHubLogins    = 100
 	appWritable        = []string{"repos", "accepts", "developers", "github_logins", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory"}
 	appReadOnly        = []string{"lock_version", "created_at", "updated_at"}
-	acceptWritable     = []string{"sender", "kinds", "can_decide", "can_auto_merge"}
+	acceptWritable     = []string{"sender", "kinds", "can_decide", "can_auto_merge", "can_decide_own_pr"}
 	appCreateFields    = append([]string{"name"}, appWritable...)
 	// An app's credential policy: what its tasks run on, and with
 	// seat_first, what they do when every seat is full.
@@ -59,9 +59,10 @@ func gigabytes(from, to int64) []int64 {
 // ones auto-merge applies to.
 var pullRequestKinds = []string{"implement-work-item", "fix-error"}
 
-// gitHubSender is the sender built into AutoPilot for reviews started from
-// GitHub. Its reviews only comment, so no app may let it decide.
-const gitHubSender = "autopilot-github"
+// builtInSenders are the senders built into AutoPilot, the MCP's and
+// GitHub's, whose reviews run for a person. Only their entries may set
+// can_decide_own_pr.
+var builtInSenders = []string{"autopilot-mcp", "autopilot-github"}
 
 // GitHubLogin is one developer's GitHub login.
 type GitHubLogin struct {
@@ -108,10 +109,11 @@ func unmappedLogin(logins []GitHubLogin, developers []string) *GitHubLogin {
 
 // Accept is one sender an app accepts work from.
 type Accept struct {
-	Sender       string
-	Kinds        []string
-	CanDecide    bool
-	CanAutoMerge bool
+	Sender         string
+	Kinds          []string
+	CanDecide      bool
+	CanAutoMerge   bool
+	CanDecideOwnPR bool
 }
 
 // appRecord is an app as the fake stores it. An empty credential or
@@ -161,7 +163,10 @@ func (rec *appRecord) view() AppView {
 func cloneAccepts(in []Accept) []Accept {
 	out := make([]Accept, 0, len(in))
 	for _, a := range in {
-		out = append(out, Accept{Sender: a.Sender, Kinds: slices.Clone(a.Kinds), CanDecide: a.CanDecide, CanAutoMerge: a.CanAutoMerge})
+		out = append(out, Accept{
+			Sender: a.Sender, Kinds: slices.Clone(a.Kinds),
+			CanDecide: a.CanDecide, CanAutoMerge: a.CanAutoMerge, CanDecideOwnPR: a.CanDecideOwnPR,
+		})
 	}
 	return out
 }
@@ -184,7 +189,7 @@ func acceptsEqual(x, y []Accept) bool {
 // sameAccept reports whether two entries, kinds sorted, are exactly equal.
 func sameAccept(a, b Accept) bool {
 	return a.Sender == b.Sender && a.CanDecide == b.CanDecide && a.CanAutoMerge == b.CanAutoMerge &&
-		slices.Equal(a.Kinds, b.Kinds)
+		a.CanDecideOwnPR == b.CanDecideOwnPR && slices.Equal(a.Kinds, b.Kinds)
 }
 
 func (rec *appRecord) json() map[string]any {
@@ -192,6 +197,7 @@ func (rec *appRecord) json() map[string]any {
 	for _, a := range sortAccepts(rec.accepts) {
 		accepts = append(accepts, map[string]any{
 			"sender": a.Sender, "kinds": a.Kinds, "can_decide": a.CanDecide, "can_auto_merge": a.CanAutoMerge,
+			"can_decide_own_pr": a.CanDecideOwnPR,
 		})
 	}
 	logins := make([]any, 0, len(rec.githubLogins))
@@ -445,29 +451,36 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 					return f, invalid(at+"/kinds/"+itoa(j), "AutoPilot doesn't know this kind")
 				}
 			}
-			canDecide := false
-			if rawDecide, ok := e["can_decide"]; ok {
-				if canDecide, ref = boolValue(rawDecide, at+"/can_decide"); ref != nil {
-					return f, ref
+			// Each flag is false unless sent, and must be true or false when
+			// sent: null is refused.
+			flags := map[string]bool{}
+			for _, name := range []string{"can_decide", "can_auto_merge", "can_decide_own_pr"} {
+				if raw, ok := e[name]; ok {
+					if flags[name], ref = boolValue(raw, at+"/"+name); ref != nil {
+						return f, ref
+					}
 				}
 			}
+			canDecide, canAutoMerge, canDecideOwnPR := flags["can_decide"], flags["can_auto_merge"], flags["can_decide_own_pr"]
 			if canDecide && !slices.Contains(kinds, reviewKind) {
 				return f, invalid(at+"/can_decide", "can_decide is only for an entry whose kinds include review-pr")
 			}
-			// Reviews started from GitHub only comment.
-			if canDecide && sender == gitHubSender {
-				return f, invalid(at+"/can_decide", "is false for autopilot-github: reviews started from GitHub only comment")
+			// The own pull request's toggle widens can_decide, so it needs it,
+			// and only a built-in sender's reviews run for a person.
+			if canDecideOwnPR && !canDecide {
+				return f, invalid(at+"/can_decide_own_pr", "is true only with can_decide true")
 			}
-			canAutoMerge := false
-			if rawMerge, ok := e["can_auto_merge"]; ok {
-				if canAutoMerge, ref = boolValue(rawMerge, at+"/can_auto_merge"); ref != nil {
-					return f, ref
-				}
+			if canDecideOwnPR && !slices.Contains(builtInSenders, sender) {
+				return f, invalid(at+"/can_decide_own_pr",
+					"is true only for autopilot-mcp and autopilot-github, whose reviews run for a person")
 			}
 			if canAutoMerge && !slices.ContainsFunc(kinds, func(k string) bool { return slices.Contains(pullRequestKinds, k) }) {
 				return f, invalid(at+"/can_auto_merge", "is true only with implement-work-item or fix-error in kinds")
 			}
-			entry := Accept{Sender: sender, Kinds: sortedUnique(kinds), CanDecide: canDecide, CanAutoMerge: canAutoMerge}
+			entry := Accept{
+				Sender: sender, Kinds: sortedUnique(kinds),
+				CanDecide: canDecide, CanAutoMerge: canAutoMerge, CanDecideOwnPR: canDecideOwnPR,
+			}
 			// An entry sent twice exactly is kept once; two different entries
 			// for one sender are refused.
 			if prior, dup := seen[sender]; dup {
