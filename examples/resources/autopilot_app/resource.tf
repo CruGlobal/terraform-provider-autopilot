@@ -34,6 +34,10 @@ resource "autopilot_app" "billing" {
       # is set to true as well. That check goes by the pull request's author
       # alone, so read can_decide's caveats before turning this on.
       can_decide = true
+      # Approve only pull requests rated low risk. An approval of one rated
+      # medium or high, or one it couldn't rate, is posted as a comment
+      # instead, saying why. Requests for changes aren't limited.
+      approve_up_to = "low"
     },
   ]
 

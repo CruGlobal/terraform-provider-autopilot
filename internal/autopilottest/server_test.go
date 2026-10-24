@@ -221,6 +221,75 @@ func TestAccepts_CanDecideOwnPR(t *testing.T) {
 	expect(t, "one entry sent twice exactly", st, http.StatusCreated, body)
 }
 
+// approve_up_to is low, medium, high or null, set only with can_decide true,
+// for any sender; it is kept and answered, null when there is none; and two
+// entries for one sender that differ only in it are refused.
+func TestAccepts_ApproveUpTo(t *testing.T) {
+	s := New(t)
+	refused := []struct {
+		name  string
+		entry map[string]any
+	}{
+		{"without can_decide", map[string]any{"sender": "autopilot-github", "kinds": []string{"review-pr"}, "approve_up_to": "low"}},
+		{"with can_decide false", map[string]any{"sender": "tracker", "kinds": []string{"review-pr"},
+			"can_decide": false, "approve_up_to": "high"}},
+		{"not a level", map[string]any{"sender": "autopilot-github", "kinds": []string{"review-pr"},
+			"can_decide": true, "approve_up_to": "none"}},
+		{"in another case", map[string]any{"sender": "autopilot-github", "kinds": []string{"review-pr"},
+			"can_decide": true, "approve_up_to": "Low"}},
+		{"not a string", map[string]any{"sender": "autopilot-github", "kinds": []string{"review-pr"},
+			"can_decide": true, "approve_up_to": 1}},
+	}
+	for _, c := range refused {
+		st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{c.entry}})
+		expect(t, "approve_up_to "+c.name, st, http.StatusUnprocessableEntity, body)
+		if body["field"] != "/accepts/0/approve_up_to" {
+			t.Errorf("%s: field = %v", c.name, body["field"])
+		}
+	}
+
+	capped := func(sender, ceiling string) map[string]any {
+		return map[string]any{"sender": sender, "kinds": []string{"review-pr"}, "can_decide": true, "approve_up_to": ceiling}
+	}
+	plain := map[string]any{"sender": "monitor", "kinds": []string{"review-pr"}, "can_decide": true}
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "accepts": []any{
+		capped("autopilot-github", "low"), capped("tracker", "medium"), plain,
+	}})
+	expect(t, "approve_up_to for any deciding sender", st, http.StatusCreated, body)
+	v, _ := s.App("billing")
+	if len(v.Accepts) != 3 || v.Accepts[0].ApproveUpTo != "low" || v.Accepts[1].ApproveUpTo != "" || v.Accepts[2].ApproveUpTo != "medium" {
+		t.Errorf("accepts = %+v, want each ceiling kept", v.Accepts)
+	}
+	accepts, _ := body["accepts"].([]any)
+	if len(accepts) != 3 {
+		t.Fatalf("accepts = %v", accepts)
+	}
+	for i, want := range []any{"low", nil, "medium"} {
+		if entry, _ := accepts[i].(map[string]any); entry["approve_up_to"] != want {
+			t.Errorf("accepts[%d] = %v, want approve_up_to %v answered", i, entry, want)
+		}
+	}
+
+	// null is no ceiling, taken anywhere, even without can_decide.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "ledger", "accepts": []any{
+		map[string]any{"sender": "autopilot-mcp", "kinds": []string{"review-pr"}, "approve_up_to": nil},
+		map[string]any{"sender": "tracker", "kinds": []string{"research"}, "approve_up_to": nil},
+	}})
+	expect(t, "approve_up_to null", st, http.StatusCreated, body)
+
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "payroll", "accepts": []any{
+		capped("autopilot-mcp", "low"), capped("autopilot-mcp", "high"),
+	}})
+	expect(t, "two entries for one sender, apart in approve_up_to", st, http.StatusUnprocessableEntity, body)
+	if body["field"] != "/accepts/1/sender" {
+		t.Errorf("two entries for one sender: field = %v", body["field"])
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "payroll", "accepts": []any{
+		capped("autopilot-mcp", "low"), capped("autopilot-mcp", "low"),
+	}})
+	expect(t, "one entry sent twice exactly", st, http.StatusCreated, body)
+}
+
 func TestDevelopers_LowercaseASCIIOnly(t *testing.T) {
 	s := New(t)
 	for _, bad := range []string{
