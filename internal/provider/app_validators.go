@@ -184,7 +184,8 @@ func (gitHubLoginsValidator) ValidateSet(ctx context.Context, req validator.SetR
 // acceptsValidator checks the rules that span an accepts entry or the whole
 // set: each sender at most once, can_decide only with review-pr,
 // can_decide_own_pr only with can_decide and only for a sender built into
-// AutoPilot, and can_auto_merge only with a kind that opens a pull request.
+// AutoPilot, approve_up_to only with can_decide, and can_auto_merge only
+// with a kind that opens a pull request.
 type acceptsValidator struct{}
 
 // pullRequestKinds are the kinds whose tasks open a pull request, the only
@@ -193,8 +194,8 @@ var pullRequestKinds = []string{"implement-work-item", "fix-error"}
 
 func (acceptsValidator) Description(context.Context) string {
 	return "each sender at most once; can_decide only with review-pr in kinds; can_decide_own_pr only with " +
-		"can_decide, and only for autopilot-mcp and autopilot-github; can_auto_merge only with implement-work-item " +
-		"or fix-error in kinds"
+		"can_decide, and only for autopilot-mcp and autopilot-github; approve_up_to only with can_decide; " +
+		"can_auto_merge only with implement-work-item or fix-error in kinds"
 }
 
 func (v acceptsValidator) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
@@ -238,6 +239,13 @@ func (acceptsValidator) ValidateSet(ctx context.Context, req validator.SetReques
 				fmt.Sprintf("The entry for %q sets can_decide_own_pr, which AutoPilot takes only for autopilot-mcp "+
 					"and autopilot-github, whose reviews run for a person. Leave can_decide_own_pr out of that entry.",
 					m.Sender.ValueString()))
+		}
+		// The ceiling narrows can_decide, so it needs it, as AutoPilot says.
+		if known(m.ApproveUpTo) && !m.CanDecide.IsUnknown() && !m.CanDecide.ValueBool() {
+			resp.Diagnostics.AddAttributeError(req.Path, "approve_up_to without can_decide",
+				fmt.Sprintf("The entry for %q sets approve_up_to, the most risk its reviews may approve, but "+
+					"can_decide isn't true, so its reviews approve nothing. Set can_decide = true too, or leave "+
+					"approve_up_to out.", m.Sender.ValueString()))
 		}
 		if isTrue(m.CanAutoMerge) && lacksKind(m.Kinds, pullRequestKinds...) {
 			resp.Diagnostics.AddAttributeError(req.Path, "can_auto_merge without a pull request kind",

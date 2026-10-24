@@ -125,6 +125,12 @@ the examples, and the generated docs. Things worth knowing:
   `autopilot-mcp` and `autopilot-github`, whose reviews run for a person
   (`builtInSenders`, checked by `acceptsValidator`). Like `can_auto_merge`,
   it is optional with no default and sent only when true.
+- An `accepts` entry's `approve_up_to` is, with `can_decide`, the most risk
+  a pull request may carry for that sender's reviews to approve it: `low`,
+  `medium` or `high`. AutoPilot takes it only with `can_decide = true`, for
+  any sender (checked by `acceptsValidator`), and answers `null` for none.
+  It is optional with no default, read back as null when AutoPilot has none,
+  and sent only when set.
 - A sender's secrets are write-only (`*_wo`). The plan compares
   `client.Fingerprint` of the configured secrets with the stored
   fingerprints; see the comment at the top of `sender_resource.go`.
