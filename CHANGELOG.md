@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.3.1...v0.4.0) (2026-10-26)
+
+
+### Added
+
+* **app:** add approve_up_to to accepts entries, a ceiling on what reviews may approve ([#16](https://github.com/CruGlobal/terraform-provider-autopilot/issues/16)) ([bc06576](https://github.com/CruGlobal/terraform-provider-autopilot/commit/bc06576c931474afcc1230a7eb0b947229d5c98c))
+* **app:** allow worker_image = "ruby-browser", the opt-in image for Rails system tests ([#17](https://github.com/CruGlobal/terraform-provider-autopilot/issues/17)) ([f4a5d62](https://github.com/CruGlobal/terraform-provider-autopilot/commit/f4a5d6203fdbc99d3bd5d7caeec44892155ccae7))
+* **app:** let reviews from GitHub decide, and add can_decide_own_pr to accepts entries ([#14](https://github.com/CruGlobal/terraform-provider-autopilot/issues/14)) ([f5e0890](https://github.com/CruGlobal/terraform-provider-autopilot/commit/f5e08908335e6af1192e4acf49d5252cb8e1f885))
+
 ## [0.3.1](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.3.0...v0.3.1) (2026-10-22)
 
 
