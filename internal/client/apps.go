@@ -25,8 +25,8 @@ type App struct {
 	// WhenSeatsFull is "wait" or "fall_back" with seat_first, and nil
 	// otherwise.
 	WhenSeatsFull *string `json:"when_seats_full"`
-	// WorkerImage is "node", "ruby", "python" or "go", or nil for node (or
-	// when the AutoPilot predates the field).
+	// WorkerImage is "node", "ruby", "ruby-browser", "python" or "go", or nil
+	// for node (or when the AutoPilot predates the field).
 	WorkerImage *string `json:"worker_image"`
 	// WorkerCPU and WorkerMemory are the size of the app's workers, in CPU
 	// units and MiB, both or neither. Nil is the worker's own size.
@@ -114,8 +114,8 @@ type AppSpec struct {
 	Developers   []string
 	GitHubLogins []GitHubLogin
 	Policy       *CredentialPolicy
-	// WorkerImage is "node", "ruby", "python" or "go", or "" to take the
-	// app back to node (sent as null).
+	// WorkerImage is "node", "ruby", "ruby-browser", "python" or "go", or ""
+	// to take the app back to node (sent as null).
 	WorkerImage *string
 	Size        *WorkerSize
 }

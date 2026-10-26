@@ -33,7 +33,7 @@ var (
 	credentials   = []string{"bedrock", "seat_first"}
 	whenSeatsFull = []string{"wait", "fall_back"}
 	// The worker images an app's tasks may run in.
-	workerImages = []string{"node", "ruby", "python", "go"}
+	workerImages = []string{"node", "ruby", "ruby-browser", "python", "go"}
 	// The risk levels a deciding review may approve up to, lowest first.
 	riskLevels = []string{"low", "medium", "high"}
 )

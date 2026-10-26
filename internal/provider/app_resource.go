@@ -520,11 +520,14 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				Validators: []validator.String{stringvalidator.OneOf("wait", "fall_back")},
 			},
 			"worker_image": schema.StringAttribute{
-				MarkdownDescription: "The worker image the tasks billed to this app run in: `node`, `ruby`, `python` or " +
-					"`go`. Each is the same worker with that language's tools; `ruby` has Node too, for Rails assets. " +
-					"Choose the app's main language. Left out, the app's tasks run in `node`, and removing it from the " +
-					"configuration takes the app back to `node`. The image is chosen when a task starts, so a change " +
-					"reaches only the tasks that start after it.",
+				MarkdownDescription: "The worker image the tasks billed to this app run in: `node`, `ruby`, " +
+					"`ruby-browser`, `python` or `go`. Each is the same worker with that language's tools; `ruby` has " +
+					"Node too, for Rails assets. Choose the app's main language. `ruby-browser` is an opt-in image for " +
+					"Rails system tests: the `ruby` image with Chromium and ChromeDriver, about 500 MB bigger, so " +
+					"choose it only for an app whose tests drive a browser. It needs an AutoPilot that has that image; " +
+					"an older AutoPilot refuses it with a 422. Left out, the app's tasks run in `node`, and removing it " +
+					"from the configuration takes the app back to `node`. The image is chosen when a task starts, so a " +
+					"change reaches only the tasks that start after it.",
 				Optional:   true,
 				Validators: []validator.String{stringvalidator.OneOf(workerImages...)},
 			},
