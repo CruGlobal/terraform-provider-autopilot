@@ -3091,3 +3091,124 @@ resource "autopilot_app" "test" {
 		}
 	}
 }
+
+// A create, a change and a removal of automatic reviews whose answers are
+// lost are each sent again and taken as the provider's own, and the state
+// ends as the configuration says.
+func TestApp_autoReviewLostAnswers(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	path := "/v1/admin/apps/" + name
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPost, "/v1/admin/apps") },
+				Config:    appConfig(env, name, `  auto_review = { can_decide = true, approve_up_to = "medium" }`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.approve_up_to", "medium"),
+					func(*terraform.State) error {
+						if n := len(env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")); n != 2 {
+							return fmt.Errorf("%d creates, want the lost one sent again", n)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPatch, path) },
+				Config:    appConfig(env, name, `  auto_review = { events = ["synchronize"] }`),
+				Check: func(*terraform.State) error {
+					v, _ := env.fake.App(name)
+					if v.AutoReview == nil || v.AutoReview.CanDecide || v.AutoReview.ApproveUpTo != "" {
+						return fmt.Errorf("auto_review = %+v, want it narrowed", v.AutoReview)
+					}
+					return nil
+				},
+			},
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPatch, path) },
+				Config:    appConfig(env, name, ``),
+				Check: func(*terraform.State) error {
+					if v, _ := env.fake.App(name); v.AutoReview != nil {
+						return fmt.Errorf("auto_review = %+v, want none", v.AutoReview)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// A whole auto_review not known until apply gets its defaults then, with no
+// inconsistent plan, and plans nothing after.
+func TestApp_autoReviewWholeObjectNotKnownYet(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	config := func(n int) string {
+		return env.providerConfig() + fmt.Sprintf(`
+resource "terraform_data" "auto" {
+  input = { max_per_day = %d }
+}
+
+resource "autopilot_app" "test" {
+  name        = %q
+  auto_review = terraform_data.auto.output
+}
+`, n, name)
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: config(5),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.max_per_day", "5"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.events.#", "2"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.can_decide", "false"),
+				),
+			},
+			{
+				Config: config(6),
+				Check:  resource.TestCheckResourceAttr(appRes, "auto_review.max_per_day", "6"),
+			},
+			{
+				Config: config(6),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// AutoPilot's defaults written out, the events in another order or
+// repeated, plan nothing against what AutoPilot keeps.
+func TestApp_autoReviewDefaultsWrittenOutPlanNothing(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, name, `  auto_review = { events = ["ready_for_review", "opened", "opened"], max_per_day = 50, can_decide = false, can_decide_own_pr = false, approve_up_to = null }`)},
+			{
+				Config: appConfig(env, name, `  auto_review = {}`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: appConfig(env, name, `  auto_review = { events = ["synchronize", "ready_for_review", "opened"] }`),
+			},
+			{
+				Config: appConfig(env, name, `  auto_review = { events = ["opened", "synchronize", "ready_for_review"] }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+	if n := len(env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)); n != 1 {
+		t.Errorf("%d changes were sent, want 1", n)
+	}
+}
