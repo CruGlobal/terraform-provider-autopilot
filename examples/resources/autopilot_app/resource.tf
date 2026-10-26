@@ -61,4 +61,20 @@ resource "autopilot_app" "billing" {
   worker_image  = "ruby"
   worker_cpu    = 4096
   worker_memory = 16384
+
+  # Review each pull request into the default branch when it is opened or
+  # marked ready, with no label, as the app's own service identity. Drafts
+  # wait until they are ready, and bots' and forks' pull requests are
+  # skipped.
+  auto_review = {
+    events      = ["opened", "ready_for_review"]
+    max_per_day = 50
+    # Let them approve pull requests rated low risk. A developer's own pull
+    # request still only gets a comment, unless can_decide_own_pr is set to
+    # true as well. With it off, they decide only once every developer's
+    # GitHub login is in github_logins: until then, any pull request may be
+    # a developer's own.
+    can_decide    = true
+    approve_up_to = "low"
+  }
 }

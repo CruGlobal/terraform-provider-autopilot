@@ -3,6 +3,7 @@ package autopilottest
 import (
 	"cmp"
 	"encoding/json"
+	"math"
 	"net/http"
 	"regexp"
 	"slices"
@@ -24,7 +25,7 @@ var (
 	maxAccepts         = 20
 	maxDevelopers      = 100
 	maxGitHubLogins    = 100
-	appWritable        = []string{"repos", "accepts", "developers", "github_logins", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory"}
+	appWritable        = []string{"repos", "accepts", "developers", "github_logins", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory", "auto_review"}
 	appReadOnly        = []string{"lock_version", "created_at", "updated_at"}
 	acceptWritable     = []string{"sender", "kinds", "can_decide", "can_auto_merge", "can_decide_own_pr", "approve_up_to"}
 	appCreateFields    = append([]string{"name"}, appWritable...)
@@ -36,7 +37,159 @@ var (
 	workerImages = []string{"node", "ruby", "ruby-browser", "python", "go"}
 	// The risk levels a deciding review may approve up to, lowest first.
 	riskLevels = []string{"low", "medium", "high"}
+	// The pull_request actions an app's automatic reviews may start on, in
+	// the order AutoPilot keeps them, and those they start on unless set.
+	autoEvents        = []string{"opened", "ready_for_review", "synchronize"}
+	defaultAutoEvents = []string{"opened", "ready_for_review"}
+	// An app's cap on its automatic reviews in 24 hours: its default, and
+	// the most it may be.
+	defaultAutoPerDay int64 = 50
+	maxAutoPerDay     int64 = 200
 )
+
+// AutoReview is an app's automatic reviews. An empty ApproveUpTo is no
+// ceiling (null).
+type AutoReview struct {
+	Events         []string
+	MaxPerDay      int64
+	CanDecide      bool
+	CanDecideOwnPR bool
+	ApproveUpTo    string
+}
+
+func cloneAutoReview(a *AutoReview) *AutoReview {
+	if a == nil {
+		return nil
+	}
+	out := *a
+	out.Events = slices.Clone(a.Events)
+	return &out
+}
+
+// storedAutoReview is automatic reviews as AutoPilot keeps what it is given
+// from outside a write (SeedApp, ChangeAppOutOfBand): the events it knows,
+// each once, in its order, and none at all with none of them; and the own
+// pull request's toggle only with can_decide.
+func storedAutoReview(a *AutoReview) *AutoReview {
+	if a == nil {
+		return nil
+	}
+	out := cloneAutoReview(a)
+	out.Events = []string{}
+	for _, e := range autoEvents {
+		if slices.Contains(a.Events, e) {
+			out.Events = append(out.Events, e)
+		}
+	}
+	if len(out.Events) == 0 {
+		return nil
+	}
+	out.CanDecideOwnPR = a.CanDecide && a.CanDecideOwnPR
+	return out
+}
+
+// plainKey is AutoPilot's rule for naming an unknown key in a refusal's
+// pointer: a plain word, at most 64 characters. Any other is pointed at
+// through the object that holds it.
+var plainKey = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+func sameAutoReview(x, y *AutoReview) bool {
+	if x == nil || y == nil {
+		return x == y
+	}
+	return slices.Equal(x.Events, y.Events) && x.MaxPerDay == y.MaxPerDay && x.CanDecide == y.CanDecide &&
+		x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo
+}
+
+// autoReviewJSON is automatic reviews as AutoPilot shows them: every field,
+// or null for none.
+func autoReviewJSON(a *AutoReview) any {
+	if a == nil {
+		return nil
+	}
+	return map[string]any{
+		"events": slices.Clone(a.Events), "max_per_day": a.MaxPerDay, "can_decide": a.CanDecide,
+		"can_decide_own_pr": a.CanDecideOwnPR, "approve_up_to": nullable(a.ApproveUpTo),
+	}
+}
+
+// readAutoReview reads auto_review as AutoPilot does: null for none, or an
+// object whose fields are read in sorted order, each left out at its
+// default; the events kept once each, in autoEvents' order; and
+// can_decide_own_pr and approve_up_to only with can_decide.
+func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
+	if string(raw) == "null" {
+		return nil, nil
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
+		return nil, invalid("/auto_review", "is an object with events, max_per_day, can_decide, can_decide_own_pr and approve_up_to, or null")
+	}
+	out := AutoReview{Events: slices.Clone(defaultAutoEvents), MaxPerDay: defaultAutoPerDay}
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, k := range keys {
+		at := "/auto_review/" + k
+		var ref *refusal
+		switch k {
+		case "events":
+			var events []json.RawMessage
+			if err := json.Unmarshal(obj[k], &events); err != nil || len(events) == 0 {
+				return nil, invalid(at, "is a list of one or more of opened, ready_for_review, synchronize")
+			}
+			sent := []string{}
+			for i, e := range events {
+				var name string
+				if err := json.Unmarshal(e, &name); err != nil || !slices.Contains(autoEvents, name) {
+					return nil, invalid(at+"/"+itoa(i), "is a list of one or more of opened, ready_for_review, synchronize")
+				}
+				sent = append(sent, name)
+			}
+			out.Events = []string{}
+			for _, name := range autoEvents {
+				if slices.Contains(sent, name) {
+					out.Events = append(out.Events, name)
+				}
+			}
+		case "max_per_day":
+			var n *float64
+			if err := json.Unmarshal(obj[k], &n); err != nil || n == nil || *n != math.Trunc(*n) ||
+				*n < 1 || *n > float64(maxAutoPerDay) {
+				return nil, invalid(at, "is a whole number from 1 to 200: the most automatic reviews in 24 hours")
+			}
+			out.MaxPerDay = int64(*n)
+		case "can_decide":
+			if out.CanDecide, ref = boolValue(obj[k], at); ref != nil {
+				return nil, ref
+			}
+		case "can_decide_own_pr":
+			if out.CanDecideOwnPR, ref = boolValue(obj[k], at); ref != nil {
+				return nil, ref
+			}
+		case "approve_up_to":
+			if out.ApproveUpTo, ref = oneOrNull(obj[k], at, riskLevels); ref != nil {
+				return nil, ref
+			}
+		default:
+			if !plainKey.MatchString(k) {
+				at = "/auto_review"
+			}
+			return nil, &refusal{http.StatusUnprocessableEntity, "invalid_attribute", "AutoPilot doesn't know this field", at}
+		}
+	}
+	// The own pull request's toggle and the ceiling each narrow can_decide,
+	// so each needs it.
+	if out.CanDecideOwnPR && !out.CanDecide {
+		return nil, invalid("/auto_review/can_decide_own_pr", "is true only with can_decide true")
+	}
+	if out.ApproveUpTo != "" && !out.CanDecide {
+		return nil, invalid("/auto_review/approve_up_to", "is set only with can_decide true")
+	}
+	return &out, nil
+}
 
 // workerMemory is the memory, in MiB, that Fargate allows with each CPU size
 // an app's workers may have: at most 4 vCPU and 16 GB.
@@ -134,6 +287,7 @@ type appRecord struct {
 	credential, whenSeatsFull string
 	workerImage               string
 	workerCPU, workerMemory   int64
+	autoReview                *AutoReview
 	lockVersion               int64
 	createdAt, updatedAt      time.Time
 }
@@ -152,7 +306,9 @@ type AppView struct {
 	WorkerImage   string
 	WorkerCPU     int64
 	WorkerMemory  int64
-	LockVersion   int64
+	// AutoReview is nil when the app has no automatic reviews.
+	AutoReview  *AutoReview
+	LockVersion int64
 }
 
 func (rec *appRecord) view() AppView {
@@ -161,6 +317,7 @@ func (rec *appRecord) view() AppView {
 		Developers: slices.Clone(rec.developers), GitHubLogins: slices.Clone(rec.githubLogins),
 		Credential: rec.credential, WhenSeatsFull: rec.whenSeatsFull,
 		WorkerImage: rec.workerImage, WorkerCPU: rec.workerCPU, WorkerMemory: rec.workerMemory,
+		AutoReview:  cloneAutoReview(rec.autoReview),
 		LockVersion: rec.lockVersion,
 	}
 }
@@ -221,6 +378,7 @@ func (rec *appRecord) json() map[string]any {
 		"worker_image":    nullable(rec.workerImage),
 		"worker_cpu":      nullableInt(rec.workerCPU),
 		"worker_memory":   nullableInt(rec.workerMemory),
+		"auto_review":     autoReviewJSON(rec.autoReview),
 		"lock_version":    rec.lockVersion,
 		"created_at":      timestamp(rec.createdAt),
 		"updated_at":      timestamp(rec.updatedAt),
@@ -255,6 +413,7 @@ func (s *Server) SeedApp(v AppView) {
 		developers: sortedUnique(v.Developers), githubLogins: sortLogins(v.GitHubLogins),
 		credential: v.Credential, whenSeatsFull: v.WhenSeatsFull,
 		workerImage: v.WorkerImage, workerCPU: v.WorkerCPU, workerMemory: v.WorkerMemory,
+		autoReview:  storedAutoReview(v.AutoReview),
 		lockVersion: 1, createdAt: now, updatedAt: now,
 	}
 }
@@ -285,6 +444,7 @@ func (s *Server) ChangeAppOutOfBand(name string, change func(v *AppView)) {
 	rec.githubLogins = sortLogins(v.GitHubLogins)
 	rec.credential, rec.whenSeatsFull = v.Credential, v.WhenSeatsFull
 	rec.workerImage, rec.workerCPU, rec.workerMemory = v.WorkerImage, v.WorkerCPU, v.WorkerMemory
+	rec.autoReview = storedAutoReview(v.AutoReview)
 	rec.lockVersion++
 	rec.updatedAt = time.Now()
 }
@@ -384,6 +544,10 @@ type appFields struct {
 	workerImage               string
 	sizeSent                  bool
 	workerCPU, workerMemory   int64
+	// autoSent says the body sent auto_review, whole; autoReview is nil for
+	// null.
+	autoSent   bool
+	autoReview *AutoReview
 }
 
 func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
@@ -512,6 +676,15 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 			f.accepts = append(f.accepts, entry)
 		}
 		f.accepts = sortAccepts(f.accepts)
+	}
+	// Read right after accepts, as AutoPilot reads an app's fields in sorted
+	// order. (This fake still reads repos first, as before.)
+	if raw, ok := obj["auto_review"]; ok {
+		auto, ref := readAutoReview(raw)
+		if ref != nil {
+			return f, ref
+		}
+		f.autoSent, f.autoReview = true, auto
 	}
 	if raw, ok := obj["developers"]; ok {
 		devs, ref := stringList(raw, "/developers")
@@ -707,7 +880,8 @@ func (rec *appRecord) holds(f appFields) bool {
 		(f.githubLogins == nil || slices.Equal(f.githubLogins, rec.githubLogins)) &&
 		(!f.policySent || (f.credential == rec.credential && f.whenSeatsFull == rec.whenSeatsFull)) &&
 		(!f.imageSent || f.workerImage == rec.workerImage) &&
-		(!f.sizeSent || (f.workerCPU == rec.workerCPU && f.workerMemory == rec.workerMemory))
+		(!f.sizeSent || (f.workerCPU == rec.workerCPU && f.workerMemory == rec.workerMemory)) &&
+		(!f.autoSent || sameAutoReview(f.autoReview, rec.autoReview))
 }
 
 // repoOwner names the app other than except that owns repo, matched without
@@ -778,7 +952,8 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 		same := slices.Equal(existing.repos, repos) && acceptsEqual(existing.accepts, accepts) && slices.Equal(existing.developers, devs) &&
 			slices.Equal(existing.githubLogins, logins) &&
 			existing.credential == f.credential && existing.whenSeatsFull == f.whenSeatsFull &&
-			existing.workerImage == f.workerImage && existing.workerCPU == f.workerCPU && existing.workerMemory == f.workerMemory
+			existing.workerImage == f.workerImage && existing.workerCPU == f.workerCPU && existing.workerMemory == f.workerMemory &&
+			sameAutoReview(existing.autoReview, f.autoReview)
 		if !same {
 			return 0, nil, &refusal{http.StatusConflict, "name_taken", "an app with this name exists with other fields", "/name"}
 		}
@@ -790,6 +965,7 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 	rec := &appRecord{name: name, repos: repos, accepts: accepts, developers: devs, githubLogins: logins,
 		credential: f.credential, whenSeatsFull: f.whenSeatsFull,
 		workerImage: f.workerImage, workerCPU: f.workerCPU, workerMemory: f.workerMemory,
+		autoReview:  f.autoReview,
 		lockVersion: 1, createdAt: now, updatedAt: now}
 	s.apps[name] = rec
 	return http.StatusCreated, rec.json(), nil
@@ -875,6 +1051,9 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 	}
 	if f.sizeSent && (f.workerCPU != rec.workerCPU || f.workerMemory != rec.workerMemory) {
 		rec.workerCPU, rec.workerMemory, changed = f.workerCPU, f.workerMemory, true
+	}
+	if f.autoSent && !sameAutoReview(f.autoReview, rec.autoReview) {
+		rec.autoReview, changed = f.autoReview, true
 	}
 	if changed {
 		rec.lockVersion++
