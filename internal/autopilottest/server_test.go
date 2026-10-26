@@ -878,3 +878,115 @@ func TestGitHubSender_MayDecide(t *testing.T) {
 		}
 	}
 }
+
+// auto_review is refused where AutoPilot refuses it, at the field AutoPilot
+// names, fields read in sorted order.
+func TestAutoReview_Refused(t *testing.T) {
+	s := New(t)
+	cases := []struct {
+		auto  any
+		field string
+	}{
+		{true, "/auto_review"},
+		{[]any{}, "/auto_review"},
+		{"on", "/auto_review"},
+		{map[string]any{"events": []string{}}, "/auto_review/events"},
+		{map[string]any{"events": "opened"}, "/auto_review/events"},
+		{map[string]any{"events": nil}, "/auto_review/events"},
+		{map[string]any{"events": []any{"opened", "pushed"}}, "/auto_review/events/1"},
+		{map[string]any{"events": []any{"Opened"}}, "/auto_review/events/0"},
+		{map[string]any{"events": []any{"reopened"}}, "/auto_review/events/0"},
+		{map[string]any{"events": []any{1}}, "/auto_review/events/0"},
+		{map[string]any{"max_per_day": 0}, "/auto_review/max_per_day"},
+		{map[string]any{"max_per_day": 201}, "/auto_review/max_per_day"},
+		{map[string]any{"max_per_day": 1.5}, "/auto_review/max_per_day"},
+		{map[string]any{"max_per_day": "50"}, "/auto_review/max_per_day"},
+		{map[string]any{"max_per_day": nil}, "/auto_review/max_per_day"},
+		{map[string]any{"can_decide": "yes"}, "/auto_review/can_decide"},
+		{map[string]any{"can_decide": nil}, "/auto_review/can_decide"},
+		{map[string]any{"can_decide_own_pr": true}, "/auto_review/can_decide_own_pr"},
+		{map[string]any{"can_decide": false, "can_decide_own_pr": true}, "/auto_review/can_decide_own_pr"},
+		{map[string]any{"approve_up_to": "low"}, "/auto_review/approve_up_to"},
+		{map[string]any{"can_decide": true, "approve_up_to": "none"}, "/auto_review/approve_up_to"},
+		{map[string]any{"can_decide": true, "approve_up_to": "LOW"}, "/auto_review/approve_up_to"},
+		{map[string]any{"name": "auto-review:billing"}, "/auto_review/name"},
+		// The first wrong field in sorted order is the one named.
+		{map[string]any{"max_per_day": 0, "events": []string{}}, "/auto_review/events"},
+	}
+	for _, c := range cases {
+		st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": c.auto})
+		expect(t, fmt.Sprintf("auto_review %v", c.auto), st, http.StatusUnprocessableEntity, body)
+		if body["field"] != c.field {
+			t.Errorf("auto_review %v: field = %v, want %s", c.auto, body["field"], c.field)
+		}
+	}
+}
+
+// auto_review is null unless set; sent, each field it leaves out is its
+// default, the events kept once each in AutoPilot's order; a change that
+// leaves it out keeps it, and null takes it away. A create with it is a
+// retry only with the same.
+func TestAutoReview_Kept(t *testing.T) {
+	s := New(t)
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing"})
+	expect(t, "create without it", st, http.StatusCreated, body)
+	if body["auto_review"] != nil {
+		t.Errorf("auto_review = %v, want null", body["auto_review"])
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"auto_review": map[string]any{}})
+	expect(t, "every default", st, http.StatusOK, body)
+	want := map[string]any{
+		"events": []any{"opened", "ready_for_review"}, "max_per_day": float64(50), "can_decide": false,
+		"can_decide_own_pr": false, "approve_up_to": nil,
+	}
+	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
+		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"auto_review": map[string]any{
+		"events": []string{"synchronize", "opened", "synchronize"}, "max_per_day": 200, "can_decide": true,
+		"can_decide_own_pr": true, "approve_up_to": "medium",
+	}})
+	expect(t, "every field", st, http.StatusOK, body)
+	v, _ := s.App("billing")
+	if v.AutoReview == nil || strings.Join(v.AutoReview.Events, ",") != "opened,synchronize" || v.AutoReview.MaxPerDay != 200 ||
+		!v.AutoReview.CanDecide || !v.AutoReview.CanDecideOwnPR || v.AutoReview.ApproveUpTo != "medium" || v.LockVersion != 3 {
+		t.Errorf("app = %+v, auto_review = %+v", v, v.AutoReview)
+	}
+	// It is one setting: a field left out is its default again.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"auto_review": map[string]any{"events": []string{"opened"}}})
+	expect(t, "events alone", st, http.StatusOK, body)
+	if v, _ = s.App("billing"); v.AutoReview == nil || v.AutoReview.CanDecide || v.AutoReview.MaxPerDay != 50 {
+		t.Errorf("auto_review = %+v, want the defaults but events", v.AutoReview)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "4", map[string]any{"developers": []string{}})
+	expect(t, "a change without it", st, http.StatusOK, body)
+	if v, _ = s.App("billing"); v.AutoReview == nil {
+		t.Errorf("a change that leaves auto_review out took it away")
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "4", map[string]any{"auto_review": nil})
+	expect(t, "null", st, http.StatusOK, body)
+	if v, _ = s.App("billing"); v.AutoReview != nil || body["auto_review"] != nil || v.LockVersion != 5 {
+		t.Errorf("auto_review = %+v after null, lock_version %d", v.AutoReview, v.LockVersion)
+	}
+
+	made := map[string]any{"name": "ledger", "auto_review": map[string]any{"max_per_day": 10}}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", made)
+	expect(t, "create with it", st, http.StatusCreated, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", made)
+	expect(t, "the same create again", st, http.StatusOK, body)
+	for _, other := range []map[string]any{
+		{"name": "ledger"},
+		{"name": "ledger", "auto_review": map[string]any{}},
+	} {
+		st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", other)
+		expect(t, fmt.Sprintf("create %v", other), st, http.StatusConflict, body)
+	}
+}
+
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}

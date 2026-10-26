@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -2732,5 +2733,361 @@ func TestUnknownGitHubLoginsAreAnError(t *testing.T) {
 	diags = nil
 	if got := gitHubLoginsFromSet(ctx, types.SetNull(gitHubLoginObjectType), &diags); got != nil || diags.HasError() {
 		t.Errorf("null github_logins gave %v, %v; null is simply not sent", got, diags)
+	}
+}
+
+// Automatic reviews are none unless set; set with nothing in them, every
+// field is AutoPilot's default; they change with the configuration, a field
+// left out going back to its default; and removing them turns them off.
+func TestApp_autoReviewLifecycle(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	config := func(auto string) string { return appConfig(env, name, auto) }
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "auto_review"),
+					func(*terraform.State) error { return env.checkAutoReview(t, name, nil) },
+				),
+			},
+			{
+				Config: config(`  auto_review = {}`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.events.#", "2"),
+					resource.TestCheckTypeSetElemAttr(appRes, "auto_review.events.*", "opened"),
+					resource.TestCheckTypeSetElemAttr(appRes, "auto_review.events.*", "ready_for_review"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.max_per_day", "50"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.can_decide", "false"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.can_decide_own_pr", "false"),
+					resource.TestCheckNoResourceAttr(appRes, "auto_review.approve_up_to"),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{
+							Events: []string{"opened", "ready_for_review"}, MaxPerDay: 50,
+						})
+					},
+				),
+			},
+			{
+				Config: config(`  auto_review = {}`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: config(`
+  auto_review = {
+    events            = ["synchronize", "opened"]
+    max_per_day       = 10
+    can_decide        = true
+    can_decide_own_pr = true
+    approve_up_to     = "low"
+  }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.max_per_day", "10"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.approve_up_to", "low"),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{
+							Events: []string{"opened", "synchronize"}, MaxPerDay: 10,
+							CanDecide: true, CanDecideOwnPR: true, ApproveUpTo: "low",
+						})
+					},
+				),
+			},
+			{
+				// One setting: what it leaves out is its default again.
+				Config: config(`  auto_review = { events = ["opened"] }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					return env.checkAutoReview(t, name, &client.AutoReview{Events: []string{"opened"}, MaxPerDay: 50})
+				},
+			},
+			{
+				// Taken out of the configuration, they are turned off.
+				Config: config(""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "auto_review"),
+					func(*terraform.State) error { return env.checkAutoReview(t, name, nil) },
+				),
+			},
+		},
+	})
+}
+
+// checkAutoReview reads the app from AutoPilot, the fake or a live one, and
+// checks its automatic reviews there (nil for none).
+func (env *testEnv) checkAutoReview(t *testing.T, name string, want *client.AutoReview) error {
+	app, err := env.apiClient(t).GetApp(context.Background(), name)
+	if err != nil {
+		return err
+	}
+	got := app.AutoReview
+	switch {
+	case want == nil && got == nil:
+		return nil
+	case want == nil || got == nil:
+		return fmt.Errorf("auto_review = %+v at AutoPilot, want %+v", got, want)
+	}
+	if !slices.Equal(got.Events, want.Events) || got.MaxPerDay != want.MaxPerDay || got.CanDecide != want.CanDecide ||
+		got.CanDecideOwnPR != want.CanDecideOwnPR || got.ApproveUpTo != want.ApproveUpTo {
+		return fmt.Errorf("auto_review = %+v at AutoPilot, want %+v", *got, *want)
+	}
+	return nil
+}
+
+// Automatic reviews are sent whole, and only when set or changed: an app
+// without them sends nothing for them, so an AutoPilot that predates the
+// field still takes it; a change to one field sends every one; removing
+// them sends null.
+func TestApp_autoReviewSentWhole(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, `  developers = ["someone@example.com"]`),
+				Check: func(*terraform.State) error {
+					post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0]
+					if _, sent := requestBody(t, post)["auto_review"]; sent {
+						return fmt.Errorf("auto_review was sent for an app that leaves it out")
+					}
+					return nil
+				},
+			},
+			{
+				Config: appConfig(env, name, `
+  developers  = ["someone@example.com"]
+  auto_review = { can_decide = true }`),
+				Check: func(*terraform.State) error {
+					patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)
+					body := requestBody(t, patches[len(patches)-1])
+					if got, want := mustJSON(t, body), `{"auto_review":{"can_decide":true,"events":["opened","ready_for_review"],"max_per_day":50}}`; got != want {
+						return fmt.Errorf("body = %s, want %s", got, want)
+					}
+					return nil
+				},
+			},
+			{
+				Config: appConfig(env, name, `
+  developers  = ["someone@example.com"]
+  auto_review = { can_decide = true, max_per_day = 5 }`),
+				Check: func(*terraform.State) error {
+					patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)
+					body := requestBody(t, patches[len(patches)-1])
+					if got, want := mustJSON(t, body), `{"auto_review":{"can_decide":true,"events":["opened","ready_for_review"],"max_per_day":5}}`; got != want {
+						return fmt.Errorf("body = %s, want %s", got, want)
+					}
+					return nil
+				},
+			},
+			{
+				Config: appConfig(env, name, `  developers = ["someone@example.com"]`),
+				Check: func(*terraform.State) error {
+					patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)
+					body := requestBody(t, patches[len(patches)-1])
+					if got, want := mustJSON(t, body), `{"auto_review":null}`; got != want {
+						return fmt.Errorf("body = %s, want %s", got, want)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// The plan refuses what AutoPilot refuses, before anything is sent.
+func TestApp_autoReviewRefusedAtPlan(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	cases := []struct{ auto, err string }{
+		{`{ events = [] }`, "set must contain at least 1 elements"},
+		{`{ events = ["pushed"] }`, "value must be one of"},
+		{`{ events = ["Opened"] }`, "value must be one of"},
+		{`{ events = ["reopened"] }`, "value must be one of"},
+		{`{ max_per_day = 0 }`, "value must be between 1 and 200"},
+		{`{ max_per_day = 201 }`, "value must be between 1 and 200"},
+		{`{ can_decide_own_pr = true }`, "can_decide_own_pr without can_decide"},
+		{`{ can_decide = false, can_decide_own_pr = true }`, "can_decide_own_pr without can_decide"},
+		{`{ approve_up_to = "low" }`, "approve_up_to without can_decide"},
+		{`{ can_decide = true, approve_up_to = "none" }`, "value must be one of"},
+	}
+	for _, c := range cases {
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{
+					Config:      appConfig(env, randName(), "  auto_review = "+c.auto),
+					ExpectError: expectErr(c.err),
+				},
+			},
+		})
+	}
+	if posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps"); len(posts) != 0 {
+		t.Errorf("%d creates were sent", len(posts))
+	}
+}
+
+// Automatic reviews changed or turned on outside Terraform show as a change,
+// and the apply puts them back as the configuration says.
+func TestApp_autoReviewChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	cases := []struct {
+		config  string
+		outside func(v *autopilottest.AppView)
+		check   func(a *autopilottest.AutoReview) bool
+	}{
+		{
+			`  auto_review = { max_per_day = 5 }`,
+			func(v *autopilottest.AppView) { v.AutoReview.MaxPerDay, v.AutoReview.CanDecide = 200, true },
+			func(a *autopilottest.AutoReview) bool { return a != nil && a.MaxPerDay == 5 && !a.CanDecide },
+		},
+		{
+			`  auto_review = { max_per_day = 5 }`,
+			func(v *autopilottest.AppView) { v.AutoReview = nil },
+			func(a *autopilottest.AutoReview) bool { return a != nil && a.MaxPerDay == 5 },
+		},
+		{
+			``,
+			func(v *autopilottest.AppView) {
+				v.AutoReview = &autopilottest.AutoReview{Events: []string{"opened"}, MaxPerDay: 50, CanDecide: true}
+			},
+			func(a *autopilottest.AutoReview) bool { return a == nil },
+		},
+	}
+	for _, c := range cases {
+		name := randName()
+		config := appConfig(env, name, c.config)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() { env.fake.ChangeAppOutOfBand(name, c.outside) },
+					Config:    config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: func(*terraform.State) error {
+						if v, _ := env.fake.App(name); !c.check(v.AutoReview) {
+							return fmt.Errorf("auto_review = %+v, not put back", v.AutoReview)
+						}
+						return nil
+					},
+				},
+			},
+		})
+	}
+}
+
+// An imported app's automatic reviews are read into state, so a
+// configuration that says the same plans nothing, and one that leaves them
+// out plans turning them off.
+func TestApp_importWithAutoReview(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{
+		Name: name,
+		AutoReview: &autopilottest.AutoReview{
+			Events: []string{"opened", "synchronize"}, MaxPerDay: 20, CanDecide: true, ApproveUpTo: "medium",
+		},
+	})
+	same := appConfig(env, name, `
+  auto_review = {
+    events        = ["opened", "synchronize"]
+    max_per_day   = 20
+    can_decide    = true
+    approve_up_to = "medium"
+  }`)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             same,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: same,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: appConfig(env, name, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					if v, _ := env.fake.App(name); v.AutoReview != nil {
+						return fmt.Errorf("auto_review = %+v, want none", v.AutoReview)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// can_decide not known until apply: the plan waits, and the apply checks
+// the knobs that need it then, before anything is sent.
+func TestApp_autoReviewWithCanDecideNotKnownYet(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	config := func(decide bool) string {
+		return env.providerConfig() + fmt.Sprintf(`
+resource "terraform_data" "decide" {
+  input = %t
+}
+
+resource "autopilot_app" "test" {
+  name        = %q
+  auto_review = { can_decide = terraform_data.decide.output, approve_up_to = "low" }
+}
+`, decide, name)
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.can_decide", "true"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.approve_up_to", "low"),
+				),
+			},
+			{
+				Config:      config(false),
+				ExpectError: expectErr("approve_up_to without can_decide"),
+			},
+		},
+	})
+	if env.fake != nil {
+		if patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name); len(patches) != 0 {
+			t.Errorf("%d changes were sent", len(patches))
+		}
 	}
 }

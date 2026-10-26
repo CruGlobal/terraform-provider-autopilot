@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1006,5 +1007,108 @@ func TestGetApp_WithoutGitHubLogins(t *testing.T) {
 	}
 	if a.GitHubLogins != nil {
 		t.Errorf("github_logins = %v", a.GitHubLogins)
+	}
+}
+
+// Automatic reviews are sent whole when set: the events each once in
+// AutoPilot's order, the cap, the flags only when true and the ceiling only
+// when set; and as null to take them away. Left unset, they aren't sent.
+func TestUpdateApp_SendsAutoReview(t *testing.T) {
+	var bodies []string
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 2})
+	}))
+	ctx := context.Background()
+	for _, spec := range []AppSpec{
+		{AutoReview: &AutoReviewSetting{On: &AutoReview{Events: []string{"ready_for_review", "opened"}, MaxPerDay: 50}}},
+		{AutoReview: &AutoReviewSetting{On: &AutoReview{
+			Events: []string{"synchronize", "opened", "synchronize"}, MaxPerDay: 10,
+			CanDecide: true, CanDecideOwnPR: true, ApproveUpTo: "low",
+		}}},
+		{AutoReview: &AutoReviewSetting{}},
+		{Developers: []string{}},
+	} {
+		if _, err := c.UpdateApp(ctx, "billing", spec, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{
+		`{"auto_review":{"events":["opened","ready_for_review"],"max_per_day":50}}`,
+		`{"auto_review":{"approve_up_to":"low","can_decide":true,"can_decide_own_pr":true,"events":["opened","synchronize"],"max_per_day":10}}`,
+		`{"auto_review":null}`,
+		`{"developers":[]}`,
+	}
+	for i := range want {
+		if bodies[i] != want[i] {
+			t.Errorf("body %d = %s\nwant      %s", i, bodies[i], want[i])
+		}
+	}
+}
+
+// An app read back holds a change's automatic reviews only when every field
+// matches, and none only when it has none.
+func TestAppSpec_AutoReviewReflectedIn(t *testing.T) {
+	on := func(change func(a *AutoReview)) *AutoReview {
+		a := &AutoReview{Events: []string{"opened", "ready_for_review"}, MaxPerDay: 50}
+		change(a)
+		return a
+	}
+	same := func(*AutoReview) {}
+	set := func(a *AutoReview) AppSpec { return AppSpec{AutoReview: &AutoReviewSetting{On: a}} }
+	cases := []struct {
+		spec AppSpec
+		app  *App
+		want bool
+	}{
+		{set(on(same)), &App{AutoReview: on(same)}, true},
+		{set(on(func(a *AutoReview) { a.Events = []string{"ready_for_review", "opened"} })), &App{AutoReview: on(same)}, true},
+		{set(on(same)), &App{}, false},
+		{set(on(func(a *AutoReview) { a.Events = []string{"opened"} })), &App{AutoReview: on(same)}, false},
+		{set(on(func(a *AutoReview) { a.MaxPerDay = 10 })), &App{AutoReview: on(same)}, false},
+		{set(on(func(a *AutoReview) { a.CanDecide = true })), &App{AutoReview: on(same)}, false},
+		{set(on(func(a *AutoReview) { a.CanDecide, a.CanDecideOwnPR = true, true })),
+			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide = true })}, false},
+		{set(on(func(a *AutoReview) { a.CanDecide, a.ApproveUpTo = true, "low" })),
+			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide = true })}, false},
+		{set(nil), &App{AutoReview: on(same)}, false},
+		{set(nil), &App{}, true},
+		{AppSpec{}, &App{AutoReview: on(same)}, true},
+	}
+	for i, c := range cases {
+		if got := c.spec.reflectedIn(c.app); got != c.want {
+			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// AutoPilot answers auto_review as null for an app without automatic
+// reviews, and an AutoPilot that predates it answers without it: both read
+// as none. A ceiling of null reads as none.
+func TestGetApp_AutoReview(t *testing.T) {
+	answers := []map[string]any{
+		{"name": "billing", "lock_version": 1},
+		{"name": "billing", "lock_version": 1, "auto_review": nil},
+		{"name": "billing", "lock_version": 1, "auto_review": map[string]any{
+			"events": []string{"opened", "synchronize"}, "max_per_day": 10, "can_decide": true,
+			"can_decide_own_pr": false, "approve_up_to": nil,
+		}},
+	}
+	for i, answer := range answers {
+		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRecord(w, http.StatusOK, answer)
+		}))
+		a, err := c.GetApp(context.Background(), "billing")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i < 2 && a.AutoReview != nil {
+			t.Errorf("answer %d: auto_review = %+v, want none", i, a.AutoReview)
+		}
+		if i == 2 && (a.AutoReview == nil || !slices.Equal(a.AutoReview.Events, []string{"opened", "synchronize"}) ||
+			a.AutoReview.MaxPerDay != 10 || !a.AutoReview.CanDecide || a.AutoReview.CanDecideOwnPR || a.AutoReview.ApproveUpTo != "") {
+			t.Errorf("auto_review = %+v", a.AutoReview)
+		}
 	}
 }

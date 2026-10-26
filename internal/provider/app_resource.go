@@ -16,7 +16,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -48,8 +50,33 @@ type appModel struct {
 	WorkerImage   types.String `tfsdk:"worker_image"`
 	WorkerCPU     types.Int64  `tfsdk:"worker_cpu"`
 	WorkerMemory  types.Int64  `tfsdk:"worker_memory"`
+	AutoReview    types.Object `tfsdk:"auto_review"`
 	LockVersion   types.Int64  `tfsdk:"lock_version"`
 }
+
+type autoReviewModel struct {
+	Events         types.Set    `tfsdk:"events"`
+	MaxPerDay      types.Int64  `tfsdk:"max_per_day"`
+	CanDecide      types.Bool   `tfsdk:"can_decide"`
+	CanDecideOwnPR types.Bool   `tfsdk:"can_decide_own_pr"`
+	ApproveUpTo    types.String `tfsdk:"approve_up_to"`
+}
+
+var autoReviewAttrTypes = map[string]attr.Type{
+	"events":            types.SetType{ElemType: types.StringType},
+	"max_per_day":       types.Int64Type,
+	"can_decide":        types.BoolType,
+	"can_decide_own_pr": types.BoolType,
+	"approve_up_to":     types.StringType,
+}
+
+// The events and the cap an app's automatic reviews have unless it says,
+// and the most the cap may be, as AutoPilot has them.
+var (
+	defaultAutoEvents       = []string{"opened", "ready_for_review"}
+	defaultAutoPerDay int64 = 50
+	maxAutoPerDay     int64 = 200
+)
 
 type acceptModel struct {
 	Sender         types.String `tfsdk:"sender"`
@@ -95,6 +122,7 @@ var appAPIFields = map[string]string{
 	"worker_image":    "worker_image",
 	"worker_cpu":      "worker_cpu",
 	"worker_memory":   "worker_memory",
+	"auto_review":     "auto_review",
 }
 
 // appToModel maps an app. Every list is optional and left out of the
@@ -114,8 +142,57 @@ func appToModel(a *client.App, prior appModel) appModel {
 		WorkerImage:   types.StringPointerValue(a.WorkerImage),
 		WorkerCPU:     types.Int64PointerValue(a.WorkerCPU),
 		WorkerMemory:  types.Int64PointerValue(a.WorkerMemory),
+		AutoReview:    autoReviewToObject(a.AutoReview),
 		LockVersion:   types.Int64Value(a.LockVersion),
 	}
+}
+
+// autoReviewToObject maps the automatic reviews AutoPilot answered with to
+// state: null for none (or an AutoPilot that predates the field), and every
+// field otherwise, the ceiling null for none. The plan fills each field it
+// leaves out with AutoPilot's default, so the two agree.
+func autoReviewToObject(a *client.AutoReview) types.Object {
+	if a == nil {
+		return types.ObjectNull(autoReviewAttrTypes)
+	}
+	return types.ObjectValueMust(autoReviewAttrTypes, map[string]attr.Value{
+		"events":            setFromStrings(a.Events),
+		"max_per_day":       types.Int64Value(a.MaxPerDay),
+		"can_decide":        types.BoolValue(a.CanDecide),
+		"can_decide_own_pr": types.BoolValue(a.CanDecideOwnPR),
+		"approve_up_to":     optionalString(a.ApproveUpTo),
+	})
+}
+
+// autoReviewFromModel is the automatic reviews the plan holds, as the
+// client sends them: a nil On for none, which takes them away. A value still
+// unknown at apply is an error, never read as none or as a default: none
+// would turn them off, and a default could widen what they may do.
+func autoReviewFromModel(ctx context.Context, m appModel, diags *diag.Diagnostics) *client.AutoReviewSetting {
+	if m.AutoReview.IsUnknown() {
+		unknownAtApply(diags, "auto_review")
+		return nil
+	}
+	if m.AutoReview.IsNull() {
+		return &client.AutoReviewSetting{}
+	}
+	var auto autoReviewModel
+	diags.Append(m.AutoReview.As(ctx, &auto, basetypes.ObjectAsOptions{})...)
+	if diags.HasError() {
+		return nil
+	}
+	if auto.Events.IsUnknown() || auto.MaxPerDay.IsUnknown() || auto.CanDecide.IsUnknown() ||
+		auto.CanDecideOwnPR.IsUnknown() || auto.ApproveUpTo.IsUnknown() {
+		unknownAtApply(diags, "auto_review")
+		return nil
+	}
+	return &client.AutoReviewSetting{On: &client.AutoReview{
+		Events:         stringsFromSet(ctx, auto.Events, "auto_review", diags),
+		MaxPerDay:      auto.MaxPerDay.ValueInt64(),
+		CanDecide:      auto.CanDecide.ValueBool(),
+		CanDecideOwnPR: auto.CanDecideOwnPR.ValueBool(),
+		ApproveUpTo:    auto.ApproveUpTo.ValueString(),
+	}}
 }
 
 // imageFromModel is the worker image the plan holds, as the client sends
@@ -326,6 +403,8 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"`worker_image`, `worker_cpu` and `worker_memory` choose the worker the tasks billed to the app run in: " +
 			"its image, and the size of the AWS Fargate task it runs as. `worker_cpu` and `worker_memory` are one " +
 			"size, set together, and a change to either sends both.\n\n" +
+			"`auto_review` has AutoPilot review the app's pull requests on its own, with no label, as the app's own " +
+			"service identity. It is one setting, and a change to any of its fields sends all of them.\n\n" +
 			"An app with this name that already exists is not taken over, even when its values match: the create " +
 			"fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a " +
 			"gateway's 502, say) before an identical app answered: that attempt may have made the app, and the " +
@@ -547,6 +626,83 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				Optional:   true,
 				Validators: []validator.Int64{int64validator.Between(512, 16384)},
 			},
+			"auto_review": schema.SingleNestedAttribute{
+				MarkdownDescription: "Automatic reviews: AutoPilot reviews each pull request into the default branch of " +
+					"this app's repositories on its own, with no label or comment, when it is opened, marked ready or " +
+					"pushed to, as `events` says. It reviews only a person's pull request, never a bot's (Dependabot's, or " +
+					"any account GitHub calls a bot), and never a draft until it is marked ready. A pull request from a fork " +
+					"is reviewed too, only as a comment. The review runs as the app's own service identity, " +
+					"`auto-review:<name>`, never a person: that identity asks for it, the app pays, its limits count it, " +
+					"and the review's footer, its check run (`AutoPilot review (automatic)`) and AutoPilot's logs name it. " +
+					"It posts no other comment. Setting this is the app's consent; it needs no `accepts` entry and no " +
+					"developer, and an `accepts` entry for `autopilot-github` doesn't turn it on. A head and base gets " +
+					"one review from GitHub, so a later `autopilot-review` label on the same head gets the automatic " +
+					"review, even one that only commented. On a public repository anyone can open pull requests, and " +
+					"each counts against `max_per_day` and the repository's own daily cap. Left out, the app has no " +
+					"automatic reviews, and removing it from the configuration turns them off, which also stops the " +
+					"ones queued or running. It needs an AutoPilot that knows the field; an older one refuses it with a " +
+					"422.",
+				Optional: true,
+				Attributes: map[string]schema.Attribute{
+					"events": schema.SetAttribute{
+						MarkdownDescription: "The pull request actions that start an automatic review: `opened`, " +
+							"`ready_for_review` (a draft marked ready) and `synchronize` (each push to it). Defaults to " +
+							"`opened` and `ready_for_review`. With `synchronize`, every push is a new head and so a new " +
+							"review, within `max_per_day`.",
+						ElementType: types.StringType,
+						Optional:    true,
+						Computed:    true,
+						Default:     setdefault.StaticValue(setFromStrings(defaultAutoEvents)),
+						Validators: []validator.Set{
+							setvalidator.SizeAtLeast(1),
+							setvalidator.ValueStringsAre(stringvalidator.OneOf(client.AutoEvents...)),
+						},
+					},
+					"max_per_day": schema.Int64Attribute{
+						MarkdownDescription: "The most automatic reviews of this app's repositories in 24 hours, every " +
+							"one AutoPilot recorded counting, however it ended: `1` to `200`. Defaults to `50`. Each also " +
+							"counts against its repository's own daily cap on reviews from GitHub, and runs only on one of " +
+							"the organization's Claude seats.",
+						Optional:   true,
+						Computed:   true,
+						Default:    int64default.StaticInt64(defaultAutoPerDay),
+						Validators: []validator.Int64{int64validator.Between(1, maxAutoPerDay)},
+					},
+					"can_decide": schema.BoolAttribute{
+						MarkdownDescription: "Whether automatic reviews may approve or request changes, which can count " +
+							"as a required review. Independent of any `accepts` entry's `can_decide`, `autopilot-github`'s " +
+							"included. A review decides only on a pull request into the default branch, never on a fork's, " +
+							"and requests changes for any finding it marks Important. Defaults to `false`.",
+						Optional: true,
+						Computed: true,
+						Default:  booldefault.StaticBool(false),
+					},
+					"can_decide_own_pr": schema.BoolAttribute{
+						MarkdownDescription: "Whether, with `can_decide = true`, an automatic review may also decide on a " +
+							"pull request that may be one of this app's developers' own. Off, such a review only comments. " +
+							"A pull request may be a developer's when its author is a GitHub login that `github_logins` " +
+							"pairs with any developer, compared without regard to case, or when AutoPilot can't tell: " +
+							"GitHub names no author, or one of `developers` has no login in `github_logins`, and so could " +
+							"be any author. So with this off, automatic reviews decide only once every developer's GitHub " +
+							"login is paired, and only on a pull request whose author isn't one of those logins. It goes " +
+							"by the author alone, which leaves open what `accepts`' `can_decide` describes: commits pushed " +
+							"onto someone else's pull request. Turning it on lets a developer's own pull request get an " +
+							"approval no other person gave, which can count as a required review: set it only where that " +
+							"is acceptable. Defaults to `false`.",
+						Optional: true,
+						Computed: true,
+						Default:  booldefault.StaticBool(false),
+					},
+					"approve_up_to": schema.StringAttribute{
+						MarkdownDescription: "With `can_decide = true`, the most risk a pull request may carry for an " +
+							"automatic review to approve it: `low`, `medium` or `high`, rated as for `accepts`' " +
+							"`approve_up_to`. An approval rated above it is posted as a comment. Left out, every level may " +
+							"be approved.",
+						Optional:   true,
+						Validators: []validator.String{stringvalidator.OneOf("low", "medium", "high")},
+					},
+				},
+			},
 			"lock_version": schema.Int64Attribute{
 				MarkdownDescription: "The record's version, which AutoPilot raises on every change. Sent as `If-Match` " +
 					"on updates and deletes.",
@@ -557,13 +713,42 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 }
 
 // ValidateConfig checks the rules that span two arguments: the credential
-// policy's, the worker size's, and that each GitHub login's developer is one
-// of the developers. A value not known yet waits: Terraform validates again
-// at apply.
+// policy's, the worker size's, that each GitHub login's developer is one of
+// the developers, and automatic reviews' deciding knobs. A value not known
+// yet waits: Terraform validates again at apply.
 func (r *appResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	validatePolicy(ctx, req, resp)
 	validateSize(ctx, req, resp)
 	validateGitHubLogins(ctx, req, resp)
+	validateAutoReview(ctx, req, resp)
+}
+
+// validateAutoReview checks automatic reviews' knobs as AutoPilot does:
+// can_decide_own_pr and approve_up_to each narrow can_decide, so each needs
+// it. can_decide left out is false (its default); one not known yet waits.
+func validateAutoReview(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var auto types.Object
+	diags := req.Config.GetAttribute(ctx, path.Root("auto_review"), &auto)
+	resp.Diagnostics.Append(diags...)
+	if diags.HasError() || auto.IsNull() || auto.IsUnknown() {
+		return
+	}
+	var m autoReviewModel
+	if d := auto.As(ctx, &m, basetypes.ObjectAsOptions{}); d.HasError() || m.CanDecide.IsUnknown() || isTrue(m.CanDecide) {
+		return
+	}
+	if isTrue(m.CanDecideOwnPR) {
+		resp.Diagnostics.AddAttributeError(path.Root("auto_review").AtName("can_decide_own_pr"),
+			"can_decide_own_pr without can_decide",
+			"auto_review sets can_decide_own_pr, which only widens can_decide, but can_decide isn't true. Set "+
+				"can_decide = true too, or leave can_decide_own_pr out.")
+	}
+	if known(m.ApproveUpTo) {
+		resp.Diagnostics.AddAttributeError(path.Root("auto_review").AtName("approve_up_to"),
+			"approve_up_to without can_decide",
+			"auto_review sets approve_up_to, the most risk its reviews may approve, but can_decide isn't true, so "+
+				"they approve nothing. Set can_decide = true too, or leave approve_up_to out.")
+	}
 }
 
 // validateGitHubLogins checks that every developer github_logins names is in
@@ -681,6 +866,9 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 	if !plan.WorkerCPU.IsNull() || !plan.WorkerMemory.IsNull() {
 		spec.Size = sizeFromModel(plan, &resp.Diagnostics)
 	}
+	if !plan.AutoReview.IsNull() {
+		spec.AutoReview = autoReviewFromModel(ctx, plan, &resp.Diagnostics)
+	}
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -744,7 +932,7 @@ func (r *appResource) Read(ctx context.Context, req resource.ReadRequest, resp *
 // Update sends only what changed. A list removed from the configuration is
 // sent as [], so AutoPilot empties it as the plan says; a credential policy
 // removed is sent as credential null, which takes it away, and so are a
-// worker image and a worker size removed.
+// worker image, a worker size and automatic reviews removed.
 func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, state appModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -786,6 +974,11 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 	// The size is one too, so a change to either sends both.
 	if !plan.WorkerCPU.Equal(state.WorkerCPU) || !plan.WorkerMemory.Equal(state.WorkerMemory) {
 		spec.Size = sizeFromModel(plan, &resp.Diagnostics)
+	}
+	// Automatic reviews are one setting too, so a change to any field sends
+	// them whole; removed, they are sent as null, which turns them off.
+	if !plan.AutoReview.Equal(state.AutoReview) {
+		spec.AutoReview = autoReviewFromModel(ctx, plan, &resp.Diagnostics)
 	}
 	if resp.Diagnostics.HasError() {
 		return

@@ -131,6 +131,18 @@ the examples, and the generated docs. Things worth knowing:
   any sender (checked by `acceptsValidator`), and answers `null` for none.
   It is optional with no default, read back as null when AutoPilot has none,
   and sent only when set.
+- An app's `auto_review` is its automatic reviews: AutoPilot reviews its
+  pull requests on its own, as the app's service identity. AutoPilot takes
+  it as one setting, sent whole (a field left out is AutoPilot's default,
+  not what was kept), and `null` turns it off. So it is a single nested
+  attribute whose fields all have AutoPilot's defaults in the schema
+  (`events` `opened` and `ready_for_review`, `max_per_day` 50, the flags
+  false), a change to any field sends every one, and removing it sends
+  `null`. `events` is one or more of `opened`, `ready_for_review` and
+  `synchronize`, kept in that order; `max_per_day` is 1 to 200; and
+  `can_decide_own_pr` and `approve_up_to` come only with `can_decide`
+  (checked by `validateAutoReview`). An app that leaves it out sends
+  nothing for it, so an older AutoPilot still takes the app.
 - A sender's secrets are write-only (`*_wo`). The plan compares
   `client.Fingerprint` of the configured secrets with the stored
   fingerprints; see the comment at the top of `sender_resource.go`.

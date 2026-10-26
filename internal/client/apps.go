@@ -9,7 +9,7 @@ import (
 // App is a unit of consent: the repositories it owns, the senders it accepts
 // work from (with the kinds it accepts from each), the people who may start
 // work for it themselves, and their GitHub logins. It also holds the app's
-// credential policy, and the worker its tasks run in.
+// credential policy, the worker its tasks run in, and its automatic reviews.
 type App struct {
 	Name       string   `json:"name"`
 	Repos      []string `json:"repos"`
@@ -32,9 +32,44 @@ type App struct {
 	// units and MiB, both or neither. Nil is the worker's own size.
 	WorkerCPU    *int64 `json:"worker_cpu"`
 	WorkerMemory *int64 `json:"worker_memory"`
-	LockVersion  int64  `json:"lock_version"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
+	// AutoReview is the app's automatic reviews, or nil when it has none (or
+	// the AutoPilot predates the field).
+	AutoReview  *AutoReview `json:"auto_review"`
+	LockVersion int64       `json:"lock_version"`
+	CreatedAt   string      `json:"created_at"`
+	UpdatedAt   string      `json:"updated_at"`
+}
+
+// AutoEvents are the pull_request actions an app's automatic reviews may
+// start on, in the order AutoPilot keeps them.
+var AutoEvents = []string{"opened", "ready_for_review", "synchronize"}
+
+// AutoReview is an app's automatic reviews: AutoPilot reviews the pull
+// requests into the default branch of the app's repositories on its own,
+// with no label, as the app's own service identity. AutoPilot takes it as
+// one setting: a write sends every field, and a field it leaves out is
+// AutoPilot's default, not what was kept.
+type AutoReview struct {
+	// Events are the actions that start one: some of AutoEvents.
+	Events []string `json:"events"`
+	// MaxPerDay is the most automatic reviews of the app's repositories in 24
+	// hours, from 1 to 200.
+	MaxPerDay int64 `json:"max_per_day"`
+	// CanDecide lets them approve or request changes.
+	CanDecide bool `json:"can_decide"`
+	// CanDecideOwnPR lets them decide, with CanDecide, on a pull request that
+	// may be one of the app's developers' own.
+	CanDecideOwnPR bool `json:"can_decide_own_pr"`
+	// ApproveUpTo is, with CanDecide, the most risk a pull request may carry
+	// for them to approve it: low, medium or high. Empty means no ceiling,
+	// which is also what AutoPilot's null reads as.
+	ApproveUpTo string `json:"approve_up_to"`
+}
+
+// AutoReviewSetting is a write of an app's automatic reviews: On to turn
+// them on or change them, or a nil On to take them away (sent as null).
+type AutoReviewSetting struct {
+	On *AutoReview
 }
 
 func (a *App) recordName() string {
@@ -118,6 +153,8 @@ type AppSpec struct {
 	// to take the app back to node (sent as null).
 	WorkerImage *string
 	Size        *WorkerSize
+	// AutoReview is the app's automatic reviews, sent whole; nil is not sent.
+	AutoReview *AutoReviewSetting
 }
 
 func (s AppSpec) fields() Fields {
@@ -158,7 +195,60 @@ func (s AppSpec) fields() Fields {
 			f["worker_cpu"], f["worker_memory"] = s.Size.CPU, s.Size.Memory
 		}
 	}
+	if s.AutoReview != nil {
+		if s.AutoReview.On == nil {
+			f["auto_review"] = nil
+		} else {
+			f["auto_review"] = autoReviewBody(*s.AutoReview.On)
+		}
+	}
 	return f
+}
+
+// autoReviewBody is automatic reviews as a write sends them: the events in
+// AutoPilot's order, each once, and the cap. can_decide and
+// can_decide_own_pr are sent only when true, and approve_up_to only when
+// set, as an accepts entry's are: AutoPilot's default for each is off.
+func autoReviewBody(a AutoReview) map[string]any {
+	body := map[string]any{"events": normalizeEvents(a.Events), "max_per_day": a.MaxPerDay}
+	if a.CanDecide {
+		body["can_decide"] = true
+	}
+	if a.CanDecideOwnPR {
+		body["can_decide_own_pr"] = true
+	}
+	if a.ApproveUpTo != "" {
+		body["approve_up_to"] = a.ApproveUpTo
+	}
+	return body
+}
+
+// normalizeEvents is events as AutoPilot keeps them: each once, in
+// AutoEvents' order. An event AutoPilot doesn't know goes last, for it to
+// refuse; the plan refuses it first.
+func normalizeEvents(events []string) []string {
+	out := []string{}
+	for _, e := range AutoEvents {
+		if slices.Contains(events, e) {
+			out = append(out, e)
+		}
+	}
+	for _, e := range sortedUnique(events) {
+		if !slices.Contains(AutoEvents, e) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// sameAutoReview reports whether two settings of automatic reviews are the
+// same, nil being none.
+func sameAutoReview(x, y *AutoReview) bool {
+	if x == nil || y == nil {
+		return x == y
+	}
+	return slices.Equal(normalizeEvents(x.Events), normalizeEvents(y.Events)) && x.MaxPerDay == y.MaxPerDay &&
+		x.CanDecide == y.CanDecide && x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo
 }
 
 // Empty reports whether the spec would send nothing.
@@ -251,6 +341,9 @@ func (s AppSpec) reflectedIn(app *App) bool {
 		return false
 	}
 	if s.Size != nil && (derefInt(app.WorkerCPU) != s.Size.CPU || derefInt(app.WorkerMemory) != s.Size.Memory) {
+		return false
+	}
+	if s.AutoReview != nil && !sameAutoReview(s.AutoReview.On, app.AutoReview) {
 		return false
 	}
 	return true
