@@ -524,6 +524,261 @@ func (env *testEnv) checkOwnPR(t *testing.T, name string, want map[string]bool) 
 	return nil
 }
 
+// approve_up_to is sent only when set, so an AutoPilot that predates it
+// still takes an entry that leaves it out.
+func TestApp_approveUpToSentOnlyWhenSet(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, `
+  accepts = [
+    { sender = "autopilot-github", kinds = ["review-pr"], can_decide = true, approve_up_to = "low" },
+    { sender = "autopilot-mcp", kinds = ["review-pr"], can_decide = true },
+  ]`),
+				Check: func(*terraform.State) error {
+					post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0]
+					accepts, _ := requestBody(t, post)["accepts"].([]any)
+					if len(accepts) != 2 {
+						return fmt.Errorf("accepts = %v", accepts)
+					}
+					first, _ := accepts[0].(map[string]any)
+					second, _ := accepts[1].(map[string]any)
+					if first["approve_up_to"] != "low" {
+						return fmt.Errorf("approve_up_to low was not sent for autopilot-github")
+					}
+					if _, ok := second["approve_up_to"]; ok {
+						return fmt.Errorf("approve_up_to was sent for an entry that leaves it out")
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// approve_up_to is none unless set, is kept when set, changes with the
+// configuration, and is taken away by leaving it out.
+func TestApp_approveUpToLifecycle(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	config := func(ceiling string) string {
+		return appConfig(env, name, fmt.Sprintf(`
+  accepts = [
+    { sender = "autopilot-github", kinds = ["review-pr"], can_decide = true%s },
+    { sender = "autopilot-mcp", kinds = ["review-pr"], can_decide = true },
+  ]`, ceiling))
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(`, approve_up_to = "low"`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckTypeSetElemNestedAttrs(appRes, "accepts.*", map[string]string{
+						"sender": "autopilot-github", "can_decide": "true", "approve_up_to": "low",
+					}),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "1"),
+					// Left out, there is none at AutoPilot.
+					func(*terraform.State) error {
+						return env.checkCeiling(t, name, map[string]string{"autopilot-github": "low", "autopilot-mcp": ""})
+					},
+				),
+			},
+			{
+				Config: config(`, approve_up_to = "medium"`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckTypeSetElemNestedAttrs(appRes, "accepts.*", map[string]string{
+						"sender": "autopilot-github", "approve_up_to": "medium",
+					}),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					func(*terraform.State) error {
+						return env.checkCeiling(t, name, map[string]string{"autopilot-github": "medium"})
+					},
+				),
+			},
+			{
+				Config: config(`, approve_up_to = "medium"`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Taken out of the configuration, the ceiling is taken away.
+				Config: config(""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "accepts.0.approve_up_to"),
+					resource.TestCheckNoResourceAttr(appRes, "accepts.1.approve_up_to"),
+					func(*terraform.State) error {
+						return env.checkCeiling(t, name, map[string]string{"autopilot-github": "", "autopilot-mcp": ""})
+					},
+				),
+			},
+		},
+	})
+}
+
+// checkCeiling reads the app from AutoPilot, the fake or a live one, and
+// checks each sender's approve_up_to there ("" for none).
+func (env *testEnv) checkCeiling(t *testing.T, name string, want map[string]string) error {
+	app, err := env.apiClient(t).GetApp(context.Background(), name)
+	if err != nil {
+		return err
+	}
+	for _, a := range app.Accepts {
+		if ceiling, ok := want[a.Sender]; ok && a.ApproveUpTo != ceiling {
+			return fmt.Errorf("%s: approve_up_to = %q at AutoPilot, want %q", a.Sender, a.ApproveUpTo, ceiling)
+		}
+	}
+	return nil
+}
+
+// Only the three levels are taken, at plan time, before anything is sent.
+func TestApp_approveUpToOnlyALevel(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	for _, bad := range []string{"Low", "none", "", "critical"} {
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{
+					Config: appConfig(env, randName(), fmt.Sprintf(
+						`  accepts = [{ sender = "autopilot-github", kinds = ["review-pr"], can_decide = true, approve_up_to = %q }]`, bad)),
+					ExpectError: expectErr("value must be one of"),
+				},
+			},
+		})
+	}
+	if posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps"); len(posts) != 0 {
+		t.Errorf("%d creates were sent", len(posts))
+	}
+}
+
+// approve_up_to with a can_decide not known at plan time waits for it, and
+// the apply refuses it once can_decide is known to be false, before anything
+// is sent.
+func TestApp_approveUpToWithCanDecideNotKnownYet(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	config := func(decide bool) string {
+		return env.providerConfig() + fmt.Sprintf(`
+resource "terraform_data" "decide" {
+  input = %t
+}
+
+resource "autopilot_app" "test" {
+  name    = %q
+  accepts = [{ sender = "autopilot-github", kinds = ["review-pr"], can_decide = terraform_data.decide.output, approve_up_to = "low" }]
+}
+`, decide, name)
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "accepts.0.can_decide", "true"),
+					resource.TestCheckResourceAttr(appRes, "accepts.0.approve_up_to", "low"),
+				),
+			},
+			{
+				Config:      config(false),
+				ExpectError: expectErr("approve_up_to without can_decide"),
+			},
+		},
+	})
+	if env.fake != nil {
+		if patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name); len(patches) != 0 {
+			t.Errorf("%d changes were sent", len(patches))
+		}
+	}
+}
+
+// A ceiling raised or taken away outside Terraform shows as a change, and the
+// apply puts it back.
+func TestApp_approveUpToChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	config := appConfig(env, name,
+		`  accepts = [{ sender = "autopilot-github", kinds = ["review-pr"], can_decide = true, approve_up_to = "low" }]`)
+	for _, outside := range []string{"high", ""} {
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() {
+						env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) { v.Accepts[0].ApproveUpTo = outside })
+					},
+					Config: config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: func(*terraform.State) error {
+						if v, _ := env.fake.App(name); len(v.Accepts) != 1 || v.Accepts[0].ApproveUpTo != "low" {
+							return fmt.Errorf("accepts = %+v, want approve_up_to low again", v.Accepts)
+						}
+						return nil
+					},
+				},
+			},
+		})
+	}
+}
+
+// An imported app's approve_up_to is read into state, so a configuration that
+// sets it plans nothing, and one that leaves it out plans taking it away.
+func TestApp_importWithApproveUpTo(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{
+		Name: name,
+		Accepts: []autopilottest.Accept{
+			{Sender: "autopilot-github", Kinds: []string{"review-pr"}, CanDecide: true, ApproveUpTo: "medium"},
+		},
+	})
+	entry := `  accepts = [{ sender = "autopilot-github", kinds = ["review-pr"], can_decide = true%s }]`
+	capped := appConfig(env, name, fmt.Sprintf(entry, `, approve_up_to = "medium"`))
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             capped,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: capped,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: appConfig(env, name, fmt.Sprintf(entry, "")),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					if v, _ := env.fake.App(name); len(v.Accepts) != 1 || v.Accepts[0].ApproveUpTo != "" || !v.Accepts[0].CanDecide {
+						return fmt.Errorf("accepts = %+v, want no ceiling", v.Accepts)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
 func TestApp_lostCreateAnswerIsSentAgain(t *testing.T) {
 	env := newTestEnv(t)
 	env.requireFake(t)
@@ -916,6 +1171,7 @@ func TestAcceptsValidator_UnknownKind(t *testing.T) {
 			"can_decide":        types.BoolValue(true),
 			"can_auto_merge":    types.BoolValue(false),
 			"can_decide_own_pr": types.BoolNull(),
+			"approve_up_to":     types.StringNull(),
 		})
 	}
 	cases := []struct {
@@ -953,6 +1209,7 @@ func TestAcceptsValidator_AutoMergeUnknownKind(t *testing.T) {
 			"can_decide":        types.BoolValue(false),
 			"can_auto_merge":    types.BoolValue(true),
 			"can_decide_own_pr": types.BoolNull(),
+			"approve_up_to":     types.StringNull(),
 		})
 	}
 	cases := []struct {
@@ -991,6 +1248,7 @@ func TestAcceptsValidator_OwnPR(t *testing.T) {
 			"can_decide":        canDecide,
 			"can_auto_merge":    types.BoolNull(),
 			"can_decide_own_pr": ownPR,
+			"approve_up_to":     types.StringNull(),
 		})
 	}
 	mcp, gh, tracker := types.StringValue("autopilot-mcp"), types.StringValue("autopilot-github"), types.StringValue("tracker")
@@ -1010,6 +1268,75 @@ func TestAcceptsValidator_OwnPR(t *testing.T) {
 		{"off, for a sender in the ledger", entry(tracker, off, off), false},
 		{"left out", entry(tracker, off, types.BoolNull()), false},
 		{"not known yet", entry(tracker, off, types.BoolUnknown()), false},
+	}
+	for _, c := range cases {
+		req := validator.SetRequest{
+			Path:        path.Root("accepts"),
+			ConfigValue: types.SetValueMust(acceptObjectType, []attr.Value{c.entry}),
+		}
+		var resp validator.SetResponse
+		acceptsValidator{}.ValidateSet(ctx, req, &resp)
+		if resp.Diagnostics.HasError() != c.refused {
+			t.Errorf("%s: refused = %v, want %v (%v)", c.name, resp.Diagnostics.HasError(), c.refused, resp.Diagnostics)
+		}
+	}
+}
+
+// A ceiling still unknown at apply is an error, never read as none, the
+// widest setting.
+func TestAcceptsFromSet_unknownCeiling(t *testing.T) {
+	ctx := context.Background()
+	entry := func(ceiling types.String) attr.Value {
+		return types.ObjectValueMust(acceptAttrTypes, map[string]attr.Value{
+			"sender":            types.StringValue("autopilot-github"),
+			"kinds":             types.SetValueMust(types.StringType, []attr.Value{types.StringValue("review-pr")}),
+			"can_decide":        types.BoolValue(true),
+			"can_auto_merge":    types.BoolNull(),
+			"can_decide_own_pr": types.BoolNull(),
+			"approve_up_to":     ceiling,
+		})
+	}
+	var diags diag.Diagnostics
+	got := acceptsFromSet(ctx, types.SetValueMust(acceptObjectType, []attr.Value{entry(types.StringUnknown())}), &diags)
+	if !diags.HasError() || got != nil {
+		t.Errorf("unknown ceiling: accepts = %+v, diags = %v; want an error and nothing", got, diags)
+	}
+	diags = nil
+	got = acceptsFromSet(ctx, types.SetValueMust(acceptObjectType, []attr.Value{entry(types.StringValue("low"))}), &diags)
+	if diags.HasError() || len(got) != 1 || got[0].ApproveUpTo != "low" {
+		t.Errorf("known ceiling: accepts = %+v, diags = %v", got, diags)
+	}
+}
+
+// approve_up_to is refused without can_decide (left out is false), for any
+// sender alike, and waits while can_decide is unknown.
+func TestAcceptsValidator_ApproveUpTo(t *testing.T) {
+	ctx := context.Background()
+	entry := func(sender types.String, canDecide types.Bool, ceiling types.String) attr.Value {
+		return types.ObjectValueMust(acceptAttrTypes, map[string]attr.Value{
+			"sender":            sender,
+			"kinds":             types.SetValueMust(types.StringType, []attr.Value{types.StringValue("review-pr")}),
+			"can_decide":        canDecide,
+			"can_auto_merge":    types.BoolNull(),
+			"can_decide_own_pr": types.BoolNull(),
+			"approve_up_to":     ceiling,
+		})
+	}
+	gh, tracker := types.StringValue("autopilot-github"), types.StringValue("tracker")
+	on, off := types.BoolValue(true), types.BoolValue(false)
+	low := types.StringValue("low")
+	cases := []struct {
+		name    string
+		entry   attr.Value
+		refused bool
+	}{
+		{"GitHub, with can_decide", entry(gh, on, low), false},
+		{"a sender in the ledger, with can_decide", entry(tracker, on, types.StringValue("high")), false},
+		{"can_decide left out", entry(gh, types.BoolNull(), low), true},
+		{"can_decide false", entry(tracker, off, low), true},
+		{"can_decide not known yet", entry(gh, types.BoolUnknown(), low), false},
+		{"left out", entry(tracker, off, types.StringNull()), false},
+		{"not known yet", entry(tracker, off, types.StringUnknown()), false},
 	}
 	for _, c := range cases {
 		req := validator.SetRequest{

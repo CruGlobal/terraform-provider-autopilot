@@ -57,6 +57,7 @@ type acceptModel struct {
 	CanDecide      types.Bool   `tfsdk:"can_decide"`
 	CanAutoMerge   types.Bool   `tfsdk:"can_auto_merge"`
 	CanDecideOwnPR types.Bool   `tfsdk:"can_decide_own_pr"`
+	ApproveUpTo    types.String `tfsdk:"approve_up_to"`
 }
 
 var acceptAttrTypes = map[string]attr.Type{
@@ -65,6 +66,7 @@ var acceptAttrTypes = map[string]attr.Type{
 	"can_decide":        types.BoolType,
 	"can_auto_merge":    types.BoolType,
 	"can_decide_own_pr": types.BoolType,
+	"approve_up_to":     types.StringType,
 }
 
 var acceptObjectType = types.ObjectType{AttrTypes: acceptAttrTypes}
@@ -172,6 +174,7 @@ func acceptsToSet(accepts []client.Accept, prior types.Set) types.Set {
 			"can_decide":        types.BoolValue(a.CanDecide),
 			"can_auto_merge":    optionalFlag(a.CanAutoMerge, autoMergeFalse[a.Sender]),
 			"can_decide_own_pr": optionalFlag(a.CanDecideOwnPR, ownPRFalse[a.Sender]),
+			"approve_up_to":     optionalString(a.ApproveUpTo),
 		}))
 	}
 	return types.SetValueMust(acceptObjectType, elems)
@@ -184,6 +187,15 @@ func optionalFlag(on, priorSaysFalse bool) types.Bool {
 		return types.BoolNull()
 	}
 	return types.BoolValue(on)
+}
+
+// optionalString maps an optional string with no default: "" (AutoPilot's
+// null) is null.
+func optionalString(s string) types.String {
+	if s == "" {
+		return types.StringNull()
+	}
+	return types.StringValue(s)
 }
 
 // flagSetFalse names the senders whose entry in prior (the plan, or the
@@ -270,12 +282,19 @@ func acceptsFromSet(ctx context.Context, set types.Set, diags *diag.Diagnostics)
 	diags.Append(set.ElementsAs(ctx, &models, false)...)
 	out := make([]client.Accept, 0, len(models))
 	for _, m := range models {
+		// A ceiling still unknown at apply is an error, never read as none:
+		// none is the widest setting there is.
+		if m.ApproveUpTo.IsUnknown() {
+			unknownAtApply(diags, "accepts")
+			return nil
+		}
 		out = append(out, client.Accept{
 			Sender:         m.Sender.ValueString(),
 			Kinds:          stringsFromSet(ctx, m.Kinds, "accepts", diags),
 			CanDecide:      m.CanDecide.ValueBool(),
 			CanAutoMerge:   m.CanAutoMerge.ValueBool(),
 			CanDecideOwnPR: m.CanDecideOwnPR.ValueBool(),
+			ApproveUpTo:    m.ApproveUpTo.ValueString(),
 		})
 	}
 	return out
@@ -406,6 +425,28 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 								"of what may be the asker's own pull request that is still queued or running is refused or " +
 								"stopped; ask for the review again.",
 							Optional: true,
+						},
+						"approve_up_to": schema.StringAttribute{
+							MarkdownDescription: "With `can_decide`, the most risk a pull request may carry for that " +
+								"sender's reviews to approve it: `low`, `medium` or `high`. Every review states its pull " +
+								"request's risk. The agent rates it from reading the pull request, and AutoPilot then " +
+								"applies rules of its own that never ask the model and can only raise the rating. For " +
+								"example, a change to CI workflows or to the instructions agents read, or a large diff, is " +
+								"never `low`, and a repository can name its own never-low paths in an " +
+								"`autopilot-never-low-paths` block on its base branch (AutoPilot's admin API documentation " +
+								"lists the rules). An approval rated above this is posted as a comment, with its findings and " +
+								"its level, saying why. So is one whose rating AutoPilot couldn't read, or whose rules it " +
+								"couldn't check, whatever the ceiling, `high` included. A request for changes isn't limited " +
+								"by it. Only with `can_decide = true`, for any sender whose reviews may decide. Left out, " +
+								"every level may be approved, as with `can_decide` alone. The rating is the model's " +
+								"judgment, held up by those rules: a change outside them that a pull request talks its " +
+								"review into rating `low` can still be approved under `low`. AutoPilot asks for the " +
+								"ceiling just before each approval, so a change reaches reviews already running. An " +
+								"AutoPilot release older than this field ignores a stored ceiling and refuses a write that " +
+								"sends one, so if AutoPilot is ever rolled back that far, its reviews approve at any level " +
+								"until it is rolled forward: take `can_decide` off first where a ceiling matters.",
+							Optional:   true,
+							Validators: []validator.String{stringvalidator.OneOf("low", "medium", "high")},
 						},
 					},
 				},

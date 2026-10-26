@@ -26,7 +26,7 @@ var (
 	maxGitHubLogins    = 100
 	appWritable        = []string{"repos", "accepts", "developers", "github_logins", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory"}
 	appReadOnly        = []string{"lock_version", "created_at", "updated_at"}
-	acceptWritable     = []string{"sender", "kinds", "can_decide", "can_auto_merge", "can_decide_own_pr"}
+	acceptWritable     = []string{"sender", "kinds", "can_decide", "can_auto_merge", "can_decide_own_pr", "approve_up_to"}
 	appCreateFields    = append([]string{"name"}, appWritable...)
 	// An app's credential policy: what its tasks run on, and with
 	// seat_first, what they do when every seat is full.
@@ -34,6 +34,8 @@ var (
 	whenSeatsFull = []string{"wait", "fall_back"}
 	// The worker images an app's tasks may run in.
 	workerImages = []string{"node", "ruby", "python", "go"}
+	// The risk levels a deciding review may approve up to, lowest first.
+	riskLevels = []string{"low", "medium", "high"}
 )
 
 // workerMemory is the memory, in MiB, that Fargate allows with each CPU size
@@ -114,6 +116,9 @@ type Accept struct {
 	CanDecide      bool
 	CanAutoMerge   bool
 	CanDecideOwnPR bool
+	// ApproveUpTo is the most risk a pull request may carry for the
+	// sender's reviews to approve it; empty is no ceiling (null).
+	ApproveUpTo string
 }
 
 // appRecord is an app as the fake stores it. An empty credential or
@@ -166,6 +171,7 @@ func cloneAccepts(in []Accept) []Accept {
 		out = append(out, Accept{
 			Sender: a.Sender, Kinds: slices.Clone(a.Kinds),
 			CanDecide: a.CanDecide, CanAutoMerge: a.CanAutoMerge, CanDecideOwnPR: a.CanDecideOwnPR,
+			ApproveUpTo: a.ApproveUpTo,
 		})
 	}
 	return out
@@ -189,7 +195,7 @@ func acceptsEqual(x, y []Accept) bool {
 // sameAccept reports whether two entries, kinds sorted, are exactly equal.
 func sameAccept(a, b Accept) bool {
 	return a.Sender == b.Sender && a.CanDecide == b.CanDecide && a.CanAutoMerge == b.CanAutoMerge &&
-		a.CanDecideOwnPR == b.CanDecideOwnPR && slices.Equal(a.Kinds, b.Kinds)
+		a.CanDecideOwnPR == b.CanDecideOwnPR && a.ApproveUpTo == b.ApproveUpTo && slices.Equal(a.Kinds, b.Kinds)
 }
 
 func (rec *appRecord) json() map[string]any {
@@ -197,7 +203,7 @@ func (rec *appRecord) json() map[string]any {
 	for _, a := range sortAccepts(rec.accepts) {
 		accepts = append(accepts, map[string]any{
 			"sender": a.Sender, "kinds": a.Kinds, "can_decide": a.CanDecide, "can_auto_merge": a.CanAutoMerge,
-			"can_decide_own_pr": a.CanDecideOwnPR,
+			"can_decide_own_pr": a.CanDecideOwnPR, "approve_up_to": nullable(a.ApproveUpTo),
 		})
 	}
 	logins := make([]any, 0, len(rec.githubLogins))
@@ -474,12 +480,25 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 				return f, invalid(at+"/can_decide_own_pr",
 					"is true only for autopilot-mcp and autopilot-github, whose reviews run for a person")
 			}
+			// The ceiling on what a deciding review may approve narrows
+			// can_decide, so it needs it. null is no ceiling, as the record
+			// shows it.
+			approveUpTo := ""
+			if raw, ok := e["approve_up_to"]; ok {
+				if approveUpTo, ref = oneOrNull(raw, at+"/approve_up_to", riskLevels); ref != nil {
+					return f, ref
+				}
+			}
+			if approveUpTo != "" && !canDecide {
+				return f, invalid(at+"/approve_up_to", "is set only with can_decide true")
+			}
 			if canAutoMerge && !slices.ContainsFunc(kinds, func(k string) bool { return slices.Contains(pullRequestKinds, k) }) {
 				return f, invalid(at+"/can_auto_merge", "is true only with implement-work-item or fix-error in kinds")
 			}
 			entry := Accept{
 				Sender: sender, Kinds: sortedUnique(kinds),
 				CanDecide: canDecide, CanAutoMerge: canAutoMerge, CanDecideOwnPR: canDecideOwnPR,
+				ApproveUpTo: approveUpTo,
 			}
 			// An entry sent twice exactly is kept once; two different entries
 			// for one sender are refused.
