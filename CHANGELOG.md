@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.4.0...v0.5.0) (2026-10-26)
+
+
+### Added
+
+* **app:** add auto_review, for pull request reviews AutoPilot starts on its own ([#18](https://github.com/CruGlobal/terraform-provider-autopilot/issues/18)) ([3ef3055](https://github.com/CruGlobal/terraform-provider-autopilot/commit/3ef30550172213b962fb7766862bd5530a680df4))
+
 ## [0.4.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.3.1...v0.4.0) (2026-10-26)
 
 
