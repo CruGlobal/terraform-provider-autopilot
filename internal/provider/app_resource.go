@@ -640,8 +640,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					"developer, and an `accepts` entry for `autopilot-github` doesn't turn it on. A head and base gets " +
 					"one review from GitHub, so a later `autopilot-review` label on the same head gets the automatic " +
 					"review, even one that only commented. Automatic reviews count only against `max_per_day`, never " +
-					"against a repository's daily cap on the reviews people ask for, so they never hold a developer's " +
-					"label back. Left out, the app has no " +
+					"against a repository's daily cap on the reviews people ask for, so they never get a developer's " +
+					"label refused, though they share AutoPilot's one running review from GitHub with labels. Left " +
+					"out, the app has no " +
 					"automatic reviews, and removing it from the configuration turns them off, which also stops the " +
 					"ones queued or running; so does taking `can_decide` or `can_decide_own_pr` away, while fewer " +
 					"`events` or a lower `max_per_day` reach only what comes after. It needs an AutoPilot that knows the " +
