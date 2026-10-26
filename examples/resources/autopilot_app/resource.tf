@@ -64,7 +64,8 @@ resource "autopilot_app" "billing" {
 
   # Review each pull request into the default branch when it is opened or
   # marked ready, with no label, as the app's own service identity. Drafts
-  # wait until they are ready, and bots' pull requests are skipped.
+  # wait until they are ready, and bots' and forks' pull requests are
+  # skipped.
   auto_review = {
     events      = ["opened", "ready_for_review"]
     max_per_day = 50

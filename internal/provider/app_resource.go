@@ -630,15 +630,18 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				MarkdownDescription: "Automatic reviews: AutoPilot reviews each pull request into the default branch of " +
 					"this app's repositories on its own, with no label or comment, when it is opened, marked ready or " +
 					"pushed to, as `events` says. It reviews only a person's pull request, never a bot's (Dependabot's, or " +
-					"any account GitHub calls a bot), and never a draft until it is marked ready. A pull request from a fork " +
-					"is reviewed too, only as a comment. The review runs as the app's own service identity, " +
+					"any account GitHub calls a bot), and never a draft until it is marked ready. It reviews only a pull " +
+					"request from a branch of the repository itself, never a fork's, so no one outside the repository " +
+					"can have code run with no person asking; a developer's `autopilot-review` label still reviews a " +
+					"fork's pull request, only as a comment. The review runs as the app's own service identity, " +
 					"`auto-review:<name>`, never a person: that identity asks for it, the app pays, its limits count it, " +
 					"and the review's footer, its check run (`AutoPilot review (automatic)`) and AutoPilot's logs name it. " +
 					"It posts no other comment. Setting this is the app's consent; it needs no `accepts` entry and no " +
 					"developer, and an `accepts` entry for `autopilot-github` doesn't turn it on. A head and base gets " +
 					"one review from GitHub, so a later `autopilot-review` label on the same head gets the automatic " +
-					"review, even one that only commented. On a public repository anyone can open pull requests, and " +
-					"each counts against `max_per_day` and the repository's own daily cap. Left out, the app has no " +
+					"review, even one that only commented. Automatic reviews count only against `max_per_day`, never " +
+					"against a repository's daily cap on the reviews people ask for, so they never hold a developer's " +
+					"label back. Left out, the app has no " +
 					"automatic reviews, and removing it from the configuration turns them off, which also stops the " +
 					"ones queued or running; so does taking `can_decide` or `can_decide_own_pr` away, while fewer " +
 					"`events` or a lower `max_per_day` reach only what comes after. It needs an AutoPilot that knows the " +
@@ -664,9 +667,10 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					},
 					"max_per_day": schema.Int64Attribute{
 						MarkdownDescription: "The most automatic reviews of this app's repositories in 24 hours, every " +
-							"one AutoPilot recorded counting, however it ended: `1` to `200`. Defaults to `50`. Each also " +
-							"counts against its repository's own daily cap on reviews from GitHub, and runs only on one of " +
-							"the organization's Claude seats.",
+							"one AutoPilot recorded counting, however it ended: `1` to `200`. Defaults to `50`. It is their " +
+							"only daily cap: they don't count against a repository's cap on the reviews people ask for, and " +
+							"those don't count against it. Each runs only on one of the organization's Claude seats, one " +
+							"review from GitHub at a time.",
 						Optional:   true,
 						Computed:   true,
 						Default:    int64default.StaticInt64(defaultAutoPerDay),
@@ -675,8 +679,8 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					"can_decide": schema.BoolAttribute{
 						MarkdownDescription: "Whether automatic reviews may approve or request changes, which can count " +
 							"as a required review. Independent of any `accepts` entry's `can_decide`, `autopilot-github`'s " +
-							"included. A review decides only on a pull request into the default branch, never on a fork's, " +
-							"and requests changes for any finding it marks Important. Defaults to `false`.",
+							"included. A review decides only on a pull request into the default branch, and requests " +
+							"changes for any finding it marks Important. Defaults to `false`.",
 						Optional: true,
 						Computed: true,
 						Default:  booldefault.StaticBool(false),
