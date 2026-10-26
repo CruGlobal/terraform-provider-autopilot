@@ -205,22 +205,27 @@ func (s AppSpec) fields() Fields {
 	return f
 }
 
-// autoReviewBody is automatic reviews as a write sends them: the events in
-// AutoPilot's order, each once, and the cap. can_decide and
-// can_decide_own_pr are sent only when true, and approve_up_to only when
-// set, as an accepts entry's are: AutoPilot's default for each is off.
+// autoReviewBody is automatic reviews as a write sends them: every field,
+// the events in AutoPilot's order, each once, and no ceiling as null. Unlike
+// an accepts entry's flags, the knobs are sent even when off: every
+// AutoPilot that takes auto_review knows all five fields, and the body then
+// says exactly what the plan does, not what AutoPilot's defaults would.
 func autoReviewBody(a AutoReview) map[string]any {
-	body := map[string]any{"events": normalizeEvents(a.Events), "max_per_day": a.MaxPerDay}
-	if a.CanDecide {
-		body["can_decide"] = true
+	return map[string]any{
+		"events":            normalizeEvents(a.Events),
+		"max_per_day":       a.MaxPerDay,
+		"can_decide":        a.CanDecide,
+		"can_decide_own_pr": a.CanDecideOwnPR,
+		"approve_up_to":     nullableString(a.ApproveUpTo),
 	}
-	if a.CanDecideOwnPR {
-		body["can_decide_own_pr"] = true
+}
+
+// nullableString is "" as null, and any other string as itself.
+func nullableString(s string) any {
+	if s == "" {
+		return nil
 	}
-	if a.ApproveUpTo != "" {
-		body["approve_up_to"] = a.ApproveUpTo
-	}
-	return body
+	return s
 }
 
 // normalizeEvents is events as AutoPilot keeps them: each once, in

@@ -66,6 +66,33 @@ func cloneAutoReview(a *AutoReview) *AutoReview {
 	return &out
 }
 
+// storedAutoReview is automatic reviews as AutoPilot keeps what it is given
+// from outside a write (SeedApp, ChangeAppOutOfBand): the events it knows,
+// each once, in its order, and none at all with none of them; and the own
+// pull request's toggle only with can_decide.
+func storedAutoReview(a *AutoReview) *AutoReview {
+	if a == nil {
+		return nil
+	}
+	out := cloneAutoReview(a)
+	out.Events = []string{}
+	for _, e := range autoEvents {
+		if slices.Contains(a.Events, e) {
+			out.Events = append(out.Events, e)
+		}
+	}
+	if len(out.Events) == 0 {
+		return nil
+	}
+	out.CanDecideOwnPR = a.CanDecide && a.CanDecideOwnPR
+	return out
+}
+
+// plainKey is AutoPilot's rule for naming an unknown key in a refusal's
+// pointer: a plain word, at most 64 characters. Any other is pointed at
+// through the object that holds it.
+var plainKey = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
 func sameAutoReview(x, y *AutoReview) bool {
 	if x == nil || y == nil {
 		return x == y
@@ -147,6 +174,9 @@ func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
 				return nil, ref
 			}
 		default:
+			if !plainKey.MatchString(k) {
+				at = "/auto_review"
+			}
 			return nil, &refusal{http.StatusUnprocessableEntity, "invalid_attribute", "AutoPilot doesn't know this field", at}
 		}
 	}
@@ -383,7 +413,7 @@ func (s *Server) SeedApp(v AppView) {
 		developers: sortedUnique(v.Developers), githubLogins: sortLogins(v.GitHubLogins),
 		credential: v.Credential, whenSeatsFull: v.WhenSeatsFull,
 		workerImage: v.WorkerImage, workerCPU: v.WorkerCPU, workerMemory: v.WorkerMemory,
-		autoReview:  cloneAutoReview(v.AutoReview),
+		autoReview:  storedAutoReview(v.AutoReview),
 		lockVersion: 1, createdAt: now, updatedAt: now,
 	}
 }
@@ -414,7 +444,7 @@ func (s *Server) ChangeAppOutOfBand(name string, change func(v *AppView)) {
 	rec.githubLogins = sortLogins(v.GitHubLogins)
 	rec.credential, rec.whenSeatsFull = v.Credential, v.WhenSeatsFull
 	rec.workerImage, rec.workerCPU, rec.workerMemory = v.WorkerImage, v.WorkerCPU, v.WorkerMemory
-	rec.autoReview = cloneAutoReview(v.AutoReview)
+	rec.autoReview = storedAutoReview(v.AutoReview)
 	rec.lockVersion++
 	rec.updatedAt = time.Now()
 }
@@ -647,6 +677,15 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 		}
 		f.accepts = sortAccepts(f.accepts)
 	}
+	// Read right after accepts, as AutoPilot reads an app's fields in sorted
+	// order. (This fake still reads repos first, as before.)
+	if raw, ok := obj["auto_review"]; ok {
+		auto, ref := readAutoReview(raw)
+		if ref != nil {
+			return f, ref
+		}
+		f.autoSent, f.autoReview = true, auto
+	}
 	if raw, ok := obj["developers"]; ok {
 		devs, ref := stringList(raw, "/developers")
 		if ref != nil {
@@ -731,13 +770,6 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 			return f, invalid("/worker_memory", "is MiB that Fargate allows with worker_cpu, at most 16 GB")
 		}
 		f.sizeSent, f.workerCPU, f.workerMemory = true, cpu, memory
-	}
-	if raw, ok := obj["auto_review"]; ok {
-		auto, ref := readAutoReview(raw)
-		if ref != nil {
-			return f, ref
-		}
-		f.autoSent, f.autoReview = true, auto
 	}
 	// Once every field is read: a write that sends both developers and
 	// github_logins is checked here, at the entry; one that sends only one of

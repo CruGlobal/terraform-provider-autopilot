@@ -910,6 +910,10 @@ func TestAutoReview_Refused(t *testing.T) {
 		{map[string]any{"can_decide": true, "approve_up_to": "none"}, "/auto_review/approve_up_to"},
 		{map[string]any{"can_decide": true, "approve_up_to": "LOW"}, "/auto_review/approve_up_to"},
 		{map[string]any{"name": "auto-review:billing"}, "/auto_review/name"},
+		// An unknown key that isn't a plain word is pointed at through the object.
+		{map[string]any{"a b": 1}, "/auto_review"},
+		// Read right after accepts, before the fields that sort after it.
+		{map[string]any{"max_per_day": 0, "zz": 1}, "/auto_review/max_per_day"},
 		// The first wrong field in sorted order is the one named.
 		{map[string]any{"max_per_day": 0, "events": []string{}}, "/auto_review/events"},
 	}

@@ -1010,9 +1010,9 @@ func TestGetApp_WithoutGitHubLogins(t *testing.T) {
 	}
 }
 
-// Automatic reviews are sent whole when set: the events each once in
-// AutoPilot's order, the cap, the flags only when true and the ceiling only
-// when set; and as null to take them away. Left unset, they aren't sent.
+// Automatic reviews are sent whole when set: every field, the events each
+// once in AutoPilot's order, the flags even when off and no ceiling as null;
+// and as null to take them away. Left unset, they aren't sent.
 func TestUpdateApp_SendsAutoReview(t *testing.T) {
 	var bodies []string
 	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1035,7 +1035,7 @@ func TestUpdateApp_SendsAutoReview(t *testing.T) {
 		}
 	}
 	want := []string{
-		`{"auto_review":{"events":["opened","ready_for_review"],"max_per_day":50}}`,
+		`{"auto_review":{"approve_up_to":null,"can_decide":false,"can_decide_own_pr":false,"events":["opened","ready_for_review"],"max_per_day":50}}`,
 		`{"auto_review":{"approve_up_to":"low","can_decide":true,"can_decide_own_pr":true,"events":["opened","synchronize"],"max_per_day":10}}`,
 		`{"auto_review":null}`,
 		`{"developers":[]}`,

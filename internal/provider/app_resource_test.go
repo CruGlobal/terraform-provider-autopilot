@@ -2875,7 +2875,7 @@ func TestApp_autoReviewSentWhole(t *testing.T) {
 				Check: func(*terraform.State) error {
 					patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)
 					body := requestBody(t, patches[len(patches)-1])
-					if got, want := mustJSON(t, body), `{"auto_review":{"can_decide":true,"events":["opened","ready_for_review"],"max_per_day":50}}`; got != want {
+					if got, want := mustJSON(t, body), `{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,"events":["opened","ready_for_review"],"max_per_day":50}}`; got != want {
 						return fmt.Errorf("body = %s, want %s", got, want)
 					}
 					return nil
@@ -2888,7 +2888,7 @@ func TestApp_autoReviewSentWhole(t *testing.T) {
 				Check: func(*terraform.State) error {
 					patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)
 					body := requestBody(t, patches[len(patches)-1])
-					if got, want := mustJSON(t, body), `{"auto_review":{"can_decide":true,"events":["opened","ready_for_review"],"max_per_day":5}}`; got != want {
+					if got, want := mustJSON(t, body), `{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,"events":["opened","ready_for_review"],"max_per_day":5}}`; got != want {
 						return fmt.Errorf("body = %s, want %s", got, want)
 					}
 					return nil

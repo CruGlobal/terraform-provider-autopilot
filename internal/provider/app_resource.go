@@ -640,8 +640,12 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					"review, even one that only commented. On a public repository anyone can open pull requests, and " +
 					"each counts against `max_per_day` and the repository's own daily cap. Left out, the app has no " +
 					"automatic reviews, and removing it from the configuration turns them off, which also stops the " +
-					"ones queued or running. It needs an AutoPilot that knows the field; an older one refuses it with a " +
-					"422.",
+					"ones queued or running; so does taking `can_decide` or `can_decide_own_pr` away, while fewer " +
+					"`events` or a lower `max_per_day` reach only what comes after. It needs an AutoPilot that knows the " +
+					"field; an older one refuses it with a 422. An AutoPilot rolled back past the field ignores a stored " +
+					"setting and refuses every write that sends one, but keeps it, so it is on again once AutoPilot is " +
+					"rolled forward, even if it was taken out of the configuration meanwhile (Terraform reads it as " +
+					"none, so sends nothing): take it off before such a rollback where that matters.",
 				Optional: true,
 				Attributes: map[string]schema.Attribute{
 					"events": schema.SetAttribute{
