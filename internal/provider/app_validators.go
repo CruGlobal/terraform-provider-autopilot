@@ -74,7 +74,7 @@ func (emailValidator) ValidateString(_ context.Context, req validator.StringRequ
 }
 
 // The worker images an app's tasks may run in.
-var workerImages = []string{"node", "ruby", "python", "go"}
+var workerImages = []string{"node", "ruby", "ruby-browser", "python", "go"}
 
 // workerSizes is the memory, in MiB, that AWS Fargate allows with each CPU
 // size, in CPU units, an app's workers may have: at most 4 vCPU and 16 GB.

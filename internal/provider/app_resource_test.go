@@ -1972,6 +1972,22 @@ func TestApp_worker(t *testing.T) {
 				),
 			},
 			{
+				// The opt-in image with a browser, and the image alone is sent.
+				Config: appConfig(env, name, `
+  worker_image  = "ruby-browser"
+  worker_cpu    = 4096
+  worker_memory = 8192`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "worker_image", "ruby-browser"),
+					resource.TestCheckResourceAttr(appRes, "worker_memory", "8192"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "3"),
+					lastAppPatch(t, env, name, map[string]any{"worker_image": "ruby-browser"}),
+				),
+			},
+			{
 				Config: appConfig(env, name, `  worker_image = "go"`),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(appRes, "worker_image", "go"),
@@ -1984,7 +2000,7 @@ func TestApp_worker(t *testing.T) {
 				Config: appConfig(env, name, ""),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckNoResourceAttr(appRes, "worker_image"),
-					resource.TestCheckResourceAttr(appRes, "lock_version", "4"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "5"),
 					lastAppPatch(t, env, name, map[string]any{"worker_image": nil}),
 					func(*terraform.State) error {
 						if env.live() {
@@ -2141,6 +2157,7 @@ func TestApp_workerPlanTimeValidation(t *testing.T) {
 	}{
 		{`  worker_image = "rust"`, "value must be one of"},
 		{`  worker_image = "Node"`, "value must be one of"},
+		{`  worker_image = "ruby_browser"`, "value must be one of"},
 		{`  worker_cpu = 4096`, "worker_memory is required with worker_cpu"},
 		{`  worker_memory = 16384`, "worker_cpu is required with worker_memory"},
 		{`

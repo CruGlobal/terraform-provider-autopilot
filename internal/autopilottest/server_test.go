@@ -663,6 +663,7 @@ func TestWorker_Rules(t *testing.T) {
 	}{
 		{map[string]any{"worker_image": "rust"}, "/worker_image"},
 		{map[string]any{"worker_image": "Node"}, "/worker_image"},
+		{map[string]any{"worker_image": "ruby_browser"}, "/worker_image"},
 		{map[string]any{"worker_image": 1}, "/worker_image"},
 		{map[string]any{"worker_cpu": 4096}, "/worker_memory"},
 		{map[string]any{"worker_memory": 16384}, "/worker_cpu"},
@@ -705,9 +706,14 @@ func TestWorker_Rules(t *testing.T) {
 	if body["worker_cpu"] != nil || body["worker_memory"] != nil || body["worker_image"] != "ruby" || body["lock_version"] != float64(2) {
 		t.Errorf("size taken away: %v", body)
 	}
-	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"worker_image": nil})
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"worker_image": "ruby-browser"})
+	expect(t, "the image with a browser", st, http.StatusOK, body)
+	if body["worker_image"] != "ruby-browser" || body["lock_version"] != float64(3) {
+		t.Errorf("the image with a browser: %v", body)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"worker_image": nil})
 	expect(t, "back to node", st, http.StatusOK, body)
-	if body["worker_image"] != nil || body["lock_version"] != float64(3) {
+	if body["worker_image"] != nil || body["lock_version"] != float64(4) {
 		t.Errorf("back to node: %v", body)
 	}
 }
