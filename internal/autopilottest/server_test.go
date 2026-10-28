@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -915,7 +916,9 @@ func TestAutoReview_Refused(t *testing.T) {
 		// Read right after accepts, before the fields that sort after it.
 		{map[string]any{"max_per_day": 0, "zz": 1}, "/auto_review/max_per_day"},
 		// The first wrong field in sorted order is the one named.
-		{map[string]any{"max_per_day": 0, "events": []string{}}, "/auto_review/events"},
+		{map[string]any{"max_per_day": 0, "events": "opened"}, "/auto_review/events"},
+		// No event is a wrong field only once every field is read.
+		{map[string]any{"max_per_day": 0, "events": []string{}}, "/auto_review/max_per_day"},
 	}
 	for _, c := range cases {
 		st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": c.auto})
@@ -940,8 +943,8 @@ func TestAutoReview_Kept(t *testing.T) {
 	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"auto_review": map[string]any{}})
 	expect(t, "every default", st, http.StatusOK, body)
 	want := map[string]any{
-		"events": []any{"opened", "ready_for_review"}, "max_per_day": float64(50), "can_decide": false,
-		"can_decide_own_pr": false, "approve_up_to": nil,
+		"events": []any{"opened", "ready_for_review"}, "workflows": []any{}, "max_per_day": float64(50),
+		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil,
 	}
 	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
 		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
@@ -984,6 +987,148 @@ func TestAutoReview_Kept(t *testing.T) {
 	} {
 		st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", other)
 		expect(t, fmt.Sprintf("create %v", other), st, http.StatusConflict, body)
+	}
+}
+
+// auto_review's workflows are refused where AutoPilot refuses them, at the
+// field AutoPilot names: each one at its place, the list as a whole, and the
+// events beside them.
+func TestAutoReview_WorkflowsRefused(t *testing.T) {
+	s := New(t)
+	const file = "example-org/billing-api/.github/workflows/autopilot-review.yml"
+	main := file + "@refs/heads/main"
+	cases := []struct {
+		auto  map[string]any
+		field string
+	}{
+		// No event and no workflow: nothing could start one.
+		{map[string]any{"events": []string{}, "workflows": []string{}}, "/auto_review/events"},
+		{map[string]any{"events": []string{}}, "/auto_review/events"},
+		// Workflows with the events left out, which would default to reviews
+		// on their own before any workflow asks.
+		{map[string]any{"workflows": []string{main}}, "/auto_review/events"},
+		{map[string]any{"workflows": []string{main}, "max_per_day": 5}, "/auto_review/events"},
+		{map[string]any{"workflows": "x"}, "/auto_review/workflows"},
+		{map[string]any{"workflows": nil}, "/auto_review/workflows"},
+		{map[string]any{"workflows": map[string]any{}}, "/auto_review/workflows"},
+		{map[string]any{"workflows": []any{1}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []any{main, nil}}, "/auto_review/workflows/1"},
+		// Every item must be a string before any is read as a workflow.
+		{map[string]any{"workflows": []any{"nonsense", 1}}, "/auto_review/workflows/1"},
+		// A pull request's ref, a tag, a commit, or no branch.
+		{map[string]any{"workflows": []string{file + "@refs/pull/5/merge"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{file + "@refs/tags/v1"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{file + "@4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{file}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{file + "@main"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{file + "@refs/heads/"}}, "/auto_review/workflows/0"},
+		// Not straight in .github/workflows, not YAML, or a repository git
+		// or GitHub wouldn't name.
+		{map[string]any{"workflows": []string{"example-org/billing-api/.github/workflows/sub/r.yml@refs/heads/main"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{"example-org/billing-api/.github/actions/r.yml@refs/heads/main"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{"example-org/billing-api/.github/workflows/r.json@refs/heads/main"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{"example-org/billing-api/.github/workflows/.yml@refs/heads/main"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{"example-org/../.github/workflows/r.yml@refs/heads/main"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{"example-org/./.github/workflows/r.yml@refs/heads/main"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{"example_org/billing-api/.github/workflows/r.yml@refs/heads/main"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{strings.Repeat("a", 40) + "/r/.github/workflows/r.yml@refs/heads/main"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{"o/" + strings.Repeat("r", 101) + "/.github/workflows/r.yml@refs/heads/main"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{"o/r/.github/workflows/" + strings.Repeat("f", 201) + ".yml@refs/heads/main"}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{"o/r/.github/workflows/r.yml@refs/heads/" + strings.Repeat("b", 201)}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{main + "\n"}}, "/auto_review/workflows/0"},
+		// The same workflow twice, its repository in another case.
+		{map[string]any{"workflows": []string{main, "Example-Org/Billing-API/.github/workflows/autopilot-review.yml@refs/heads/main"}}, "/auto_review/workflows/1"},
+		// Read in sorted order: max_per_day before workflows, workflows
+		// before the checks that span fields.
+		{map[string]any{"workflows": []string{"nonsense"}, "max_per_day": 0}, "/auto_review/max_per_day"},
+		{map[string]any{"workflows": []string{"nonsense"}, "events": []string{}}, "/auto_review/workflows/0"},
+		{map[string]any{"workflows": []string{main}, "approve_up_to": "low"}, "/auto_review/approve_up_to"},
+	}
+	// Branches git wouldn't make.
+	for _, branch := range []string{"../main", "main/", "a..b", "a//b", ".hidden", "x.lock", "-x", "/x", "x.", "a b", "a/.b", "a@b", "a~b"} {
+		cases = append(cases, struct {
+			auto  map[string]any
+			field string
+		}{map[string]any{"events": []string{}, "workflows": []string{file + "@refs/heads/" + branch}}, "/auto_review/workflows/0"})
+	}
+	var many []string
+	for i := range 21 {
+		many = append(many, fmt.Sprintf("example-org/billing-api/.github/workflows/w%d.yml@refs/heads/main", i))
+	}
+	cases = append(cases, struct {
+		auto  map[string]any
+		field string
+	}{map[string]any{"events": []string{}, "workflows": many}, "/auto_review/workflows"})
+	for _, c := range cases {
+		st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": c.auto})
+		expect(t, fmt.Sprintf("auto_review %v", c.auto), st, http.StatusUnprocessableEntity, body)
+		if body["field"] != c.field {
+			t.Errorf("auto_review %v: field = %v (%v), want %s", c.auto, body["field"], body["message"], c.field)
+		}
+	}
+}
+
+// auto_review's workflows are kept as sent, sorted, each once, and none
+// unless sent; with them, events may be none; and a create with them is a
+// retry only with the same.
+func TestAutoReview_WorkflowsKept(t *testing.T) {
+	s := New(t)
+	const main = "example-org/billing-api/.github/workflows/autopilot-review.yml@refs/heads/main"
+	const shared = "Example-Org/.github/.github/workflows/autopilot-review.yaml@refs/heads/release/v2"
+	// Another file, or the same in another case, is another workflow.
+	const other = "example-org/billing-api/.github/workflows/Autopilot-Review.yml@refs/heads/main"
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": map[string]any{
+		"events": []string{}, "workflows": []string{main, shared, main, other},
+	}})
+	expect(t, "workflows alone", st, http.StatusCreated, body)
+	want := map[string]any{
+		"events": []any{}, "workflows": []any{shared, other, main}, "max_per_day": float64(50),
+		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil,
+	}
+	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
+		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
+	}
+	v, _ := s.App("billing")
+	if v.AutoReview == nil || strings.Join(v.AutoReview.Workflows, ",") != shared+","+other+","+main {
+		t.Errorf("auto_review = %+v", v.AutoReview)
+	}
+	// The same create again is a retry; other workflows aren't.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": map[string]any{
+		"events": []string{}, "workflows": []string{other, shared, main},
+	}})
+	expect(t, "the same create again", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": map[string]any{
+		"events": []string{}, "workflows": []string{main},
+	}})
+	expect(t, "a create with other workflows", st, http.StatusConflict, body)
+	// With events too.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"auto_review": map[string]any{
+		"events": []string{"opened"}, "workflows": []string{main},
+	}})
+	expect(t, "events and a workflow", st, http.StatusOK, body)
+	if v, _ = s.App("billing"); v.AutoReview == nil || strings.Join(v.AutoReview.Events, ",") != "opened" ||
+		strings.Join(v.AutoReview.Workflows, ",") != main || v.LockVersion != 2 {
+		t.Errorf("auto_review = %+v, lock_version %d", v.AutoReview, v.LockVersion)
+	}
+	// Left out, there are none, as for any field of the one setting.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"auto_review": map[string]any{
+		"events": []string{"opened"},
+	}})
+	expect(t, "workflows left out", st, http.StatusOK, body)
+	if v, _ = s.App("billing"); v.AutoReview == nil || len(v.AutoReview.Workflows) != 0 || v.LockVersion != 3 {
+		t.Errorf("auto_review = %+v, lock_version %d, want no workflows", v.AutoReview, v.LockVersion)
+	}
+	// Twenty, with one sent twice, is twenty.
+	var twenty []string
+	for i := range 20 {
+		twenty = append(twenty, fmt.Sprintf("example-org/billing-api/.github/workflows/w%02d.yml@refs/heads/main", i))
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"auto_review": map[string]any{
+		"events": []string{}, "workflows": append(slices.Clone(twenty), twenty[0]),
+	}})
+	expect(t, "twenty, one twice", st, http.StatusOK, body)
+	if v, _ = s.App("billing"); v.AutoReview == nil || !slices.Equal(v.AutoReview.Workflows, twenty) {
+		t.Errorf("auto_review = %+v", v.AutoReview)
 	}
 }
 

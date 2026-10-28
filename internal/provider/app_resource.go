@@ -56,6 +56,7 @@ type appModel struct {
 
 type autoReviewModel struct {
 	Events         types.Set    `tfsdk:"events"`
+	Workflows      types.Set    `tfsdk:"workflows"`
 	MaxPerDay      types.Int64  `tfsdk:"max_per_day"`
 	CanDecide      types.Bool   `tfsdk:"can_decide"`
 	CanDecideOwnPR types.Bool   `tfsdk:"can_decide_own_pr"`
@@ -64,6 +65,7 @@ type autoReviewModel struct {
 
 var autoReviewAttrTypes = map[string]attr.Type{
 	"events":            types.SetType{ElemType: types.StringType},
+	"workflows":         types.SetType{ElemType: types.StringType},
 	"max_per_day":       types.Int64Type,
 	"can_decide":        types.BoolType,
 	"can_decide_own_pr": types.BoolType,
@@ -71,11 +73,13 @@ var autoReviewAttrTypes = map[string]attr.Type{
 }
 
 // The events and the cap an app's automatic reviews have unless it says,
-// and the most the cap may be, as AutoPilot has them.
+// the most the cap may be, and the most workflows it may list, as AutoPilot
+// has them.
 var (
 	defaultAutoEvents       = []string{"opened", "ready_for_review"}
 	defaultAutoPerDay int64 = 50
 	maxAutoPerDay     int64 = 200
+	maxAutoWorkflows        = 20
 )
 
 type acceptModel struct {
@@ -149,7 +153,8 @@ func appToModel(a *client.App, prior appModel) appModel {
 
 // autoReviewToObject maps the automatic reviews AutoPilot answered with to
 // state: null for none (or an AutoPilot that predates the field), and every
-// field otherwise, the ceiling null for none. The plan fills each field it
+// field otherwise, the ceiling null for none and the workflows empty for
+// none (or an AutoPilot that predates them). The plan fills each field it
 // leaves out with AutoPilot's default, so the two agree.
 func autoReviewToObject(a *client.AutoReview) types.Object {
 	if a == nil {
@@ -157,6 +162,7 @@ func autoReviewToObject(a *client.AutoReview) types.Object {
 	}
 	return types.ObjectValueMust(autoReviewAttrTypes, map[string]attr.Value{
 		"events":            setFromStrings(a.Events),
+		"workflows":         setFromStrings(a.Workflows),
 		"max_per_day":       types.Int64Value(a.MaxPerDay),
 		"can_decide":        types.BoolValue(a.CanDecide),
 		"can_decide_own_pr": types.BoolValue(a.CanDecideOwnPR),
@@ -181,13 +187,14 @@ func autoReviewFromModel(ctx context.Context, m appModel, diags *diag.Diagnostic
 	if diags.HasError() {
 		return nil
 	}
-	if auto.Events.IsUnknown() || auto.MaxPerDay.IsUnknown() || auto.CanDecide.IsUnknown() ||
-		auto.CanDecideOwnPR.IsUnknown() || auto.ApproveUpTo.IsUnknown() {
+	if auto.Events.IsUnknown() || auto.Workflows.IsUnknown() || auto.MaxPerDay.IsUnknown() ||
+		auto.CanDecide.IsUnknown() || auto.CanDecideOwnPR.IsUnknown() || auto.ApproveUpTo.IsUnknown() {
 		unknownAtApply(diags, "auto_review")
 		return nil
 	}
 	return &client.AutoReviewSetting{On: &client.AutoReview{
 		Events:         stringsFromSet(ctx, auto.Events, "auto_review", diags),
+		Workflows:      stringsFromSet(ctx, auto.Workflows, "auto_review", diags),
 		MaxPerDay:      auto.MaxPerDay.ValueInt64(),
 		CanDecide:      auto.CanDecide.ValueBool(),
 		CanDecideOwnPR: auto.CanDecideOwnPR.ValueBool(),
@@ -404,7 +411,8 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"its image, and the size of the AWS Fargate task it runs as. `worker_cpu` and `worker_memory` are one " +
 			"size, set together, and a change to either sends both.\n\n" +
 			"`auto_review` has AutoPilot review the app's pull requests on its own, with no label, as the app's own " +
-			"service identity. It is one setting, and a change to any of its fields sends all of them.\n\n" +
+			"service identity, and lets the GitHub Actions workflows it lists ask for those reviews. It is one " +
+			"setting, and a change to any of its fields sends all of them.\n\n" +
 			"An app with this name that already exists is not taken over, even when its values match: the create " +
 			"fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a " +
 			"gateway's 502, say) before an identical app answered: that attempt may have made the app, and the " +
@@ -629,7 +637,7 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"auto_review": schema.SingleNestedAttribute{
 				MarkdownDescription: "Automatic reviews: AutoPilot reviews each pull request into the default branch of " +
 					"this app's repositories on its own, with no label or comment, when it is opened, marked ready or " +
-					"pushed to, as `events` says. It reviews only a person's pull request, never a bot's (Dependabot's, or " +
+					"pushed to, as `events` says, or when a GitHub Actions workflow listed in `workflows` asks. It reviews only a person's pull request, never a bot's (Dependabot's, or " +
 					"any account GitHub calls a bot), and never a draft until it is marked ready. It reviews only a pull " +
 					"request from a branch of the repository itself, never a fork's, so no one outside the repository " +
 					"can have code run with no person asking; a developer's `autopilot-review` label still reviews a " +
@@ -645,7 +653,7 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					"out, the app has no " +
 					"automatic reviews, and removing it from the configuration turns them off, which also stops the " +
 					"ones queued or running; so does taking `can_decide` or `can_decide_own_pr` away, while fewer " +
-					"`events` or a lower `max_per_day` reach only what comes after. It needs an AutoPilot that knows the " +
+					"`events`, fewer `workflows` or a lower `max_per_day` reach only what comes after. It needs an AutoPilot that knows the " +
 					"field; an older one refuses it with a 422. An AutoPilot rolled back past the field ignores a stored " +
 					"setting and refuses every write that sends one, but keeps it, so it is on again once AutoPilot is " +
 					"rolled forward, even if it was taken out of the configuration meanwhile (Terraform reads it as " +
@@ -653,17 +661,53 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				Optional: true,
 				Attributes: map[string]schema.Attribute{
 					"events": schema.SetAttribute{
-						MarkdownDescription: "The pull request actions that start an automatic review: `opened`, " +
-							"`ready_for_review` (a draft marked ready) and `synchronize` (each push to it). Defaults to " +
-							"`opened` and `ready_for_review`. With `synchronize`, every push is a new head and so a new " +
-							"review, within `max_per_day`.",
+						MarkdownDescription: "The pull request actions that start an automatic review on its own: " +
+							"`opened`, `ready_for_review` (a draft marked ready) and `synchronize` (each push to it). " +
+							"Defaults to `opened` and `ready_for_review`. With `synchronize`, every push is a new head and " +
+							"so a new review, within `max_per_day`. At least one, unless `workflows` lists one: `[]` with " +
+							"`workflows` means only those workflows ask, and AutoPilot reviews nothing on its own. With " +
+							"`workflows` listed it must be set, even to the default, so the configuration says on purpose " +
+							"whether pull requests are also reviewed when they open.",
 						ElementType: types.StringType,
 						Optional:    true,
 						Computed:    true,
 						Default:     setdefault.StaticValue(setFromStrings(defaultAutoEvents)),
 						Validators: []validator.Set{
-							setvalidator.SizeAtLeast(1),
 							setvalidator.ValueStringsAre(stringvalidator.OneOf(client.AutoEvents...)),
+						},
+					},
+					"workflows": schema.SetAttribute{
+						MarkdownDescription: "The GitHub Actions workflows that may ask for one of this app's automatic " +
+							"reviews, for a repository that wants a review when no event can say, such as once its CI " +
+							"passes. A job of a listed workflow asks AutoPilot with the OIDC token GitHub gives a job " +
+							"that has `id-token: write`, so no secret is stored anywhere. AutoPilot's own documentation on " +
+							"reviews a workflow asks for has a workflow to copy and the checks it makes on each ask. Each " +
+							"entry is the workflow as GitHub names it in that token (`job_workflow_ref`): " +
+							"`owner/repo/.github/workflows/<file>.yml@refs/heads/<branch>` (or `.yaml`), such as " +
+							"`example-org/billing-api/.github/workflows/autopilot-review.yml@refs/heads/main`. Only a " +
+							"branch: a pull request's ref, a tag or a commit is refused, so a pull request that changes " +
+							"the workflow can't ask with its own copy. `owner` is letters, digits and `-`, at most 39 " +
+							"characters; `repo` is letters, digits, `.`, `_` and `-`, at most 100, and not dots alone; the " +
+							"file is straight in `.github/workflows`, letters, digits, `.`, `_` and `-`, at most 200, then " +
+							"`.yml` or `.yaml`; and the branch is letters, digits, `.`, `_`, `/` and `-`, at most 200, as " +
+							"git allows it: not starting with `.`, `-` or `/`, not ending with `/`, `.` or `.lock`, and " +
+							"with no `..`, `//` or `/.`. AutoPilot compares `owner/repo` without regard to case and the " +
+							"rest exactly, so no two entries may differ only in the case of `owner/repo`. At most 20. " +
+							"Defaults to none. The repository the job runs in must be one this app owns. The workflow " +
+							"file may be in another repository, called as a reusable workflow, and then whoever can push " +
+							"to that branch there decides what asks. An ask is one of this app's automatic reviews in " +
+							"every other way: the same identity, `max_per_day`, deciding knobs and check run, and the same " +
+							"rules on which pull requests get one. With any listed, `events` must be set. It needs an " +
+							"AutoPilot that knows the field; an older one refuses it with a 422. An AutoPilot rolled back " +
+							"past the field refuses every write that sends it, and reads an app that lists workflows and " +
+							"no event as having no automatic reviews.",
+						ElementType: types.StringType,
+						Optional:    true,
+						Computed:    true,
+						Default:     setdefault.StaticValue(setFromStrings(nil)),
+						Validators: []validator.Set{
+							setvalidator.SizeAtMost(maxAutoWorkflows),
+							setvalidator.ValueStringsAre(workflowRefValidator{}),
 						},
 					},
 					"max_per_day": schema.Int64Attribute{
@@ -723,8 +767,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 
 // ValidateConfig checks the rules that span two arguments: the credential
 // policy's, the worker size's, that each GitHub login's developer is one of
-// the developers, and automatic reviews' deciding knobs. A value not known
-// yet waits: Terraform validates again at apply.
+// the developers, and automatic reviews' deciding knobs, events and
+// workflows. A value not known yet waits: Terraform validates again at
+// apply.
 func (r *appResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	validatePolicy(ctx, req, resp)
 	validateSize(ctx, req, resp)
@@ -732,9 +777,9 @@ func (r *appResource) ValidateConfig(ctx context.Context, req resource.ValidateC
 	validateAutoReview(ctx, req, resp)
 }
 
-// validateAutoReview checks automatic reviews' knobs as AutoPilot does:
-// can_decide_own_pr and approve_up_to each narrow can_decide, so each needs
-// it. can_decide left out is false (its default); one not known yet waits.
+// validateAutoReview checks automatic reviews' fields that depend on each
+// other as AutoPilot does: the deciding knobs, the events beside the
+// workflows, and the workflows' repositories' case.
 func validateAutoReview(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	var auto types.Object
 	diags := req.Config.GetAttribute(ctx, path.Root("auto_review"), &auto)
@@ -743,7 +788,76 @@ func validateAutoReview(ctx context.Context, req resource.ValidateConfigRequest,
 		return
 	}
 	var m autoReviewModel
-	if d := auto.As(ctx, &m, basetypes.ObjectAsOptions{}); d.HasError() || m.CanDecide.IsUnknown() || isTrue(m.CanDecide) {
+	if d := auto.As(ctx, &m, basetypes.ObjectAsOptions{}); d.HasError() {
+		return
+	}
+	validateAutoReviewKnobs(m, resp)
+	validateAutoReviewEvents(m, resp)
+	validateAutoReviewWorkflows(m, resp)
+}
+
+// validateAutoReviewEvents checks events beside workflows, as AutoPilot
+// does: no event is allowed only with a workflow that may ask, and with one,
+// events must be set rather than left to its default, which would review
+// every pull request when it opens, before any workflow asks. AutoPilot
+// refuses workflows sent without events for the same reason, and the
+// default in the plan would hide that the configuration left them out.
+// Workflows not known yet wait.
+func validateAutoReviewEvents(m autoReviewModel, resp *resource.ValidateConfigResponse) {
+	if m.Workflows.IsUnknown() {
+		return
+	}
+	// A set with a value not known yet still has at least one value.
+	listsWorkflows := !m.Workflows.IsNull() && len(m.Workflows.Elements()) > 0
+	switch {
+	case listsWorkflows && m.Events.IsNull():
+		resp.Diagnostics.AddAttributeError(path.Root("auto_review").AtName("events"), "events is required with workflows",
+			"auto_review lists workflows, so it must also say which events start a review on their own: "+
+				"events = [] for only the workflows to ask, or the events, such as [\"opened\", \"ready_for_review\"]. "+
+				"AutoPilot refuses workflows without events, so that its default never reviews every pull request "+
+				"when it opens unasked.")
+	case !listsWorkflows && !m.Events.IsNull() && !m.Events.IsUnknown() && len(m.Events.Elements()) == 0:
+		resp.Diagnostics.AddAttributeError(path.Root("auto_review").AtName("events"), "No event and no workflow",
+			"auto_review's events is empty and it lists no workflows, so nothing could start a review. Name at least "+
+				"one event, list the workflows that may ask in workflows, or take auto_review out to turn automatic "+
+				"reviews off.")
+	}
+}
+
+// validateAutoReviewWorkflows refuses two workflows that differ only in the
+// case of owner/repo, as AutoPilot does: it compares the repository without
+// regard to case and the file and branch exactly. A set already keeps an
+// entry listed twice exactly once. Values not known yet, or that their own
+// validator refuses, are skipped.
+func validateAutoReviewWorkflows(m autoReviewModel, resp *resource.ValidateConfigResponse) {
+	if m.Workflows.IsNull() || m.Workflows.IsUnknown() {
+		return
+	}
+	seen := map[string]string{}
+	for _, elem := range m.Workflows.Elements() {
+		s, ok := elem.(types.String)
+		if !ok || !known(s) {
+			continue
+		}
+		ref, problem := parseWorkflowRef(s.ValueString())
+		if problem != "" {
+			continue
+		}
+		if first, dup := seen[ref.key()]; dup {
+			resp.Diagnostics.AddAttributeError(path.Root("auto_review").AtName("workflows"), "Repeated workflow",
+				fmt.Sprintf("%q and %q name the same workflow to AutoPilot, which compares owner/repo without regard "+
+					"to case. Keep one of them.", first, s.ValueString()))
+			return
+		}
+		seen[ref.key()] = s.ValueString()
+	}
+}
+
+// validateAutoReviewKnobs checks automatic reviews' knobs as AutoPilot does:
+// can_decide_own_pr and approve_up_to each narrow can_decide, so each needs
+// it. can_decide left out is false (its default); one not known yet waits.
+func validateAutoReviewKnobs(m autoReviewModel, resp *resource.ValidateConfigResponse) {
+	if m.CanDecide.IsUnknown() || isTrue(m.CanDecide) {
 		return
 	}
 	if isTrue(m.CanDecideOwnPR) {

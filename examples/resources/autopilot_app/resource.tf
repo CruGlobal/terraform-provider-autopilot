@@ -78,3 +78,20 @@ resource "autopilot_app" "billing" {
     approve_up_to = "low"
   }
 }
+
+resource "autopilot_app" "infrastructure" {
+  name  = "infrastructure"
+  repos = ["example-org/infrastructure"]
+
+  # Review a pull request only when a GitHub Actions workflow asks, such as
+  # once the repository's CI passes. The workflow's job has
+  # `id-token: write` and asks AutoPilot with the OIDC token GitHub gives
+  # it, so no secret is stored. AutoPilot's own documentation has a
+  # workflow to copy. Only this file on the main branch may ask: a pull
+  # request's own copy of it can't.
+  auto_review = {
+    # Required with workflows. [] means nothing is reviewed on its own.
+    events    = []
+    workflows = ["example-org/infrastructure/.github/workflows/autopilot-review.yml@refs/heads/main"]
+  }
+}

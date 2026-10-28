@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	fwresource "github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
@@ -2841,7 +2842,8 @@ func (env *testEnv) checkAutoReview(t *testing.T, name string, want *client.Auto
 	case want == nil || got == nil:
 		return fmt.Errorf("auto_review = %+v at AutoPilot, want %+v", got, want)
 	}
-	if !slices.Equal(got.Events, want.Events) || got.MaxPerDay != want.MaxPerDay || got.CanDecide != want.CanDecide ||
+	if !slices.Equal(got.Events, want.Events) || !slices.Equal(got.Workflows, want.Workflows) ||
+		got.MaxPerDay != want.MaxPerDay || got.CanDecide != want.CanDecide ||
 		got.CanDecideOwnPR != want.CanDecideOwnPR || got.ApproveUpTo != want.ApproveUpTo {
 		return fmt.Errorf("auto_review = %+v at AutoPilot, want %+v", *got, *want)
 	}
@@ -2923,7 +2925,7 @@ func TestApp_autoReviewRefusedAtPlan(t *testing.T) {
 	env := newTestEnv(t)
 	env.requireFake(t)
 	cases := []struct{ auto, err string }{
-		{`{ events = [] }`, "set must contain at least 1 elements"},
+		{`{ events = [] }`, "No event and no workflow"},
 		{`{ events = ["pushed"] }`, "value must be one of"},
 		{`{ events = ["Opened"] }`, "value must be one of"},
 		{`{ events = ["reopened"] }`, "value must be one of"},
@@ -3211,4 +3213,517 @@ func TestApp_autoReviewDefaultsWrittenOutPlanNothing(t *testing.T) {
 	if n := len(env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)); n != 1 {
 		t.Errorf("%d changes were sent, want 1", n)
 	}
+}
+
+// workflowFile is a workflow file the tests list, on a branch by ref.
+const workflowFile = "example-org/billing-api/.github/workflows/autopilot-review.yml"
+
+// parseWorkflowRef takes what AutoPilot takes in auto_review.workflows and
+// refuses the rest, saying why, step for step with AutoPilot's own rule.
+func TestParseWorkflowRef(t *testing.T) {
+	good := []string{
+		workflowFile + "@refs/heads/main",
+		"Example-Org/.github/.github/workflows/review.yaml@refs/heads/release/v2",
+		"a/b/.github/workflows/c.yml@refs/heads/d",
+		"a/a./.github/workflows/c.yml@refs/heads/feature/x_y-z.1",
+		"a/.a/.github/workflows/a.yml.yml@refs/heads/a.b",
+		"a/_/.github/workflows/..yml@refs/heads/lock",
+		"a/b/.github/workflows/c.yml@refs/heads/a.lock.b",
+		strings.Repeat("o", 39) + "/" + strings.Repeat("r", 100) + "/.github/workflows/" + strings.Repeat("f", 200) +
+			".yml@refs/heads/" + strings.Repeat("b", 200),
+	}
+	for _, s := range good {
+		if _, problem := parseWorkflowRef(s); problem != "" {
+			t.Errorf("%q refused: %s", s, problem)
+		}
+	}
+	bad := []struct{ ref, problem string }{
+		{workflowFile + "@refs/pull/5/merge", "pull request's ref"},
+		{workflowFile + "@refs/tags/v1", "tag's ref"},
+		{workflowFile + "@4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e", "isn't owner/repo"},
+		{workflowFile, "isn't owner/repo"},
+		{workflowFile + "@main", "isn't owner/repo"},
+		{workflowFile + "@refs/heads/", "isn't owner/repo"},
+		{workflowFile + "@refs/heads/main\n", "isn't owner/repo"},
+		{" " + workflowFile + "@refs/heads/main", "isn't owner/repo"},
+		{"example-org/billing-api/.github/workflows/sub/r.yml@refs/heads/main", "isn't owner/repo"},
+		{"example-org/billing-api/.github/actions/r.yml@refs/heads/main", "isn't owner/repo"},
+		{"example-org/billing-api/.github/workflows/r.json@refs/heads/main", "isn't owner/repo"},
+		{"example-org/billing-api/.github/workflows/.yml@refs/heads/main", "isn't owner/repo"},
+		{"example-org/billing-api/.github/workflows/r.YML@refs/heads/main", "isn't owner/repo"},
+		{"example_org/billing-api/.github/workflows/r.yml@refs/heads/main", "isn't owner/repo"},
+		{strings.Repeat("o", 40) + "/r/.github/workflows/r.yml@refs/heads/main", "isn't owner/repo"},
+		{"o/" + strings.Repeat("r", 101) + "/.github/workflows/r.yml@refs/heads/main", "isn't owner/repo"},
+		{"o/r/.github/workflows/" + strings.Repeat("f", 201) + ".yml@refs/heads/main", "isn't owner/repo"},
+		{"o/r/.github/workflows/r.yml@refs/heads/" + strings.Repeat("b", 201), "isn't owner/repo"},
+		{"example-org/./.github/workflows/r.yml@refs/heads/main", "dots alone"},
+		{"example-org/../.github/workflows/r.yml@refs/heads/main", "dots alone"},
+		{"example-org/.../.github/workflows/r.yml@refs/heads/main", "dots alone"},
+		{workflowFile + "@refs/heads/.hidden", "starts with"},
+		{workflowFile + "@refs/heads/-x", "starts with"},
+		{workflowFile + "@refs/heads//x", "starts with"},
+		{workflowFile + "@refs/heads/../main", "starts with"},
+		{workflowFile + "@refs/heads/main/", "ends with"},
+		{workflowFile + "@refs/heads/x.", "ends with"},
+		{workflowFile + "@refs/heads/x.lock", "ends with"},
+		{workflowFile + "@refs/heads/a/b.lock", "ends with"},
+		{workflowFile + "@refs/heads/a..b", "with .., // or /."},
+		{workflowFile + "@refs/heads/a//b", "with .., // or /."},
+		{workflowFile + "@refs/heads/a/.b", "with .., // or /."},
+		{workflowFile + "@refs/heads/a b", "isn't owner/repo"},
+		{workflowFile + "@refs/heads/a@b", "isn't owner/repo"},
+		{workflowFile + "@refs/heads/a~b", "isn't owner/repo"},
+	}
+	for _, c := range bad {
+		if _, problem := parseWorkflowRef(c.ref); !strings.Contains(problem, c.problem) {
+			t.Errorf("%q: problem = %q, want one with %q", c.ref, problem, c.problem)
+		}
+	}
+	// The key compares the repository without regard to case, and the file
+	// and the branch exactly.
+	key := func(s string) string {
+		w, problem := parseWorkflowRef(s)
+		if problem != "" {
+			t.Fatalf("%q refused: %s", s, problem)
+		}
+		return w.key()
+	}
+	if key("Example-Org/Billing-API/.github/workflows/r.yml@refs/heads/main") != key("example-org/billing-api/.github/workflows/r.yml@refs/heads/main") {
+		t.Error("the repository's case changes the key")
+	}
+	if key("o/r/.github/workflows/R.yml@refs/heads/main") == key("o/r/.github/workflows/r.yml@refs/heads/main") {
+		t.Error("the file's case doesn't change the key")
+	}
+	if key("o/r/.github/workflows/r.yml@refs/heads/Main") == key("o/r/.github/workflows/r.yml@refs/heads/main") {
+		t.Error("the branch's case doesn't change the key")
+	}
+}
+
+// workflowRefValidator refuses a workflow AutoPilot would refuse, and waits
+// for one not known yet.
+func TestWorkflowRefValidator(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		value   types.String
+		refused bool
+	}{
+		{types.StringValue(workflowFile + "@refs/heads/main"), false},
+		{types.StringNull(), false},
+		{types.StringUnknown(), false},
+		{types.StringValue(workflowFile + "@refs/pull/1/merge"), true},
+		{types.StringValue(workflowFile + "@refs/heads/x.lock"), true},
+		{types.StringValue("example-org/../.github/workflows/r.yml@refs/heads/main"), true},
+	}
+	for _, c := range cases {
+		req := validator.StringRequest{Path: path.Root("auto_review").AtName("workflows"), ConfigValue: c.value}
+		var resp validator.StringResponse
+		workflowRefValidator{}.ValidateString(ctx, req, &resp)
+		if resp.Diagnostics.HasError() != c.refused {
+			t.Errorf("%s: refused = %v, want %v (%v)", c.value, resp.Diagnostics.HasError(), c.refused, resp.Diagnostics)
+		}
+	}
+}
+
+// autoReviewConfig is an auto_review as the configuration holds it, every
+// field but events and workflows left out.
+func autoReviewConfig(events, workflows types.Set) autoReviewModel {
+	return autoReviewModel{
+		Events: events, Workflows: workflows, MaxPerDay: types.Int64Null(), CanDecide: types.BoolNull(),
+		CanDecideOwnPR: types.BoolNull(), ApproveUpTo: types.StringNull(),
+	}
+}
+
+// strs is a set of strings, each value known.
+func strs(values ...string) types.Set { return setFromStrings(values) }
+
+// Two workflows that differ only in the case of owner/repo are refused, as
+// AutoPilot refuses them; in the file's or the branch's case, they are two
+// workflows. A value not known yet, or one its own validator refuses, is
+// left alone.
+func TestValidateAutoReviewWorkflows_CaseOnlyRepeats(t *testing.T) {
+	main := workflowFile + "@refs/heads/main"
+	cases := []struct {
+		name      string
+		workflows types.Set
+		refused   bool
+	}{
+		{"one", strs(main), false},
+		{"owner in another case", strs(main, "Example-Org/billing-api/.github/workflows/autopilot-review.yml@refs/heads/main"), true},
+		{"repo in another case", strs(main, "example-org/Billing-API/.github/workflows/autopilot-review.yml@refs/heads/main"), true},
+		{"file in another case", strs(main, "example-org/billing-api/.github/workflows/Autopilot-Review.yml@refs/heads/main"), false},
+		{"branch in another case", strs(main, workflowFile+"@refs/heads/Main"), false},
+		{"another branch", strs(main, workflowFile+"@refs/heads/release"), false},
+		{".yaml beside .yml", strs(main, "example-org/billing-api/.github/workflows/autopilot-review.yaml@refs/heads/main"), false},
+		{"an unknown value", types.SetValueMust(types.StringType, []attr.Value{types.StringValue(main), types.StringUnknown()}), false},
+		{"refused on its own", strs("Example-Org/billing-api/.github/workflows/autopilot-review.yml@refs/pull/1/merge", main), false},
+		{"null", types.SetNull(types.StringType), false},
+		{"unknown", types.SetUnknown(types.StringType), false},
+	}
+	for _, c := range cases {
+		var resp fwresource.ValidateConfigResponse
+		validateAutoReviewWorkflows(autoReviewConfig(strs("opened"), c.workflows), &resp)
+		if resp.Diagnostics.HasError() != c.refused {
+			t.Errorf("%s: refused = %v, want %v (%v)", c.name, resp.Diagnostics.HasError(), c.refused, resp.Diagnostics)
+		}
+	}
+}
+
+// events may be empty only beside a workflow, and must be set, not left to
+// its default, beside one. Workflows not known yet wait; one value not known
+// yet is still one workflow.
+func TestValidateAutoReviewEvents(t *testing.T) {
+	main := workflowFile + "@refs/heads/main"
+	oneUnknown := types.SetValueMust(types.StringType, []attr.Value{types.StringUnknown()})
+	cases := []struct {
+		name              string
+		events, workflows types.Set
+		refused           string
+	}{
+		{"defaults", types.SetNull(types.StringType), types.SetNull(types.StringType), ""},
+		{"events alone", strs("opened"), types.SetNull(types.StringType), ""},
+		{"no event alone", strs(), types.SetNull(types.StringType), "No event and no workflow"},
+		{"no event and no workflow", strs(), strs(), "No event and no workflow"},
+		{"no event, workflows not known yet", strs(), types.SetUnknown(types.StringType), ""},
+		{"no event, a workflow not known yet", strs(), oneUnknown, ""},
+		{"no event, a workflow", strs(), strs(main), ""},
+		{"events and a workflow", strs("opened"), strs(main), ""},
+		{"events not known yet, a workflow", types.SetUnknown(types.StringType), strs(main), ""},
+		{"events left out, a workflow", types.SetNull(types.StringType), strs(main), "events is required with workflows"},
+		{"events left out, a workflow not known yet", types.SetNull(types.StringType), oneUnknown, "events is required with workflows"},
+		{"events left out, workflows not known yet", types.SetNull(types.StringType), types.SetUnknown(types.StringType), ""},
+		{"events left out, no workflow", types.SetNull(types.StringType), strs(), ""},
+	}
+	for _, c := range cases {
+		var resp fwresource.ValidateConfigResponse
+		validateAutoReviewEvents(autoReviewConfig(c.events, c.workflows), &resp)
+		got := ""
+		if resp.Diagnostics.HasError() {
+			got = resp.Diagnostics.Errors()[0].Summary()
+		}
+		if got != c.refused {
+			t.Errorf("%s: refused with %q, want %q", c.name, got, c.refused)
+		}
+	}
+}
+
+// Workflows are none unless set; with them, events may be none; read back,
+// they plan nothing in any order; set to null or [] they are none again,
+// and removing auto_review turns it off.
+func TestApp_autoReviewWorkflowsLifecycle(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	main := workflowFile + "@refs/heads/main"
+	shared := "Example-Org/.github/.github/workflows/autopilot-review.yaml@refs/heads/release/v2"
+	config := func(auto string) string { return appConfig(env, name, auto) }
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(`  auto_review = { events = ["opened"] }`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.workflows.#", "0"),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{Events: []string{"opened"}, MaxPerDay: 50})
+					},
+				),
+			},
+			{
+				// Only the workflows ask.
+				Config: config(fmt.Sprintf(`  auto_review = { events = [], workflows = %s }`, hcl(main, shared))),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.events.#", "0"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.workflows.#", "2"),
+					resource.TestCheckTypeSetElemAttr(appRes, "auto_review.workflows.*", main),
+					resource.TestCheckTypeSetElemAttr(appRes, "auto_review.workflows.*", shared),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{
+							Events: []string{}, Workflows: []string{shared, main}, MaxPerDay: 50,
+						})
+					},
+				),
+			},
+			{
+				// In another order, or one listed twice, they plan nothing.
+				Config: config(fmt.Sprintf(`  auto_review = { events = [], workflows = %s }`, hcl(shared, main, shared))),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: config(fmt.Sprintf(`
+  auto_review = {
+    events     = ["opened", "ready_for_review"]
+    workflows  = %s
+    can_decide = true
+  }`, hcl(main))),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					return env.checkAutoReview(t, name, &client.AutoReview{
+						Events: []string{"opened", "ready_for_review"}, Workflows: []string{main}, MaxPerDay: 50, CanDecide: true,
+					})
+				},
+			},
+			{
+				// null is the default, none.
+				Config: config(`  auto_review = { events = ["opened", "ready_for_review"], workflows = null, can_decide = true }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.workflows.#", "0"),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{
+							Events: []string{"opened", "ready_for_review"}, MaxPerDay: 50, CanDecide: true,
+						})
+					},
+				),
+			},
+			{
+				// [] is the same as null, and as leaving it out.
+				Config: config(`  auto_review = { workflows = [], can_decide = true }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: config(fmt.Sprintf(`  auto_review = { events = [], workflows = %s }`, hcl(main))),
+			},
+			{
+				Config: config(""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "auto_review"),
+					func(*terraform.State) error { return env.checkAutoReview(t, name, nil) },
+				),
+			},
+		},
+	})
+}
+
+// Workflows are sent sorted and each once, and only when there are some: an
+// auto_review with none sends no workflows field, so an AutoPilot that
+// predates the field still takes it.
+func TestApp_autoReviewWorkflowsSent(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	main := workflowFile + "@refs/heads/main"
+	shared := "Example-Org/.github/.github/workflows/autopilot-review.yaml@refs/heads/release/v2"
+	lastBody := func() string {
+		patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)
+		return mustJSON(t, requestBody(t, patches[len(patches)-1]))
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, `  auto_review = {}`),
+				Check: func(*terraform.State) error {
+					post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0]
+					auto, _ := requestBody(t, post)["auto_review"].(map[string]any)
+					if _, sent := auto["workflows"]; sent || auto == nil {
+						return fmt.Errorf("auto_review = %v, want it without workflows", auto)
+					}
+					return nil
+				},
+			},
+			{
+				Config: appConfig(env, name, fmt.Sprintf(`  auto_review = { events = [], workflows = %s }`, hcl(main, shared))),
+				Check: func(*terraform.State) error {
+					want := `{"auto_review":{"approve_up_to":null,"can_decide":false,"can_decide_own_pr":false,"events":[],"max_per_day":50,"workflows":["` +
+						shared + `","` + main + `"]}}`
+					if got := lastBody(); got != want {
+						return fmt.Errorf("body = %s, want %s", got, want)
+					}
+					return nil
+				},
+			},
+			{
+				Config: appConfig(env, name, `  auto_review = { events = ["opened"], workflows = [] }`),
+				Check: func(*terraform.State) error {
+					want := `{"auto_review":{"approve_up_to":null,"can_decide":false,"can_decide_own_pr":false,"events":["opened"],"max_per_day":50}}`
+					if got := lastBody(); got != want {
+						return fmt.Errorf("body = %s, want %s", got, want)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// The plan refuses what AutoPilot refuses in workflows and the events beside
+// them, before anything is sent.
+func TestApp_autoReviewWorkflowsRefusedAtPlan(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	main := workflowFile + "@refs/heads/main"
+	var many []string
+	for i := range 21 {
+		many = append(many, fmt.Sprintf("example-org/billing-api/.github/workflows/w%d.yml@refs/heads/main", i))
+	}
+	cases := []struct{ auto, err string }{
+		{fmt.Sprintf(`{ workflows = %s }`, hcl(main)), "events is required with workflows"},
+		{fmt.Sprintf(`{ workflows = %s, events = null }`, hcl(main)), "events is required with workflows"},
+		{fmt.Sprintf(`{ workflows = %s, max_per_day = 5 }`, hcl(main)), "events is required with workflows"},
+		{`{ events = [], workflows = [] }`, "No event and no workflow"},
+		{`{ events = [], workflows = null }`, "No event and no workflow"},
+		{fmt.Sprintf(`{ events = [], workflows = %s }`, hcl(workflowFile+"@refs/pull/1/merge")), "Invalid workflow ... pull request's ref"},
+		{fmt.Sprintf(`{ events = [], workflows = %s }`, hcl(workflowFile+"@refs/tags/v1")), "Invalid workflow ... tag's ref"},
+		{fmt.Sprintf(`{ events = [], workflows = %s }`, hcl(workflowFile+"@refs/heads/x.lock")), "Invalid workflow"},
+		{fmt.Sprintf(`{ events = [], workflows = %s }`, hcl(workflowFile+"@refs/heads/a..b")), "Invalid workflow"},
+		{fmt.Sprintf(`{ events = [], workflows = %s }`, hcl("example-org/../.github/workflows/r.yml@refs/heads/main")), "Invalid workflow"},
+		{fmt.Sprintf(`{ events = [], workflows = %s }`, hcl("example-org/billing-api/.github/workflows/sub/r.yml@refs/heads/main")), "Invalid workflow"},
+		{fmt.Sprintf(`{ events = [], workflows = %s }`,
+			hcl(main, "Example-Org/Billing-API/.github/workflows/autopilot-review.yml@refs/heads/main")), "Repeated workflow"},
+		{fmt.Sprintf(`{ events = [], workflows = %s }`, hcl(many...)), "set must contain at most 20 elements"},
+	}
+	for _, c := range cases {
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{
+					Config:      appConfig(env, randName(), "  auto_review = "+c.auto),
+					ExpectError: expectErr(c.err),
+				},
+			},
+		})
+	}
+	if posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps"); len(posts) != 0 {
+		t.Errorf("%d creates were sent", len(posts))
+	}
+}
+
+// Workflows not known until apply: the plan waits, and the apply checks the
+// events beside them then, before anything is sent.
+func TestApp_autoReviewWorkflowsNotKnownYet(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	main := workflowFile + "@refs/heads/main"
+	config := func(workflows, events string) string {
+		return env.providerConfig() + fmt.Sprintf(`
+resource "terraform_data" "workflows" {
+  input = %s
+}
+
+resource "autopilot_app" "test" {
+  name        = %q
+  auto_review = { workflows = terraform_data.workflows.output%s }
+}
+`, workflows, name, events)
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(hcl(main), ", events = []"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.events.#", "0"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.workflows.#", "1"),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{Events: []string{}, Workflows: []string{main}, MaxPerDay: 50})
+					},
+				),
+			},
+			{
+				// No workflow after all, and no event.
+				Config:      config("[]", ", events = []"),
+				ExpectError: expectErr("No event and no workflow"),
+			},
+			{
+				// A workflow after all, and the events left out.
+				Config:      config(hcl(workflowFile+"@refs/heads/release"), ""),
+				ExpectError: expectErr("events is required with workflows"),
+			},
+		},
+	})
+	if env.fake != nil {
+		if patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name); len(patches) != 0 {
+			t.Errorf("%d changes were sent", len(patches))
+		}
+	}
+}
+
+// Workflows changed outside Terraform show as a change, and the apply puts
+// them back as the configuration says.
+func TestApp_autoReviewWorkflowsChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	main := workflowFile + "@refs/heads/main"
+	other := workflowFile + "@refs/heads/other"
+	cases := []struct {
+		config  string
+		outside func(v *autopilottest.AppView)
+		want    []string
+	}{
+		{
+			`  auto_review = { events = ["opened"] }`,
+			func(v *autopilottest.AppView) { v.AutoReview.Workflows = []string{other} },
+			nil,
+		},
+		{
+			fmt.Sprintf(`  auto_review = { events = [], workflows = %s }`, hcl(main)),
+			func(v *autopilottest.AppView) { v.AutoReview.Workflows = []string{main, other} },
+			[]string{main},
+		},
+	}
+	for _, c := range cases {
+		name := randName()
+		config := appConfig(env, name, c.config)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() { env.fake.ChangeAppOutOfBand(name, c.outside) },
+					Config:    config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: func(*terraform.State) error {
+						if v, _ := env.fake.App(name); v.AutoReview == nil || !slices.Equal(v.AutoReview.Workflows, c.want) {
+							return fmt.Errorf("auto_review = %+v, not put back", v.AutoReview)
+						}
+						return nil
+					},
+				},
+			},
+		})
+	}
+}
+
+// An imported app's workflows are read into state, so a configuration that
+// lists the same in another order plans nothing.
+func TestApp_importWithAutoReviewWorkflows(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	main := workflowFile + "@refs/heads/main"
+	shared := "Example-Org/.github/.github/workflows/autopilot-review.yaml@refs/heads/release/v2"
+	env.fake.SeedApp(autopilottest.AppView{
+		Name:       name,
+		AutoReview: &autopilottest.AutoReview{Events: []string{}, Workflows: []string{main, shared}, MaxPerDay: 50},
+	})
+	same := appConfig(env, name, fmt.Sprintf(`  auto_review = { events = [], workflows = %s }`, hcl(shared, main)))
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             same,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: same,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
 }

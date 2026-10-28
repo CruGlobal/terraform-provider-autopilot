@@ -27,7 +27,85 @@ var (
 	// digit, then letters, digits, - and _ (an enterprise's managed users
 	// have _), at most 39 characters.
 	gitHubLoginPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,38}$`)
+	// A workflow that may ask for an app's automatic reviews, as GitHub's
+	// OIDC token names the workflow a job ran (job_workflow_ref), in
+	// AutoPilot's own pattern: owner/repo, a file straight in
+	// .github/workflows, and a branch. parseWorkflowRef checks the rest.
+	workflowRefPattern = regexp.MustCompile(`^([A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100})/(\.github/workflows/[A-Za-z0-9._-]{1,200}\.ya?ml)@refs/heads/([A-Za-z0-9._/-]{1,200})$`)
 )
+
+// workflowRef is a workflow an app's automatic reviews may take asks from.
+type workflowRef struct {
+	// repo is owner/repo, the repository the workflow's file is in.
+	repo string
+	// path is .github/workflows/<file>.yml (or .yaml).
+	path string
+	// branch is the branch, without refs/heads/.
+	branch string
+}
+
+// key is what AutoPilot tells two workflows apart by: the repository without
+// regard to case, as GitHub names repositories, and the file and branch
+// exactly, as git does.
+func (w workflowRef) key() string {
+	return strings.ToLower(w.repo) + "/" + w.path + "@refs/heads/" + w.branch
+}
+
+// parseWorkflowRef is AutoPilot's own rule for a workflow an app lists in
+// auto_review.workflows, step for step: workflowRefPattern, a repository
+// name that isn't dots alone, and a branch named as git allows. It returns
+// the workflow, or what is wrong with it.
+func parseWorkflowRef(text string) (workflowRef, string) {
+	m := workflowRefPattern.FindStringSubmatch(text)
+	if m == nil {
+		switch {
+		case strings.Contains(text, "@refs/pull/"):
+			return workflowRef{}, "is a pull request's ref, and only a branch's workflow may ask (refs/heads/<branch>)"
+		case strings.Contains(text, "@refs/tags/"):
+			return workflowRef{}, "is a tag's ref, and only a branch's workflow may ask (refs/heads/<branch>)"
+		}
+		return workflowRef{}, "isn't owner/repo/.github/workflows/<file>.yml@refs/heads/<branch>, in the characters " +
+			"and lengths GitHub allows"
+	}
+	w := workflowRef{repo: m[1], path: m[2], branch: m[3]}
+	b := w.branch
+	switch {
+	case strings.Trim(w.repo[strings.IndexByte(w.repo, '/')+1:], ".") == "":
+		return workflowRef{}, "names a repository of dots alone"
+	case strings.HasPrefix(b, ".") || strings.HasPrefix(b, "-") || strings.HasPrefix(b, "/"):
+		return workflowRef{}, "names a branch that starts with ., - or /, which git doesn't allow"
+	case strings.HasSuffix(b, "/") || strings.HasSuffix(b, ".") || strings.HasSuffix(b, ".lock"):
+		return workflowRef{}, "names a branch that ends with /, . or .lock, which git doesn't allow"
+	case strings.Contains(b, "..") || strings.Contains(b, "//") || strings.Contains(b, "/."):
+		return workflowRef{}, "names a branch with .., // or /. in it, which git doesn't allow"
+	}
+	return w, ""
+}
+
+// workflowRefValidator refuses a workflow AutoPilot would refuse in
+// auto_review.workflows.
+type workflowRefValidator struct{}
+
+func (workflowRefValidator) Description(context.Context) string {
+	return "a GitHub Actions workflow on a branch: owner/repo/.github/workflows/<file>.yml@refs/heads/<branch>"
+}
+
+func (v workflowRefValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (workflowRefValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	value := req.ConfigValue.ValueString()
+	if _, problem := parseWorkflowRef(value); problem != "" {
+		resp.Diagnostics.AddAttributeError(req.Path, "Invalid workflow",
+			fmt.Sprintf("%q %s. AutoPilot takes a workflow as GitHub's OIDC token names the workflow a job ran "+
+				"(job_workflow_ref), on a branch, such as "+
+				"example-org/billing-api/.github/workflows/autopilot-review.yml@refs/heads/main.", value, problem))
+	}
+}
 
 // builtInSenders are the senders built into AutoPilot, whose reviews run for
 // a person: autopilot-mcp, for the one who asked on AutoPilot's MCP server,
