@@ -698,9 +698,12 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 							"to that branch there decides what asks. An ask is one of this app's automatic reviews in " +
 							"every other way: the same identity, `max_per_day`, deciding knobs and check run, and the same " +
 							"rules on which pull requests get one. With any listed, `events` must be set. It needs an " +
-							"AutoPilot that knows the field; an older one refuses it with a 422. An AutoPilot rolled back " +
-							"past the field refuses every write that sends it, and reads an app that lists workflows and " +
-							"no event as having no automatic reviews.",
+							"AutoPilot that knows the field; an older one refuses it with a 422, and with `events = []` " +
+							"names `events` in the refusal, since it takes no empty `events`. An AutoPilot rolled back " +
+							"past the field refuses every write that sends it, reads an app that lists workflows and no " +
+							"event as having no automatic reviews, and drops the workflows on any write it takes to the " +
+							"app; the next apply after AutoPilot is rolled forward sends them again. Take them off before " +
+							"such a rollback where that matters.",
 						ElementType: types.StringType,
 						Optional:    true,
 						Computed:    true,

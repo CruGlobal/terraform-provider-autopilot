@@ -98,9 +98,10 @@ func cloneAutoReview(a *AutoReview) *AutoReview {
 
 // storedAutoReview is automatic reviews as AutoPilot keeps what it is given
 // from outside a write (SeedApp, ChangeAppOutOfBand): the events it knows,
-// each once, in its order; the workflows it reads, sorted, each once; none
-// at all with no event and no workflow; and the own pull request's toggle
-// only with can_decide.
+// each once, in its order; the workflows it reads (AutoPilot only leaves out
+// those it can't read; they are also sorted and kept once each here, as any
+// write AutoPilot takes keeps them); none at all with no event and no
+// workflow; and the own pull request's toggle only with can_decide.
 func storedAutoReview(a *AutoReview) *AutoReview {
 	if a == nil {
 		return nil
