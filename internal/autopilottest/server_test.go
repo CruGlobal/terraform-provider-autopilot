@@ -1139,3 +1139,220 @@ func mustJSON(v any) string {
 	}
 	return string(b)
 }
+
+// review_also_reads is refused where AutoPilot refuses it, at the same
+// field: each repository at its place when it isn't owner/name or names one
+// already listed in another case, and the list when it isn't a list or holds
+// more than 5. Beside the app's repositories, the first it may not read, in
+// sorted order, is refused where it was sent. Fields are read in sorted
+// order (this fake reads repos first), and the rules that span fields come
+// after every field.
+func TestReviewAlsoReads_Refused(t *testing.T) {
+	s := New(t)
+	own := []string{"example-org/infra"}
+	var six []string
+	for i := range 6 {
+		six = append(six, fmt.Sprintf("example-org/modules-%d", i))
+	}
+	cases := []struct {
+		what  string
+		body  map[string]any
+		field string
+	}{
+		{"not a list", map[string]any{"review_also_reads": "example-org/modules"}, "/review_also_reads"},
+		{"null", map[string]any{"review_also_reads": nil}, "/review_also_reads"},
+		{"an object", map[string]any{"review_also_reads": map[string]any{}}, "/review_also_reads"},
+		{"not a string", map[string]any{"review_also_reads": []any{1}}, "/review_also_reads/0"},
+		{"null in it", map[string]any{"review_also_reads": []any{"example-org/modules", nil}}, "/review_also_reads/1"},
+		// Every item must be a string before any is read as a repository.
+		{"nonsense, then not a string", map[string]any{"review_also_reads": []any{"nonsense", 1}}, "/review_also_reads/1"},
+		{"six", map[string]any{"review_also_reads": six}, "/review_also_reads"},
+		{"case only", map[string]any{"review_also_reads": []string{"example-org/modules", "Example-Org/Modules"}}, "/review_also_reads/1"},
+		// Beside the app's repositories: one it owns, in any case, or of another owner.
+		{"one it owns", map[string]any{"review_also_reads": []string{"example-org/modules", "example-org/infra"}}, "/review_also_reads/1"},
+		{"one it owns, in another case", map[string]any{"review_also_reads": []string{"Example-Org/INFRA"}}, "/review_also_reads/0"},
+		{"another owner", map[string]any{"review_also_reads": []string{"example-org/modules", "other/modules"}}, "/review_also_reads/1"},
+		// The first in sorted order, where it was sent.
+		{"two wrong", map[string]any{"review_also_reads": []string{"zed/modules", "example-org/infra"}}, "/review_also_reads/1"},
+		// credential is read before it, when_seats_full and worker_image after.
+		{"credential wrong too", map[string]any{"credential": "bogus", "review_also_reads": []string{"nonsense"}}, "/credential"},
+		{"when_seats_full wrong too", map[string]any{"when_seats_full": "bogus", "review_also_reads": []string{"nonsense"}}, "/review_also_reads/0"},
+		{"worker_image wrong too", map[string]any{"worker_image": "bogus", "review_also_reads": []string{"nonsense"}}, "/review_also_reads/0"},
+		// Each field is read before the rules that span fields: GitHub
+		// logins first, then what reviews also read, then the policy.
+		{"worker_image wrong, another owner", map[string]any{"worker_image": "bogus", "review_also_reads": []string{"other/modules"}}, "/worker_image"},
+		{"a login unpaired, another owner", map[string]any{"github_logins": []any{map[string]any{"login": "alice", "developer": "alice@example.org"}},
+			"review_also_reads": []string{"other/modules"}}, "/github_logins/0"},
+		{"seat_first alone, another owner", map[string]any{"credential": "seat_first", "review_also_reads": []string{"other/modules"}}, "/review_also_reads/0"},
+	}
+	bad := []string{
+		"example-org", "example-org/", "/modules", "example-org/a/b", "example_org/modules", "example.org/modules",
+		strings.Repeat("o", 40) + "/modules", "example-org/" + strings.Repeat("n", 101), "example-org/.", "example-org/..",
+		"example-org/...", "example-org/a b", "example-org/modules\n", " example-org/modules", "example-org/modulé", "",
+	}
+	for _, b := range bad {
+		cases = append(cases, struct {
+			what  string
+			body  map[string]any
+			field string
+		}{fmt.Sprintf("%q", b), map[string]any{"review_also_reads": []string{"example-org/modules", b}}, "/review_also_reads/1"})
+	}
+	for _, c := range cases {
+		body := map[string]any{"name": "infrastructure", "repos": own}
+		for k, v := range c.body {
+			body[k] = v
+		}
+		st, answer := call(t, s, http.MethodPost, "/v1/admin/apps", "", body)
+		expect(t, c.what, st, http.StatusUnprocessableEntity, answer)
+		if answer["field"] != c.field {
+			t.Errorf("%s: field = %v (%v), want %s", c.what, answer["field"], answer["message"], c.field)
+		}
+	}
+	// An app that owns no repository has no owner to read from.
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "infrastructure", "review_also_reads": []string{"example-org/modules"}})
+	expect(t, "no repos", st, http.StatusUnprocessableEntity, body)
+	if msg, _ := body["message"].(string); body["field"] != "/review_also_reads/0" || !strings.Contains(msg, "owns none") {
+		t.Errorf("no repos: %v", body)
+	}
+}
+
+// review_also_reads is kept as sent, sorted, each once, and none unless
+// sent; a write that leaves it out keeps it, and [] takes it away. A create
+// with it is a retry only with the same. A change is held to the app's
+// repositories by what it leaves, only when it sends one of the two.
+func TestReviewAlsoReads_Kept(t *testing.T) {
+	s := New(t)
+	own := []string{"example-org/infra", "other/thing"}
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "plain", "repos": []string{"example-org/plain"}})
+	expect(t, "none", st, http.StatusCreated, body)
+	if got := mustJSON(body["review_also_reads"]); got != "[]" {
+		t.Errorf("review_also_reads = %s, want []", got)
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "infrastructure", "repos": own,
+		"review_also_reads": []string{"example-org/zeta", "Example-Org/modules", "example-org/zeta", "OTHER/.github"}})
+	expect(t, "create", st, http.StatusCreated, body)
+	want := `["Example-Org/modules","OTHER/.github","example-org/zeta"]`
+	if got := mustJSON(body["review_also_reads"]); got != want {
+		t.Errorf("review_also_reads = %s, want %s", got, want)
+	}
+	// The same create again, in another order, is a retry; another isn't.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "infrastructure", "repos": own,
+		"review_also_reads": []string{"OTHER/.github", "example-org/zeta", "Example-Org/modules"}})
+	expect(t, "the same create again", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "infrastructure", "repos": own,
+		"review_also_reads": []string{"example-org/zeta"}})
+	expect(t, "a create with another list", st, http.StatusConflict, body)
+
+	// A change that leaves it out keeps it.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/infrastructure", "1", map[string]any{"developers": []string{"alice@example.org"}})
+	expect(t, "left out", st, http.StatusOK, body)
+	if got := mustJSON(body["review_also_reads"]); got != want {
+		t.Errorf("review_also_reads = %s, want it kept", got)
+	}
+	// Sent alone, it is held to the record's repositories.
+	for _, also := range [][]string{{"example-org/infra"}, {"third/modules"}} {
+		st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/infrastructure", "2", map[string]any{"review_also_reads": also})
+		expect(t, fmt.Sprintf("%v alone", also), st, http.StatusUnprocessableEntity, body)
+		if body["field"] != "/review_also_reads" {
+			t.Errorf("%v alone: field = %v", also, body["field"])
+		}
+	}
+	// repos sent alone is held to the record's list: owning one it reads,
+	// or giving up the owner one is of.
+	for _, repos := range [][]string{{"example-org/infra", "other/thing", "example-org/zeta"}, {"example-org/infra"}} {
+		st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/infrastructure", "2", map[string]any{"repos": repos})
+		expect(t, fmt.Sprintf("repos %v alone", repos), st, http.StatusUnprocessableEntity, body)
+		if msg, _ := body["message"].(string); body["field"] != "/repos" || !strings.Contains(msg, "same write") {
+			t.Errorf("repos %v alone: %v", repos, body)
+		}
+	}
+	// Both, held to each other at the place, and nothing changes.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/infrastructure", "2", map[string]any{
+		"repos": []string{"example-org/infra"}, "review_also_reads": []string{"example-org/zeta", "OTHER/.github"},
+	})
+	expect(t, "both, one of another owner", st, http.StatusUnprocessableEntity, body)
+	if body["field"] != "/review_also_reads/1" {
+		t.Errorf("field = %v", body["field"])
+	}
+	if v, _ := s.App("infrastructure"); v.LockVersion != 2 {
+		t.Errorf("lock_version = %d, want nothing changed", v.LockVersion)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/infrastructure", "2", map[string]any{
+		"repos": []string{"example-org/infra"}, "review_also_reads": []string{"example-org/zeta"},
+	})
+	expect(t, "both together", st, http.StatusOK, body)
+	// A repeat one version behind of the change the record holds is that
+	// change; another is stale. A value it can't take is refused first.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/infrastructure", "2", map[string]any{"review_also_reads": []string{"example-org/zeta"}})
+	expect(t, "a repeat one version behind", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/infrastructure", "2", map[string]any{"review_also_reads": []string{"example-org/modules"}})
+	expect(t, "another change one version behind", st, http.StatusConflict, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/infrastructure", "2", map[string]any{"review_also_reads": []string{"nonsense"}})
+	expect(t, "a value it can't take, one version behind", st, http.StatusUnprocessableEntity, body)
+	// A change of case alone is a change, kept as sent.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/infrastructure", "3", map[string]any{"review_also_reads": []string{"Example-Org/Zeta"}})
+	expect(t, "a change of case", st, http.StatusOK, body)
+	if v, _ := s.App("infrastructure"); v.LockVersion != 4 || !slices.Equal(v.ReviewAlsoReads, []string{"Example-Org/Zeta"}) {
+		t.Errorf("review_also_reads = %v, lock_version %d", v.ReviewAlsoReads, v.LockVersion)
+	}
+	// [] takes them all away.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/infrastructure", "4", map[string]any{"review_also_reads": []string{}})
+	expect(t, "[]", st, http.StatusOK, body)
+	if got := mustJSON(body["review_also_reads"]); got != "[]" || body["lock_version"] != float64(5) {
+		t.Errorf("review_also_reads = %s, lock_version %v", got, body["lock_version"])
+	}
+
+	// A record left out of step with its repositories, as a release that
+	// predates the field could leave it, still takes a change that sends
+	// neither.
+	s.ChangeAppOutOfBand("infrastructure", func(v *AppView) { v.ReviewAlsoReads = []string{"third/modules"} })
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/infrastructure", "6", map[string]any{"developers": []string{}})
+	expect(t, "a change that sends neither", st, http.StatusOK, body)
+
+	// What is given from outside a write is kept as AutoPilot reads it: only
+	// what it can read, each once without regard to case, sorted, at most 5.
+	s.SeedApp(AppView{Name: "seeded", Repos: []string{"c/own"}, ReviewAlsoReads: []string{
+		"nonsense", "example-org/b", "Example-Org/B", "example-org/a", "c/1", "c/2", "c/3", "c/4",
+	}})
+	if v, _ := s.App("seeded"); !slices.Equal(v.ReviewAlsoReads, []string{"c/1", "c/2", "c/3", "c/4", "example-org/a"}) {
+		t.Errorf("seeded review_also_reads = %v", v.ReviewAlsoReads)
+	}
+	// Names AutoPilot takes, at their longest.
+	long := strings.Repeat("o", 39)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "edges", "repos": []string{long + "/own"},
+		"review_also_reads": []string{long + "/" + strings.Repeat("n", 100), long + "/.github", long + "/a.", long + "/..a", long + "/_", long + "/-"}[:5]})
+	expect(t, "names at their longest, and of dots beside others", st, http.StatusCreated, body)
+}
+
+// An app's fields are read in sorted order, as AutoPilot reads them (this
+// fake still reads repos first), so a body with two wrong names the first;
+// the rules that span fields come after every field, in AutoPilot's order:
+// GitHub logins, what reviews also read, the credential policy, then the
+// worker size.
+func TestAppFields_ReadInOrder(t *testing.T) {
+	s := New(t)
+	unpaired := []any{map[string]any{"login": "alice", "developer": "alice@example.org"}}
+	cases := []struct {
+		body  map[string]any
+		field string
+	}{
+		{map[string]any{"accepts": "x", "credential": "bogus"}, "/accepts"},
+		{map[string]any{"auto_review": "x", "credential": "bogus"}, "/auto_review"},
+		{map[string]any{"credential": "bogus", "developers": []string{"Not An Email"}}, "/credential"},
+		{map[string]any{"worker_cpu": "x", "worker_image": "bogus"}, "/worker_cpu"},
+		{map[string]any{"worker_image": "bogus", "worker_memory": "x"}, "/worker_image"},
+		{map[string]any{"github_logins": unpaired, "credential": "seat_first"}, "/github_logins/0"},
+		{map[string]any{"credential": "seat_first", "worker_cpu": 1024}, "/when_seats_full"},
+	}
+	for _, c := range cases {
+		body := map[string]any{"name": "billing"}
+		for k, v := range c.body {
+			body[k] = v
+		}
+		st, answer := call(t, s, http.MethodPost, "/v1/admin/apps", "", body)
+		expect(t, mustJSON(c.body), st, http.StatusUnprocessableEntity, answer)
+		if answer["field"] != c.field {
+			t.Errorf("%s: field = %v, want %s", mustJSON(c.body), answer["field"], c.field)
+		}
+	}
+}

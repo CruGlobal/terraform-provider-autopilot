@@ -1151,3 +1151,95 @@ func TestGetApp_AutoReview(t *testing.T) {
 		t.Errorf("auto_review = %+v, want the workflow and no event", a.AutoReview)
 	}
 }
+
+// The repositories an app's reviews also read are sent sorted and each once.
+// Left unset, they aren't sent, so an AutoPilot that predates the field still
+// takes the app; an empty list is sent as [], which takes them all away.
+func TestAppSpec_SendsReviewAlsoReads(t *testing.T) {
+	var bodies []string
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 2})
+	}))
+	ctx := context.Background()
+	for _, spec := range []AppSpec{
+		{},
+		{ReviewAlsoReads: []string{}},
+		{ReviewAlsoReads: []string{"example-org/terraform-modules", "Example-Org/Shared", "example-org/terraform-modules"}},
+		{Repos: []string{"example-org/infrastructure"}, ReviewAlsoReads: []string{"example-org/terraform-modules"}},
+	} {
+		if _, err := c.UpdateApp(ctx, "billing", spec, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := c.CreateApp(ctx, "billing", AppSpec{Repos: []string{"example-org/infrastructure"}}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		`{}`,
+		`{"review_also_reads":[]}`,
+		`{"review_also_reads":["Example-Org/Shared","example-org/terraform-modules"]}`,
+		`{"repos":["example-org/infrastructure"],"review_also_reads":["example-org/terraform-modules"]}`,
+		`{"name":"billing","repos":["example-org/infrastructure"]}`,
+	}
+	for i := range want {
+		if bodies[i] != want[i] {
+			t.Errorf("body %d = %s\nwant      %s", i, bodies[i], want[i])
+		}
+	}
+	if (AppSpec{ReviewAlsoReads: []string{}}).Empty() {
+		t.Error("an empty list sends []")
+	}
+}
+
+// An app read back holds a change's repositories to also read only when they
+// match, in any order. The case of each is part of it, as AutoPilot keeps
+// them as sent.
+func TestAppSpec_ReviewAlsoReadsReflectedIn(t *testing.T) {
+	held := &App{ReviewAlsoReads: []string{"example-org/a", "example-org/b"}}
+	cases := []struct {
+		spec AppSpec
+		app  *App
+		want bool
+	}{
+		{AppSpec{ReviewAlsoReads: []string{"example-org/b", "example-org/a"}}, held, true},
+		{AppSpec{ReviewAlsoReads: []string{"example-org/a"}}, held, false},
+		{AppSpec{ReviewAlsoReads: []string{"example-org/a", "Example-Org/B"}}, held, false},
+		{AppSpec{ReviewAlsoReads: []string{}}, held, false},
+		{AppSpec{ReviewAlsoReads: []string{}}, &App{}, true},
+		{AppSpec{ReviewAlsoReads: []string{}}, &App{ReviewAlsoReads: []string{}}, true},
+		{AppSpec{}, held, true},
+	}
+	for i, c := range cases {
+		if got := c.spec.reflectedIn(c.app); got != c.want {
+			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// An answer without review_also_reads, from an AutoPilot that predates it,
+// reads as none; one with it reads as it is.
+func TestGetApp_ReviewAlsoReads(t *testing.T) {
+	answers := []struct {
+		answer map[string]any
+		want   []string
+	}{
+		{map[string]any{"name": "billing", "lock_version": 1}, nil},
+		{map[string]any{"name": "billing", "lock_version": 1, "review_also_reads": []string{}}, []string{}},
+		{map[string]any{"name": "billing", "lock_version": 1, "review_also_reads": []string{"example-org/a", "example-org/b"}},
+			[]string{"example-org/a", "example-org/b"}},
+	}
+	for i, a := range answers {
+		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRecord(w, http.StatusOK, a.answer)
+		}))
+		app, err := c.GetApp(context.Background(), "billing")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(app.ReviewAlsoReads, a.want) || (a.want == nil) != (app.ReviewAlsoReads == nil) {
+			t.Errorf("answer %d: review_also_reads = %#v, want %#v", i, app.ReviewAlsoReads, a.want)
+		}
+	}
+}

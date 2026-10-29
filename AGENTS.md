@@ -156,6 +156,27 @@ the examples, and the generated docs. Things worth knowing:
   `validateAutoReview` checks the rules that span fields. An app that
   leaves it out sends nothing for it, so an older AutoPilot still takes
   the app.
+- An app's `review_also_reads` lists other repositories, `owner/name`, that
+  the reviews of the app's own repositories also read, read-only. Each is
+  checked step for step with AutoPilot's own rule (`validRepo`, in the
+  provider and the fake): the owner letters, digits and `-`, at most 39,
+  the name letters, digits, `.`, `_` and `-`, at most 100 and not dots
+  alone; at most 5, and no two that differ only in case. AutoPilot also
+  takes each only of the same owner as one of `repos`, without regard to
+  case, and never one of `repos`, on a create and on any change that sends
+  either (at `/review_also_reads/<n>` when it sends both, or at
+  `/review_also_reads` or `/repos` against the record when it sends one).
+  The plan checks that against the configuration
+  (`validateReviewAlsoReads`), which is what AutoPilot will hold, so `repos`
+  left out is none; a change to both goes out in one `PATCH`. Like `repos`,
+  it is optional with no default and null in state while AutoPilot answers
+  `[]`. Unlike `repos`, none is never sent, as `auto_review.workflows`
+  isn't: it is sent sorted and each once only when it changed and lists
+  some, or as `[]` to take some away, never from none to none (null and
+  `[]` alike), and an answer without the field reads as none
+  (`alsoReadsToSet`). So an app that lists none still works with an
+  AutoPilot that predates the field, and one rolled back past it can be
+  taken out of the configuration.
 - A sender's secrets are write-only (`*_wo`). The plan compares
   `client.Fingerprint` of the configured secrets with the stored
   fingerprints; see the comment at the top of `sender_resource.go`.

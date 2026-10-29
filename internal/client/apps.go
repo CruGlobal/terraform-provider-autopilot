@@ -9,7 +9,8 @@ import (
 // App is a unit of consent: the repositories it owns, the senders it accepts
 // work from (with the kinds it accepts from each), the people who may start
 // work for it themselves, and their GitHub logins. It also holds the app's
-// credential policy, the worker its tasks run in, and its automatic reviews.
+// credential policy, the worker its tasks run in, its automatic reviews, and
+// the other repositories its reviews also read.
 type App struct {
 	Name       string   `json:"name"`
 	Repos      []string `json:"repos"`
@@ -34,10 +35,14 @@ type App struct {
 	WorkerMemory *int64 `json:"worker_memory"`
 	// AutoReview is the app's automatic reviews, or nil when it has none (or
 	// the AutoPilot predates the field).
-	AutoReview  *AutoReview `json:"auto_review"`
-	LockVersion int64       `json:"lock_version"`
-	CreatedAt   string      `json:"created_at"`
-	UpdatedAt   string      `json:"updated_at"`
+	AutoReview *AutoReview `json:"auto_review"`
+	// ReviewAlsoReads are other repositories, as owner/name, that the reviews
+	// of the app's own repositories also read, read-only. Empty (or nil, when
+	// the AutoPilot predates the field) is none.
+	ReviewAlsoReads []string `json:"review_also_reads"`
+	LockVersion     int64    `json:"lock_version"`
+	CreatedAt       string   `json:"created_at"`
+	UpdatedAt       string   `json:"updated_at"`
 }
 
 // AutoEvents are the pull_request actions an app's automatic reviews may
@@ -163,6 +168,11 @@ type AppSpec struct {
 	Size        *WorkerSize
 	// AutoReview is the app's automatic reviews, sent whole; nil is not sent.
 	AutoReview *AutoReviewSetting
+	// ReviewAlsoReads are the other repositories the app's reviews also read,
+	// sent sorted and each once. Like every list, nil is not sent (so an
+	// AutoPilot that predates the field still takes the app), and an empty,
+	// non-nil list is sent as [], which takes them all away.
+	ReviewAlsoReads []string
 }
 
 func (s AppSpec) fields() Fields {
@@ -209,6 +219,9 @@ func (s AppSpec) fields() Fields {
 		} else {
 			f["auto_review"] = autoReviewBody(*s.AutoReview.On)
 		}
+	}
+	if s.ReviewAlsoReads != nil {
+		f["review_also_reads"] = sortedUnique(s.ReviewAlsoReads)
 	}
 	return f
 }
@@ -367,6 +380,9 @@ func (s AppSpec) reflectedIn(app *App) bool {
 		return false
 	}
 	if s.AutoReview != nil && !sameAutoReview(s.AutoReview.On, app.AutoReview) {
+		return false
+	}
+	if s.ReviewAlsoReads != nil && !slices.Equal(sortedUnique(s.ReviewAlsoReads), sortedUnique(app.ReviewAlsoReads)) {
 		return false
 	}
 	return true

@@ -40,18 +40,19 @@ type appResource struct {
 }
 
 type appModel struct {
-	Name          types.String `tfsdk:"name"`
-	Repos         types.Set    `tfsdk:"repos"`
-	Accepts       types.Set    `tfsdk:"accepts"`
-	Developers    types.Set    `tfsdk:"developers"`
-	GitHubLogins  types.Set    `tfsdk:"github_logins"`
-	Credential    types.String `tfsdk:"credential"`
-	WhenSeatsFull types.String `tfsdk:"when_seats_full"`
-	WorkerImage   types.String `tfsdk:"worker_image"`
-	WorkerCPU     types.Int64  `tfsdk:"worker_cpu"`
-	WorkerMemory  types.Int64  `tfsdk:"worker_memory"`
-	AutoReview    types.Object `tfsdk:"auto_review"`
-	LockVersion   types.Int64  `tfsdk:"lock_version"`
+	Name            types.String `tfsdk:"name"`
+	Repos           types.Set    `tfsdk:"repos"`
+	Accepts         types.Set    `tfsdk:"accepts"`
+	Developers      types.Set    `tfsdk:"developers"`
+	GitHubLogins    types.Set    `tfsdk:"github_logins"`
+	Credential      types.String `tfsdk:"credential"`
+	WhenSeatsFull   types.String `tfsdk:"when_seats_full"`
+	WorkerImage     types.String `tfsdk:"worker_image"`
+	WorkerCPU       types.Int64  `tfsdk:"worker_cpu"`
+	WorkerMemory    types.Int64  `tfsdk:"worker_memory"`
+	AutoReview      types.Object `tfsdk:"auto_review"`
+	ReviewAlsoReads types.Set    `tfsdk:"review_also_reads"`
+	LockVersion     types.Int64  `tfsdk:"lock_version"`
 }
 
 type autoReviewModel struct {
@@ -116,17 +117,18 @@ var gitHubLoginObjectType = types.ObjectType{AttrTypes: gitHubLoginAttrTypes}
 
 // appAPIFields maps the API's field names to this resource's attributes.
 var appAPIFields = map[string]string{
-	"name":            "name",
-	"repos":           "repos",
-	"accepts":         "accepts",
-	"developers":      "developers",
-	"github_logins":   "github_logins",
-	"credential":      "credential",
-	"when_seats_full": "when_seats_full",
-	"worker_image":    "worker_image",
-	"worker_cpu":      "worker_cpu",
-	"worker_memory":   "worker_memory",
-	"auto_review":     "auto_review",
+	"name":              "name",
+	"repos":             "repos",
+	"accepts":           "accepts",
+	"developers":        "developers",
+	"github_logins":     "github_logins",
+	"credential":        "credential",
+	"when_seats_full":   "when_seats_full",
+	"worker_image":      "worker_image",
+	"worker_cpu":        "worker_cpu",
+	"worker_memory":     "worker_memory",
+	"auto_review":       "auto_review",
+	"review_also_reads": "review_also_reads",
 }
 
 // appToModel maps an app. Every list is optional and left out of the
@@ -136,20 +138,42 @@ var appAPIFields = map[string]string{
 // AutoPilot answers null, as it does for an app without them.
 func appToModel(a *client.App, prior appModel) appModel {
 	return appModel{
-		Name:          types.StringValue(a.Name),
-		Repos:         setOrNull(a.Repos, prior.Repos),
-		Accepts:       acceptsToSet(a.Accepts, prior.Accepts),
-		Developers:    setOrNull(a.Developers, prior.Developers),
-		GitHubLogins:  gitHubLoginsToSet(a.GitHubLogins, prior.GitHubLogins),
-		Credential:    types.StringPointerValue(a.Credential),
-		WhenSeatsFull: types.StringPointerValue(a.WhenSeatsFull),
-		WorkerImage:   types.StringPointerValue(a.WorkerImage),
-		WorkerCPU:     types.Int64PointerValue(a.WorkerCPU),
-		WorkerMemory:  types.Int64PointerValue(a.WorkerMemory),
-		AutoReview:    autoReviewToObject(a.AutoReview),
-		LockVersion:   types.Int64Value(a.LockVersion),
+		Name:            types.StringValue(a.Name),
+		Repos:           setOrNull(a.Repos, prior.Repos),
+		Accepts:         acceptsToSet(a.Accepts, prior.Accepts),
+		Developers:      setOrNull(a.Developers, prior.Developers),
+		GitHubLogins:    gitHubLoginsToSet(a.GitHubLogins, prior.GitHubLogins),
+		Credential:      types.StringPointerValue(a.Credential),
+		WhenSeatsFull:   types.StringPointerValue(a.WhenSeatsFull),
+		WorkerImage:     types.StringPointerValue(a.WorkerImage),
+		WorkerCPU:       types.Int64PointerValue(a.WorkerCPU),
+		WorkerMemory:    types.Int64PointerValue(a.WorkerMemory),
+		AutoReview:      autoReviewToObject(a.AutoReview),
+		ReviewAlsoReads: alsoReadsToSet(a.ReviewAlsoReads, prior.ReviewAlsoReads),
+		LockVersion:     types.Int64Value(a.LockVersion),
 	}
 }
+
+// alsoReadsToSet maps the repositories AutoPilot answered that the app's
+// reviews also read to state, as setOrNull does, except that an answer
+// without the field is none: null, or [] where prior was []. Only an
+// AutoPilot that predates the field, or was rolled back past it, answers
+// so, and it ignores a list it kept, so no review reads one. Read as none, a
+// configuration that takes the list out plans nothing, where [] would send
+// the field, which that AutoPilot refuses.
+func alsoReadsToSet(values []string, prior types.Set) types.Set {
+	if values == nil && !emptySet(prior) {
+		return types.SetNull(types.StringType)
+	}
+	return setOrNull(values, prior)
+}
+
+// emptySet reports whether a set is known and holds no value.
+func emptySet(s types.Set) bool { return !s.IsNull() && !s.IsUnknown() && len(s.Elements()) == 0 }
+
+// noneSet reports whether a set is null or known and empty: none, to
+// AutoPilot, for a list whose default is none.
+func noneSet(s types.Set) bool { return s.IsNull() || emptySet(s) }
 
 // autoReviewToObject maps the automatic reviews AutoPilot answered with to
 // state: null for none (or an AutoPilot that predates the field), and every
@@ -413,6 +437,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"`auto_review` has AutoPilot review the app's pull requests on its own, with no label, as the app's own " +
 			"service identity, and lets the GitHub Actions workflows it lists ask for those reviews. It is one " +
 			"setting, and a change to any of its fields sends all of them.\n\n" +
+			"`review_also_reads` lets the reviews of the app's repositories read other repositories of the same " +
+			"owner, read-only. Anyone who can push a branch to one of the app's repositories, and anyone who can read " +
+			"its reviews, can see what those repositories hold.\n\n" +
 			"An app with this name that already exists is not taken over, even when its values match: the create " +
 			"fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a " +
 			"gateway's 502, say) before an identical app answered: that attempt may have made the app, and the " +
@@ -759,6 +786,46 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					},
 				},
 			},
+			"review_also_reads": schema.SetAttribute{
+				MarkdownDescription: "Other repositories that the pull request reviews of this app's own repositories " +
+					"also read, read-only, as `owner/name`: such as the Terraform modules repository whose modules this " +
+					"app's roots use, so a review can read a module at the ref a `source` pins. Only the reviews of this " +
+					"app's repositories read them, whoever asked for the review, and only of a pull request from a branch " +
+					"of the repository itself, never a fork's. No other kind of task, and no other app's review, ever " +
+					"does. Each review reads only those of its own repository's owner. Before the review starts, " +
+					"AutoPilot clones each, every branch and tag, with GitHub tokens of their own that can only read " +
+					"them, never the review's own token, and the review reads them as data, never as instructions: their " +
+					"files for agents, such as `AGENTS.md`, don't apply to it. **This app's " +
+					"repositories' writers and the readers of its reviews can see what these repositories hold:** a " +
+					"review runs the pull request's own code, so anyone who can push a branch to one of this app's " +
+					"repositories and have it reviewed can read everything they hold, every branch and tag, and a review, " +
+					"posted on this app's repository, may quote them. List only repositories those people may read, and " +
+					"review this list as you would `repos`. Each must have the same owner as one of `repos`, compared " +
+					"without regard to case, since a review reads only repositories of its own repository's owner, and " +
+					"none may be one of `repos`, which a review already reads. So an app with no `repos` can list none, " +
+					"and a change that takes a repository out of `repos` must take out the ones only its owner allowed. " +
+					"Each is `owner/name`: the owner letters, digits and `-`, at most 39 characters, and the name " +
+					"letters, digits, `.`, `_` and `-`, at most 100, and not dots alone. AutoPilot compares them without " +
+					"regard to case, so no two may differ only in case. At most 5. An AutoPilot that limits which " +
+					"repositories its apps may reach refuses one outside that limit when it is applied. A repository the " +
+					"GitHub App isn't installed on, that GitHub doesn't know, or that is too large or too slow to clone, " +
+					"is left out of that review, which goes on and says so. Left out, reviews read only their own " +
+					"repository, and removing it from the configuration takes every one away. A change reaches each " +
+					"review that starts after it. Listing some needs an AutoPilot that knows the field; an older one " +
+					"refuses it with a 422. Listing none, left out or `[]`, never sends it. An AutoPilot rolled back past " +
+					"the field ignores the stored list, so reviews read only their own repository, and refuses every " +
+					"write that sends it, but keeps it. Meanwhile the provider reads the app as listing none, so a " +
+					"configuration that lists some plans a change on every run and its applies fail: take them out of " +
+					"the configuration until AutoPilot is rolled forward. Then the next plan shows the list AutoPilot " +
+					"kept, and the apply takes it away unless the configuration lists it again.",
+				ElementType: types.StringType,
+				Optional:    true,
+				Validators: []validator.Set{
+					setvalidator.SizeAtMost(maxAlsoReads),
+					setvalidator.ValueStringsAre(alsoReadsRepoValidator{}),
+					noCaseRepeatsValidator{what: "repositories"},
+				},
+			},
 			"lock_version": schema.Int64Attribute{
 				MarkdownDescription: "The record's version, which AutoPilot raises on every change. Sent as `If-Match` " +
 					"on updates and deletes.",
@@ -770,14 +837,54 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 
 // ValidateConfig checks the rules that span two arguments: the credential
 // policy's, the worker size's, that each GitHub login's developer is one of
-// the developers, and automatic reviews' deciding knobs, events and
-// workflows. A value not known yet waits: Terraform validates again at
-// apply.
+// the developers, automatic reviews' deciding knobs, events and workflows,
+// and what reviews also read beside the app's own repositories. A value not
+// known yet waits: Terraform validates again at apply.
 func (r *appResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	validatePolicy(ctx, req, resp)
 	validateSize(ctx, req, resp)
 	validateGitHubLogins(ctx, req, resp)
 	validateAutoReview(ctx, req, resp)
+	validateReviewAlsoReads(ctx, req, resp)
+}
+
+// validateReviewAlsoReads checks each repository the app's reviews also read
+// against the app's own repositories, as AutoPilot does on a create and on
+// any change that sends either: of the same owner as one of them, without
+// regard to case, and never one of them. The configuration is what AutoPilot
+// will hold, since a list left out is sent as [] once it was set, so repos
+// left out is no repository at all. It waits while repos, or one of them, is
+// not known yet; a repository to read that isn't known yet, or that its own
+// validator refuses, is skipped.
+func validateReviewAlsoReads(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var repos, alsoReads types.Set
+	var diags diag.Diagnostics
+	diags.Append(req.Config.GetAttribute(ctx, path.Root("repos"), &repos)...)
+	diags.Append(req.Config.GetAttribute(ctx, path.Root("review_also_reads"), &alsoReads)...)
+	resp.Diagnostics.Append(diags...)
+	if diags.HasError() || alsoReads.IsNull() || alsoReads.IsUnknown() || repos.IsUnknown() {
+		return
+	}
+	own, owners := map[string]bool{}, map[string]bool{}
+	for _, elem := range repos.Elements() {
+		s, ok := elem.(types.String)
+		if !ok || s.IsUnknown() {
+			return
+		}
+		if s.IsNull() {
+			continue
+		}
+		own[strings.ToLower(s.ValueString())], owners[repoOwner(s.ValueString())] = true, true
+	}
+	for _, elem := range alsoReads.Elements() {
+		s, ok := elem.(types.String)
+		if !ok || !known(s) || !validRepo(s.ValueString()) {
+			continue
+		}
+		if summary, detail := alsoReadsProblem(s.ValueString(), own, owners); summary != "" {
+			resp.Diagnostics.AddAttributeError(path.Root("review_also_reads"), summary, detail)
+		}
+	}
 }
 
 // validateAutoReview checks automatic reviews' fields that depend on each
@@ -983,6 +1090,12 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 		Developers:   stringsFromSet(ctx, plan.Developers, "developers", &resp.Diagnostics),
 		GitHubLogins: gitHubLoginsFromSet(ctx, plan.GitHubLogins, &resp.Diagnostics),
 	}
+	// Sent only when it lists some: none is AutoPilot's default, and an
+	// AutoPilot that predates the field refuses it, [] included, so an app
+	// that lists none still works with it.
+	if !noneSet(plan.ReviewAlsoReads) {
+		spec.ReviewAlsoReads = stringsFromSet(ctx, plan.ReviewAlsoReads, "review_also_reads", &resp.Diagnostics)
+	}
 	if !plan.Credential.IsNull() {
 		spec.Policy = policyFromModel(plan, &resp.Diagnostics)
 	}
@@ -1106,6 +1219,16 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 	if !plan.AutoReview.Equal(state.AutoReview) {
 		spec.AutoReview = autoReviewFromModel(ctx, plan, &resp.Diagnostics)
 	}
+	// Sent with repos or apart: AutoPilot checks the two against what the
+	// change leaves, so taking a repository and the ones only its owner
+	// allowed out in one change sends both in one write. Removed, it is sent
+	// as [], which takes them all away. It is never sent unless it changed,
+	// nor from none to none (null and [] alike), so an app that lists none
+	// still works with an AutoPilot that predates the field.
+	noneToNone := noneSet(plan.ReviewAlsoReads) && noneSet(state.ReviewAlsoReads)
+	if !plan.ReviewAlsoReads.Equal(state.ReviewAlsoReads) && !noneToNone {
+		spec.ReviewAlsoReads = orEmptyStrings(stringsFromSet(ctx, plan.ReviewAlsoReads, "review_also_reads", &resp.Diagnostics))
+	}
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -1185,10 +1308,11 @@ func (r *appResource) ImportState(ctx context.Context, req resource.ImportStateR
 		return
 	}
 	state := appToModel(a, appModel{
-		Repos:        types.SetNull(types.StringType),
-		Accepts:      types.SetNull(acceptObjectType),
-		Developers:   types.SetNull(types.StringType),
-		GitHubLogins: types.SetNull(gitHubLoginObjectType),
+		Repos:           types.SetNull(types.StringType),
+		Accepts:         types.SetNull(acceptObjectType),
+		Developers:      types.SetNull(types.StringType),
+		GitHubLogins:    types.SetNull(gitHubLoginObjectType),
+		ReviewAlsoReads: types.SetNull(types.StringType),
 	})
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }

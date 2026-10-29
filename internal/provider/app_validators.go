@@ -32,7 +32,78 @@ var (
 	// AutoPilot's own pattern: owner/repo, a file straight in
 	// .github/workflows, and a branch. parseWorkflowRef checks the rest.
 	workflowRefPattern = regexp.MustCompile(`^([A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100})/(\.github/workflows/[A-Za-z0-9._-]{1,200}\.ya?ml)@refs/heads/([A-Za-z0-9._/-]{1,200})$`)
+	// A repository an app's reviews also read, in AutoPilot's own pattern:
+	// owner/name, as GitHub spells them. validRepo checks the rest.
+	alsoReadsPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}/([A-Za-z0-9._-]{1,100})$`)
 )
+
+// maxAlsoReads is the most repositories an app's reviews may also read, as
+// AutoPilot has it.
+const maxAlsoReads = 5
+
+// validRepo is AutoPilot's own rule for a repository an app's reviews also
+// read, step for step: owner/name, the owner letters, digits and -, at most
+// 39 characters, and the name letters, digits, ., _ and -, at most 100, and
+// not dots alone. It is stricter than repoPattern, which an app's own
+// repositories are checked with.
+func validRepo(repo string) bool {
+	m := alsoReadsPattern.FindStringSubmatch(repo)
+	return m != nil && strings.Trim(m[1], ".") != ""
+}
+
+// repoOwner is a repository's owner, lowercased, for comparing: the part
+// before the first /.
+func repoOwner(repo string) string {
+	owner, _, _ := strings.Cut(repo, "/")
+	return strings.ToLower(owner)
+}
+
+// alsoReadsRepoValidator refuses a repository AutoPilot would refuse in
+// review_also_reads.
+type alsoReadsRepoValidator struct{}
+
+func (alsoReadsRepoValidator) Description(context.Context) string {
+	return "a repository as owner/name, as GitHub spells them"
+}
+
+func (v alsoReadsRepoValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (alsoReadsRepoValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if value := req.ConfigValue.ValueString(); !validRepo(value) {
+		resp.Diagnostics.AddAttributeError(req.Path, "Invalid repository",
+			fmt.Sprintf("%q isn't a repository as AutoPilot takes one: owner/name, the owner letters, digits and -, "+
+				"at most 39 characters, and the name letters, digits, ., _ and -, at most 100, and not dots alone.", value))
+	}
+}
+
+// alsoReadsProblem says why repo, a repository an app's reviews also read,
+// can't stand beside the app's own repositories, as AutoPilot does, or "".
+// own and owners are the app's repositories and their owners, lowercased.
+// A repository the review already reads is refused first, then one of
+// another owner: a review reads only repositories of its own repository's
+// owner, since its token for them is one GitHub App installation's.
+func alsoReadsProblem(repo string, own, owners map[string]bool) (summary, detail string) {
+	switch {
+	case own[strings.ToLower(repo)]:
+		return "Repository the app owns", fmt.Sprintf("%q is one of this app's repos, which its reviews already read. "+
+			"Take it out of review_also_reads.", repo)
+	case len(owners) == 0:
+		return "Repository of another owner", fmt.Sprintf("%q can't be read by this app's reviews: the app owns no "+
+			"repository, and a review reads only other repositories of its own repository's owner. Add the app's repos, "+
+			"or take it out of review_also_reads.", repo)
+	case !owners[repoOwner(repo)]:
+		return "Repository of another owner", fmt.Sprintf("%q has another owner than every one of this app's repos. A "+
+			"review reads only other repositories of its own repository's owner, compared without regard to case, since "+
+			"its read-only token for them comes from the same GitHub App installation. Take it out of review_also_reads.",
+			repo)
+	}
+	return "", ""
+}
 
 // workflowRef is a workflow an app's automatic reviews may take asks from.
 type workflowRef struct {

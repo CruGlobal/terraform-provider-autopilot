@@ -94,4 +94,11 @@ resource "autopilot_app" "infrastructure" {
     events    = []
     workflows = ["example-org/infrastructure/.github/workflows/autopilot-review.yml@refs/heads/main"]
   }
+
+  # Let the reviews of this app's repositories also read the modules its
+  # Terraform roots use, read-only, at the ref each module source pins.
+  # Each must have the same owner as one of repos. Anyone who can push a
+  # branch to example-org/infrastructure and have it reviewed, and anyone
+  # who can read its reviews, can see what these repositories hold.
+  review_also_reads = ["example-org/terraform-modules"]
 }
