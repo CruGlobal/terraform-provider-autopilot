@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.5.0...v0.6.0) (2026-10-29)
+
+
+### Added
+
+* **app:** add auto_review.workflows, the GitHub Actions workflows that may ask for an app's automatic review ([#20](https://github.com/CruGlobal/terraform-provider-autopilot/issues/20)) ([6e09c8b](https://github.com/CruGlobal/terraform-provider-autopilot/commit/6e09c8b71d9c0765375d3d3234d3beb7d12a6ee4))
+
 ## [0.5.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.4.0...v0.5.0) (2026-10-26)
 
 
