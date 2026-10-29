@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.6.0...v0.7.0) (2026-10-29)
+
+
+### Added
+
+* **app:** add review_also_reads, other repositories an app's reviews also read, read-only ([#22](https://github.com/CruGlobal/terraform-provider-autopilot/issues/22)) ([3384071](https://github.com/CruGlobal/terraform-provider-autopilot/commit/3384071f36c42a77c3269663e25182b8fbca16cd))
+
 ## [0.6.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.5.0...v0.6.0) (2026-10-29)
 
 
