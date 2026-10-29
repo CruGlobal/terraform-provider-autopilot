@@ -46,12 +46,20 @@ var AutoEvents = []string{"opened", "ready_for_review", "synchronize"}
 
 // AutoReview is an app's automatic reviews: AutoPilot reviews the pull
 // requests into the default branch of the app's repositories on its own,
-// with no label, as the app's own service identity. AutoPilot takes it as
-// one setting: a write sends every field, and a field it leaves out is
-// AutoPilot's default, not what was kept.
+// with no label, as the app's own service identity, and a GitHub Actions
+// workflow it lists may ask for one. AutoPilot takes it as one setting: a
+// write sends every field (the workflows only when there are some), and a
+// field it leaves out is AutoPilot's default, not what was kept.
 type AutoReview struct {
-	// Events are the actions that start one: some of AutoEvents.
+	// Events are the actions that start one: some of AutoEvents. Empty only
+	// with Workflows.
 	Events []string `json:"events"`
+	// Workflows are the GitHub Actions workflows that may ask for one with
+	// their OIDC token, each as GitHub names the workflow a job ran
+	// (job_workflow_ref) on a branch:
+	// owner/repo/.github/workflows/<file>.yml@refs/heads/<branch>. Empty (or
+	// nil, when the AutoPilot predates the field) is none.
+	Workflows []string `json:"workflows"`
 	// MaxPerDay is the most automatic reviews of the app's repositories in 24
 	// hours, from 1 to 200.
 	MaxPerDay int64 `json:"max_per_day"`
@@ -208,16 +216,25 @@ func (s AppSpec) fields() Fields {
 // autoReviewBody is automatic reviews as a write sends them: every field,
 // the events in AutoPilot's order, each once, and no ceiling as null. Unlike
 // an accepts entry's flags, the knobs are sent even when off: every
-// AutoPilot that takes auto_review knows all five fields, and the body then
-// says exactly what the plan does, not what AutoPilot's defaults would.
+// AutoPilot that takes auto_review knows those five fields, and the body
+// then says exactly what the plan does, not what AutoPilot's defaults would.
+// The workflows are the one exception: sent sorted and each once, and only
+// when there are some, never as [] or null. AutoPilot's default for them is
+// none, which a write that leaves them out gets, and an AutoPilot that
+// predates them refuses the field, so an app that lists none still works
+// with it.
 func autoReviewBody(a AutoReview) map[string]any {
-	return map[string]any{
+	body := map[string]any{
 		"events":            normalizeEvents(a.Events),
 		"max_per_day":       a.MaxPerDay,
 		"can_decide":        a.CanDecide,
 		"can_decide_own_pr": a.CanDecideOwnPR,
 		"approve_up_to":     nullableString(a.ApproveUpTo),
 	}
+	if workflows := sortedUnique(a.Workflows); len(workflows) > 0 {
+		body["workflows"] = workflows
+	}
+	return body
 }
 
 // nullableString is "" as null, and any other string as itself.
@@ -247,12 +264,13 @@ func normalizeEvents(events []string) []string {
 }
 
 // sameAutoReview reports whether two settings of automatic reviews are the
-// same, nil being none.
+// same, nil being none. No workflows, nil or empty, is the same either way.
 func sameAutoReview(x, y *AutoReview) bool {
 	if x == nil || y == nil {
 		return x == y
 	}
-	return slices.Equal(normalizeEvents(x.Events), normalizeEvents(y.Events)) && x.MaxPerDay == y.MaxPerDay &&
+	return slices.Equal(normalizeEvents(x.Events), normalizeEvents(y.Events)) &&
+		slices.Equal(sortedUnique(x.Workflows), sortedUnique(y.Workflows)) && x.MaxPerDay == y.MaxPerDay &&
 		x.CanDecide == y.CanDecide && x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo
 }
 

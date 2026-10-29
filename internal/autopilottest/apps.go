@@ -45,12 +45,41 @@ var (
 	// the most it may be.
 	defaultAutoPerDay int64 = 50
 	maxAutoPerDay     int64 = 200
+	// The most workflows an app may list that may ask for its automatic
+	// reviews.
+	maxAutoWorkflows = 20
+	// A workflow that may ask for an app's automatic reviews, as GitHub's
+	// OIDC token names the workflow a job ran (job_workflow_ref): the
+	// repository, the file straight in .github/workflows, and a branch.
+	workflowRefPattern = regexp.MustCompile(`^([A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100})/(\.github/workflows/[A-Za-z0-9._-]{1,200}\.ya?ml)@refs/heads/([A-Za-z0-9._/-]{1,200})$`)
 )
 
+// workflowKey is AutoPilot's key for a workflow an app may list: the
+// repository without regard to case, and the file and branch exactly. ok is
+// false for one AutoPilot refuses: not a workflow on a branch, a repository
+// name of dots alone, or a branch git wouldn't make.
+func workflowKey(text string) (key string, ok bool) {
+	m := workflowRefPattern.FindStringSubmatch(text)
+	if m == nil {
+		return "", false
+	}
+	repo, path, branch := m[1], m[2], m[3]
+	if strings.Trim(repo[strings.IndexByte(repo, '/')+1:], ".") == "" {
+		return "", false
+	}
+	if strings.HasPrefix(branch, "/") || strings.HasPrefix(branch, "-") || strings.HasPrefix(branch, ".") ||
+		strings.HasSuffix(branch, "/") || strings.HasSuffix(branch, ".") || strings.HasSuffix(branch, ".lock") ||
+		strings.Contains(branch, "..") || strings.Contains(branch, "//") || strings.Contains(branch, "/.") {
+		return "", false
+	}
+	return strings.ToLower(repo) + "/" + path + "@refs/heads/" + branch, true
+}
+
 // AutoReview is an app's automatic reviews. An empty ApproveUpTo is no
-// ceiling (null).
+// ceiling (null), and no Workflows (nil or empty) is none.
 type AutoReview struct {
 	Events         []string
+	Workflows      []string
 	MaxPerDay      int64
 	CanDecide      bool
 	CanDecideOwnPR bool
@@ -63,13 +92,16 @@ func cloneAutoReview(a *AutoReview) *AutoReview {
 	}
 	out := *a
 	out.Events = slices.Clone(a.Events)
+	out.Workflows = slices.Clone(a.Workflows)
 	return &out
 }
 
 // storedAutoReview is automatic reviews as AutoPilot keeps what it is given
 // from outside a write (SeedApp, ChangeAppOutOfBand): the events it knows,
-// each once, in its order, and none at all with none of them; and the own
-// pull request's toggle only with can_decide.
+// each once, in its order; the workflows it reads (AutoPilot only leaves out
+// those it can't read; they are also sorted and kept once each here, as any
+// write AutoPilot takes keeps them); none at all with no event and no
+// workflow; and the own pull request's toggle only with can_decide.
 func storedAutoReview(a *AutoReview) *AutoReview {
 	if a == nil {
 		return nil
@@ -81,7 +113,13 @@ func storedAutoReview(a *AutoReview) *AutoReview {
 			out.Events = append(out.Events, e)
 		}
 	}
-	if len(out.Events) == 0 {
+	out.Workflows = []string{}
+	for _, w := range sortedUnique(a.Workflows) {
+		if _, ok := workflowKey(w); ok {
+			out.Workflows = append(out.Workflows, w)
+		}
+	}
+	if len(out.Events) == 0 && len(out.Workflows) == 0 {
 		return nil
 	}
 	out.CanDecideOwnPR = a.CanDecide && a.CanDecideOwnPR
@@ -97,8 +135,8 @@ func sameAutoReview(x, y *AutoReview) bool {
 	if x == nil || y == nil {
 		return x == y
 	}
-	return slices.Equal(x.Events, y.Events) && x.MaxPerDay == y.MaxPerDay && x.CanDecide == y.CanDecide &&
-		x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo
+	return slices.Equal(x.Events, y.Events) && slices.Equal(x.Workflows, y.Workflows) && x.MaxPerDay == y.MaxPerDay &&
+		x.CanDecide == y.CanDecide && x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo
 }
 
 // autoReviewJSON is automatic reviews as AutoPilot shows them: every field,
@@ -108,24 +146,27 @@ func autoReviewJSON(a *AutoReview) any {
 		return nil
 	}
 	return map[string]any{
-		"events": slices.Clone(a.Events), "max_per_day": a.MaxPerDay, "can_decide": a.CanDecide,
-		"can_decide_own_pr": a.CanDecideOwnPR, "approve_up_to": nullable(a.ApproveUpTo),
+		"events": slices.Clone(a.Events), "workflows": orEmpty(slices.Clone(a.Workflows)), "max_per_day": a.MaxPerDay,
+		"can_decide": a.CanDecide, "can_decide_own_pr": a.CanDecideOwnPR, "approve_up_to": nullable(a.ApproveUpTo),
 	}
 }
 
 // readAutoReview reads auto_review as AutoPilot does: null for none, or an
 // object whose fields are read in sorted order, each left out at its
-// default; the events kept once each, in autoEvents' order; and
-// can_decide_own_pr and approve_up_to only with can_decide.
+// default; the events kept once each, in autoEvents' order, and none only
+// beside a workflow, which needs them sent; the workflows as
+// readAutoWorkflows reads them; and can_decide_own_pr and approve_up_to only
+// with can_decide.
 func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
 	if string(raw) == "null" {
 		return nil, nil
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
-		return nil, invalid("/auto_review", "is an object with events, max_per_day, can_decide, can_decide_own_pr and approve_up_to, or null")
+		return nil, invalid("/auto_review", "is an object with events, workflows, max_per_day, can_decide, can_decide_own_pr and approve_up_to, or null")
 	}
-	out := AutoReview{Events: slices.Clone(defaultAutoEvents), MaxPerDay: defaultAutoPerDay}
+	out := AutoReview{Events: slices.Clone(defaultAutoEvents), Workflows: []string{}, MaxPerDay: defaultAutoPerDay}
+	_, eventsSent := obj["events"]
 	keys := make([]string, 0, len(obj))
 	for k := range obj {
 		keys = append(keys, k)
@@ -136,15 +177,17 @@ func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
 		var ref *refusal
 		switch k {
 		case "events":
+			// Empty only beside a workflow that may ask (checked below).
+			const rule = "is a list of opened, ready_for_review, synchronize: at least one, unless workflows lists one"
 			var events []json.RawMessage
-			if err := json.Unmarshal(obj[k], &events); err != nil || len(events) == 0 {
-				return nil, invalid(at, "is a list of one or more of opened, ready_for_review, synchronize")
+			if err := json.Unmarshal(obj[k], &events); err != nil || events == nil {
+				return nil, invalid(at, rule)
 			}
 			sent := []string{}
 			for i, e := range events {
 				var name string
 				if err := json.Unmarshal(e, &name); err != nil || !slices.Contains(autoEvents, name) {
-					return nil, invalid(at+"/"+itoa(i), "is a list of one or more of opened, ready_for_review, synchronize")
+					return nil, invalid(at+"/"+itoa(i), rule)
 				}
 				sent = append(sent, name)
 			}
@@ -153,6 +196,10 @@ func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
 				if slices.Contains(sent, name) {
 					out.Events = append(out.Events, name)
 				}
+			}
+		case "workflows":
+			if out.Workflows, ref = readAutoWorkflows(obj[k]); ref != nil {
+				return nil, ref
 			}
 		case "max_per_day":
 			var n *float64
@@ -188,7 +235,54 @@ func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
 	if out.ApproveUpTo != "" && !out.CanDecide {
 		return nil, invalid("/auto_review/approve_up_to", "is set only with can_decide true")
 	}
+	if len(out.Events) == 0 && len(out.Workflows) == 0 {
+		return nil, invalid("/auto_review/events", "names at least one event, unless workflows lists a workflow that may ask")
+	}
+	// Left out beside workflows, the default events would review every pull
+	// request when it opens, before any workflow asks, so they must be sent.
+	if len(out.Workflows) > 0 && !eventsSent {
+		return nil, invalid("/auto_review/events",
+			"is required with workflows: [] for only the workflows to ask, or the events that start a review on their own too")
+	}
 	return &out, nil
+}
+
+// readAutoWorkflows reads auto_review's workflows as AutoPilot does: a list
+// of strings, each refused at its place when it isn't a workflow on a
+// branch (workflowKey), or when it names one already listed with its
+// repository in another case; then kept as sent, sorted, each once, and at
+// most maxAutoWorkflows.
+func readAutoWorkflows(raw json.RawMessage) ([]string, *refusal) {
+	const at = "/auto_review/workflows"
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil || items == nil {
+		return nil, invalid(at, "is a list of workflow refs")
+	}
+	list := make([]string, 0, len(items))
+	for i, item := range items {
+		var ref *string
+		if err := json.Unmarshal(item, &ref); err != nil || ref == nil {
+			return nil, invalid(at+"/"+itoa(i), "is not a string")
+		}
+		list = append(list, *ref)
+	}
+	seen := map[string]string{}
+	for i, ref := range list {
+		key, ok := workflowKey(ref)
+		if !ok {
+			return nil, invalid(at+"/"+itoa(i), "a workflow is owner/repo/.github/workflows/<file>.yml@refs/heads/<branch>, "+
+				"as GitHub's OIDC token names it (job_workflow_ref): a branch, never a pull request's ref, a tag or a commit")
+		}
+		if other, dup := seen[key]; dup && other != ref {
+			return nil, invalid(at+"/"+itoa(i), "names a workflow already in the list, with its repository in another case")
+		}
+		seen[key] = ref
+	}
+	kept := sortedUnique(list)
+	if len(kept) > maxAutoWorkflows {
+		return nil, invalid(at, "lists at most 20 workflows")
+	}
+	return kept, nil
 }
 
 // workerMemory is the memory, in MiB, that Fargate allows with each CPU size

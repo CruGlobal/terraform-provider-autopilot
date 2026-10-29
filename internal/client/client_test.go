@@ -1012,7 +1012,9 @@ func TestGetApp_WithoutGitHubLogins(t *testing.T) {
 
 // Automatic reviews are sent whole when set: every field, the events each
 // once in AutoPilot's order, the flags even when off and no ceiling as null;
-// and as null to take them away. Left unset, they aren't sent.
+// and as null to take them away. Left unset, they aren't sent. The workflows
+// are sent sorted and each once, and only when there are some: never as []
+// or null, which an AutoPilot that predates them would refuse.
 func TestUpdateApp_SendsAutoReview(t *testing.T) {
 	var bodies []string
 	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1029,6 +1031,12 @@ func TestUpdateApp_SendsAutoReview(t *testing.T) {
 		}}},
 		{AutoReview: &AutoReviewSetting{}},
 		{Developers: []string{}},
+		{AutoReview: &AutoReviewSetting{On: &AutoReview{
+			Events: []string{}, MaxPerDay: 50,
+			Workflows: []string{"o/r/.github/workflows/b.yml@refs/heads/main", "O/r/.github/workflows/a.yml@refs/heads/main",
+				"o/r/.github/workflows/b.yml@refs/heads/main"},
+		}}},
+		{AutoReview: &AutoReviewSetting{On: &AutoReview{Events: []string{"opened"}, MaxPerDay: 50, Workflows: []string{}}}},
 	} {
 		if _, err := c.UpdateApp(ctx, "billing", spec, 1); err != nil {
 			t.Fatal(err)
@@ -1039,6 +1047,8 @@ func TestUpdateApp_SendsAutoReview(t *testing.T) {
 		`{"auto_review":{"approve_up_to":"low","can_decide":true,"can_decide_own_pr":true,"events":["opened","synchronize"],"max_per_day":10}}`,
 		`{"auto_review":null}`,
 		`{"developers":[]}`,
+		`{"auto_review":{"approve_up_to":null,"can_decide":false,"can_decide_own_pr":false,"events":[],"max_per_day":50,"workflows":["O/r/.github/workflows/a.yml@refs/heads/main","o/r/.github/workflows/b.yml@refs/heads/main"]}}`,
+		`{"auto_review":{"approve_up_to":null,"can_decide":false,"can_decide_own_pr":false,"events":["opened"],"max_per_day":50}}`,
 	}
 	for i := range want {
 		if bodies[i] != want[i] {
@@ -1072,6 +1082,19 @@ func TestAppSpec_AutoReviewReflectedIn(t *testing.T) {
 			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide = true })}, false},
 		{set(on(func(a *AutoReview) { a.CanDecide, a.ApproveUpTo = true, "low" })),
 			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide = true })}, false},
+		{set(on(func(a *AutoReview) { a.Workflows = []string{"o/r/.github/workflows/a.yml@refs/heads/main"} })),
+			&App{AutoReview: on(same)}, false},
+		{set(on(same)), &App{AutoReview: on(func(a *AutoReview) { a.Workflows = []string{"o/r/.github/workflows/a.yml@refs/heads/main"} })}, false},
+		{set(on(func(a *AutoReview) {
+			a.Workflows = []string{"o/r/.github/workflows/b.yml@refs/heads/main", "o/r/.github/workflows/a.yml@refs/heads/main"}
+		})), &App{AutoReview: on(func(a *AutoReview) {
+			a.Workflows = []string{"o/r/.github/workflows/a.yml@refs/heads/main", "o/r/.github/workflows/b.yml@refs/heads/main"}
+		})}, true},
+		// A change of case alone is a change.
+		{set(on(func(a *AutoReview) { a.Workflows = []string{"O/r/.github/workflows/a.yml@refs/heads/main"} })),
+			&App{AutoReview: on(func(a *AutoReview) { a.Workflows = []string{"o/r/.github/workflows/a.yml@refs/heads/main"} })}, false},
+		// None is none, nil or empty.
+		{set(on(func(a *AutoReview) { a.Workflows = []string{} })), &App{AutoReview: on(same)}, true},
 		{set(nil), &App{AutoReview: on(same)}, false},
 		{set(nil), &App{}, true},
 		{AppSpec{}, &App{AutoReview: on(same)}, true},
@@ -1085,7 +1108,8 @@ func TestAppSpec_AutoReviewReflectedIn(t *testing.T) {
 
 // AutoPilot answers auto_review as null for an app without automatic
 // reviews, and an AutoPilot that predates it answers without it: both read
-// as none. A ceiling of null reads as none.
+// as none. A ceiling of null reads as none, and so do workflows left out, as
+// an AutoPilot that predates them answers.
 func TestGetApp_AutoReview(t *testing.T) {
 	answers := []map[string]any{
 		{"name": "billing", "lock_version": 1},
@@ -1107,8 +1131,23 @@ func TestGetApp_AutoReview(t *testing.T) {
 			t.Errorf("answer %d: auto_review = %+v, want none", i, a.AutoReview)
 		}
 		if i == 2 && (a.AutoReview == nil || !slices.Equal(a.AutoReview.Events, []string{"opened", "synchronize"}) ||
-			a.AutoReview.MaxPerDay != 10 || !a.AutoReview.CanDecide || a.AutoReview.CanDecideOwnPR || a.AutoReview.ApproveUpTo != "") {
+			a.AutoReview.MaxPerDay != 10 || !a.AutoReview.CanDecide || a.AutoReview.CanDecideOwnPR || a.AutoReview.ApproveUpTo != "" ||
+			len(a.AutoReview.Workflows) != 0) {
 			t.Errorf("auto_review = %+v", a.AutoReview)
 		}
+	}
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 1, "auto_review": map[string]any{
+			"events": []string{}, "workflows": []string{"o/r/.github/workflows/a.yml@refs/heads/main"}, "max_per_day": 50,
+			"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil,
+		}})
+	}))
+	a, err := c.GetApp(context.Background(), "billing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.AutoReview == nil || len(a.AutoReview.Events) != 0 ||
+		!slices.Equal(a.AutoReview.Workflows, []string{"o/r/.github/workflows/a.yml@refs/heads/main"}) {
+		t.Errorf("auto_review = %+v, want the workflow and no event", a.AutoReview)
 	}
 }
