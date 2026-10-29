@@ -25,7 +25,7 @@ var (
 	maxAccepts         = 20
 	maxDevelopers      = 100
 	maxGitHubLogins    = 100
-	appWritable        = []string{"repos", "accepts", "developers", "github_logins", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory", "auto_review"}
+	appWritable        = []string{"repos", "accepts", "developers", "github_logins", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory", "auto_review", "review_also_reads"}
 	appReadOnly        = []string{"lock_version", "created_at", "updated_at"}
 	acceptWritable     = []string{"sender", "kinds", "can_decide", "can_auto_merge", "can_decide_own_pr", "approve_up_to"}
 	appCreateFields    = append([]string{"name"}, appWritable...)
@@ -52,7 +52,116 @@ var (
 	// OIDC token names the workflow a job ran (job_workflow_ref): the
 	// repository, the file straight in .github/workflows, and a branch.
 	workflowRefPattern = regexp.MustCompile(`^([A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100})/(\.github/workflows/[A-Za-z0-9._-]{1,200}\.ya?ml)@refs/heads/([A-Za-z0-9._/-]{1,200})$`)
+	// The most repositories an app's reviews may also read.
+	maxAlsoReads = 5
+	// A repository's owner and name, as GitHub spells them (validRepo).
+	repoOwnerPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}$`)
+	repoNamePattern  = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 )
+
+// validRepo is AutoPilot's rule for a repository an app's reviews also read:
+// owner/name, split at the first /, the owner letters, digits and -, at most
+// 39, and the name letters, digits, ., _ and -, at most 100, not dots alone.
+func validRepo(repo string) bool {
+	owner, name, ok := strings.Cut(repo, "/")
+	return ok && repoOwnerPattern.MatchString(owner) && repoNamePattern.MatchString(name) &&
+		strings.Trim(name, ".") != ""
+}
+
+// repoOwnerKey is a repository's owner, lowercased, for comparing.
+func repoOwnerKey(repo string) string {
+	owner, _, _ := strings.Cut(repo, "/")
+	return strings.ToLower(owner)
+}
+
+// alsoReadsProblem is AutoPilot's check of what an app's reviews also read
+// beside its own repositories: each is of the same owner as one of them,
+// without regard to case, and never one of them. It returns the first that
+// isn't, in alsoReads' order, and why, or "".
+func alsoReadsProblem(repos, alsoReads []string) (string, string) {
+	own, owners := map[string]bool{}, map[string]bool{}
+	for _, r := range repos {
+		own[strings.ToLower(r)], owners[repoOwnerKey(r)] = true, true
+	}
+	for _, r := range alsoReads {
+		switch {
+		case own[strings.ToLower(r)]:
+			return r, "is one of the app's own repositories: a review already reads those"
+		case !owners[repoOwnerKey(r)] && len(owners) == 0:
+			return r, "needs the app to own a repository of the same owner: the app owns none"
+		case !owners[repoOwnerKey(r)]:
+			return r, "has another owner than the app's repositories: a review reads only repositories of its own repository's owner"
+		}
+	}
+	return "", ""
+}
+
+// readAlsoReads reads review_also_reads as AutoPilot does: a list of strings,
+// every item a string before any is read as a repository; each refused at
+// its place when it isn't owner/name, or names one already listed in another
+// case; then kept as sent, sorted, each once, and at most maxAlsoReads. sent
+// is the list as sent, for a refusal to point into.
+func readAlsoReads(raw json.RawMessage) (kept, sent []string, ref *refusal) {
+	const at = "/review_also_reads"
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil || items == nil {
+		return nil, nil, invalid(at, "is a list of repositories")
+	}
+	sent = make([]string, 0, len(items))
+	for i, item := range items {
+		var repo *string
+		if err := json.Unmarshal(item, &repo); err != nil || repo == nil {
+			return nil, nil, invalid(at+"/"+itoa(i), "is not a string")
+		}
+		sent = append(sent, *repo)
+	}
+	seen := map[string]string{}
+	for i, repo := range sent {
+		if !validRepo(repo) {
+			return nil, nil, invalid(at+"/"+itoa(i), "a repository is owner/name, as GitHub spells them")
+		}
+		key := strings.ToLower(repo)
+		if other, dup := seen[key]; dup && other != repo {
+			return nil, nil, invalid(at+"/"+itoa(i), "names a repository already in the list, in another case")
+		}
+		seen[key] = repo
+	}
+	kept = sortedUnique(sent)
+	if len(kept) > maxAlsoReads {
+		return nil, nil, invalid(at, "lists at most 5 repositories")
+	}
+	return kept, sent, nil
+}
+
+// alsoReadsAt is where repo was in the list review_also_reads sent, as a
+// pointer: its first place, or the list.
+func alsoReadsAt(sent []string, repo string) string {
+	if i := slices.Index(sent, repo); i >= 0 {
+		return "/review_also_reads/" + itoa(i)
+	}
+	return "/review_also_reads"
+}
+
+// storedAlsoReads is review_also_reads as AutoPilot reads what it keeps,
+// for what is given from outside a write (SeedApp, ChangeAppOutOfBand):
+// only repositories it can read, each once without regard to case (the
+// first given), sorted, and at most maxAlsoReads.
+func storedAlsoReads(repos []string) []string {
+	seen := map[string]bool{}
+	kept := []string{}
+	for _, r := range repos {
+		if !validRepo(r) || seen[strings.ToLower(r)] {
+			continue
+		}
+		seen[strings.ToLower(r)] = true
+		kept = append(kept, r)
+	}
+	slices.Sort(kept)
+	if len(kept) > maxAlsoReads {
+		kept = kept[:maxAlsoReads]
+	}
+	return kept
+}
 
 // workflowKey is AutoPilot's key for a workflow an app may list: the
 // repository without regard to case, and the file and branch exactly. ok is
@@ -382,6 +491,7 @@ type appRecord struct {
 	workerImage               string
 	workerCPU, workerMemory   int64
 	autoReview                *AutoReview
+	alsoReads                 []string
 	lockVersion               int64
 	createdAt, updatedAt      time.Time
 }
@@ -401,8 +511,11 @@ type AppView struct {
 	WorkerCPU     int64
 	WorkerMemory  int64
 	// AutoReview is nil when the app has no automatic reviews.
-	AutoReview  *AutoReview
-	LockVersion int64
+	AutoReview *AutoReview
+	// ReviewAlsoReads are the other repositories the app's reviews also
+	// read; empty is none.
+	ReviewAlsoReads []string
+	LockVersion     int64
 }
 
 func (rec *appRecord) view() AppView {
@@ -411,8 +524,9 @@ func (rec *appRecord) view() AppView {
 		Developers: slices.Clone(rec.developers), GitHubLogins: slices.Clone(rec.githubLogins),
 		Credential: rec.credential, WhenSeatsFull: rec.whenSeatsFull,
 		WorkerImage: rec.workerImage, WorkerCPU: rec.workerCPU, WorkerMemory: rec.workerMemory,
-		AutoReview:  cloneAutoReview(rec.autoReview),
-		LockVersion: rec.lockVersion,
+		AutoReview:      cloneAutoReview(rec.autoReview),
+		ReviewAlsoReads: orEmpty(slices.Clone(rec.alsoReads)),
+		LockVersion:     rec.lockVersion,
 	}
 }
 
@@ -462,20 +576,21 @@ func (rec *appRecord) json() map[string]any {
 		logins = append(logins, map[string]any{"login": l.Login, "developer": l.Developer})
 	}
 	return map[string]any{
-		"name":            rec.name,
-		"repos":           sortedUnique(rec.repos),
-		"accepts":         accepts,
-		"developers":      sortedUnique(rec.developers),
-		"github_logins":   logins,
-		"credential":      nullable(rec.credential),
-		"when_seats_full": nullable(rec.whenSeatsFull),
-		"worker_image":    nullable(rec.workerImage),
-		"worker_cpu":      nullableInt(rec.workerCPU),
-		"worker_memory":   nullableInt(rec.workerMemory),
-		"auto_review":     autoReviewJSON(rec.autoReview),
-		"lock_version":    rec.lockVersion,
-		"created_at":      timestamp(rec.createdAt),
-		"updated_at":      timestamp(rec.updatedAt),
+		"name":              rec.name,
+		"repos":             sortedUnique(rec.repos),
+		"accepts":           accepts,
+		"developers":        sortedUnique(rec.developers),
+		"github_logins":     logins,
+		"credential":        nullable(rec.credential),
+		"when_seats_full":   nullable(rec.whenSeatsFull),
+		"worker_image":      nullable(rec.workerImage),
+		"worker_cpu":        nullableInt(rec.workerCPU),
+		"worker_memory":     nullableInt(rec.workerMemory),
+		"auto_review":       autoReviewJSON(rec.autoReview),
+		"review_also_reads": orEmpty(slices.Clone(rec.alsoReads)),
+		"lock_version":      rec.lockVersion,
+		"created_at":        timestamp(rec.createdAt),
+		"updated_at":        timestamp(rec.updatedAt),
 	}
 }
 
@@ -507,7 +622,7 @@ func (s *Server) SeedApp(v AppView) {
 		developers: sortedUnique(v.Developers), githubLogins: sortLogins(v.GitHubLogins),
 		credential: v.Credential, whenSeatsFull: v.WhenSeatsFull,
 		workerImage: v.WorkerImage, workerCPU: v.WorkerCPU, workerMemory: v.WorkerMemory,
-		autoReview:  storedAutoReview(v.AutoReview),
+		autoReview: storedAutoReview(v.AutoReview), alsoReads: storedAlsoReads(v.ReviewAlsoReads),
 		lockVersion: 1, createdAt: now, updatedAt: now,
 	}
 }
@@ -539,6 +654,7 @@ func (s *Server) ChangeAppOutOfBand(name string, change func(v *AppView)) {
 	rec.credential, rec.whenSeatsFull = v.Credential, v.WhenSeatsFull
 	rec.workerImage, rec.workerCPU, rec.workerMemory = v.WorkerImage, v.WorkerCPU, v.WorkerMemory
 	rec.autoReview = storedAutoReview(v.AutoReview)
+	rec.alsoReads = storedAlsoReads(v.ReviewAlsoReads)
 	rec.lockVersion++
 	rec.updatedAt = time.Now()
 }
@@ -642,9 +758,20 @@ type appFields struct {
 	// null.
 	autoSent   bool
 	autoReview *AutoReview
+	// alsoReads is nil when review_also_reads was not sent; alsoReadsSent
+	// is the list as sent, for a refusal to point into.
+	alsoReads, alsoReadsSent []string
 }
 
-func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
+// readAppFields reads an app's writable fields from a body, each in its
+// place, then checks the rules that span fields, in AutoPilot's order: each
+// GitHub login's developer, what reviews also read beside the repositories,
+// the credential policy, and the worker size. A create (creating) that
+// leaves out developers or repos has none, so it is held to the first two
+// rules whenever it sends github_logins or review_also_reads; a change is
+// held to them here only when it sends both of the two fields, and
+// otherwise against the record.
+func readAppFields(obj map[string]json.RawMessage, creating bool) (appFields, *refusal) {
 	var f appFields
 	if raw, ok := obj["repos"]; ok {
 		repos, ref := stringList(raw, "/repos")
@@ -771,14 +898,26 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 		}
 		f.accepts = sortAccepts(f.accepts)
 	}
-	// Read right after accepts, as AutoPilot reads an app's fields in sorted
-	// order. (This fake still reads repos first, as before.)
+	// The other fields are read in sorted order, as AutoPilot reads them.
+	// (This fake still reads repos first, as before.)
 	if raw, ok := obj["auto_review"]; ok {
 		auto, ref := readAutoReview(raw)
 		if ref != nil {
 			return f, ref
 		}
 		f.autoSent, f.autoReview = true, auto
+	}
+	// The credential policy is one: a write that sends credential sets both
+	// fields, and when_seats_full means nothing without it. Each is read in
+	// its place, and the two are checked together below.
+	rawCredential, sentCredential := obj["credential"]
+	rawWhen, sentWhen := obj["when_seats_full"]
+	var credential, when string
+	if sentCredential {
+		var ref *refusal
+		if credential, ref = oneOrNull(rawCredential, "/credential", credentials); ref != nil {
+			return f, ref
+		}
 	}
 	if raw, ok := obj["developers"]; ok {
 		devs, ref := stringList(raw, "/developers")
@@ -802,21 +941,65 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 		}
 		f.githubLogins, f.loginAt = logins, at
 	}
-	// The credential policy is one: a write that sends credential sets both
-	// fields, and when_seats_full means nothing without it.
-	rawCredential, sentCredential := obj["credential"]
-	rawWhen, sentWhen := obj["when_seats_full"]
-	if sentCredential {
-		credential, ref := oneOrNull(rawCredential, "/credential", credentials)
-		if ref != nil {
+	var ref *refusal
+	if raw, ok := obj["review_also_reads"]; ok {
+		if f.alsoReads, f.alsoReadsSent, ref = readAlsoReads(raw); ref != nil {
 			return f, ref
 		}
-		when := ""
-		if sentWhen {
-			if when, ref = oneOrNull(rawWhen, "/when_seats_full", whenSeatsFull); ref != nil {
-				return f, ref
-			}
+	}
+	if sentWhen {
+		if when, ref = oneOrNull(rawWhen, "/when_seats_full", whenSeatsFull); ref != nil {
+			return f, ref
 		}
+	}
+	// The worker's size is one too: a write that sends either field sets
+	// both, so one left out is null. Each is read in its place, around
+	// worker_image, and the two are checked together below.
+	rawCPU, sentCPU := obj["worker_cpu"]
+	rawMemory, sentMemory := obj["worker_memory"]
+	var cpu, memory int64
+	if sentCPU {
+		if cpu, ref = wholeOrNull(rawCPU, "/worker_cpu", "is CPU units, 1024 to a vCPU, or null"); ref != nil {
+			return f, ref
+		}
+	}
+	if raw, ok := obj["worker_image"]; ok {
+		if f.workerImage, ref = oneOrNull(raw, "/worker_image", workerImages); ref != nil {
+			return f, ref
+		}
+		f.imageSent = true
+	}
+	if sentMemory {
+		if memory, ref = wholeOrNull(rawMemory, "/worker_memory", "is MiB, or null"); ref != nil {
+			return f, ref
+		}
+	}
+
+	// Once every field is read, the rules that span fields. Each GitHub
+	// login's developer is one of the app's developers, checked here at the
+	// entry.
+	developers := f.developers
+	if creating && developers == nil {
+		developers = []string{}
+	}
+	if f.githubLogins != nil && developers != nil {
+		if l := unmappedLogin(f.githubLogins, developers); l != nil {
+			return f, invalid(f.loginAt[l.Login], "names a developer the app doesn't list: each GitHub login's developer is one of the app's developers")
+		}
+	}
+	// What the app's reviews also read is of its repositories' owner and
+	// never one of them, checked here at the first it may not read, in
+	// sorted order, where it was sent.
+	repos := f.repos
+	if creating && repos == nil {
+		repos = []string{}
+	}
+	if f.alsoReads != nil && repos != nil {
+		if repo, why := alsoReadsProblem(repos, f.alsoReads); why != "" {
+			return f, invalid(alsoReadsAt(f.alsoReadsSent, repo), why)
+		}
+	}
+	if sentCredential {
 		switch {
 		case credential == "seat_first" && when == "":
 			return f, invalid("/when_seats_full", "is wait or fall_back when credential is seat_first")
@@ -827,30 +1010,7 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 	} else if sentWhen {
 		return f, invalid("/when_seats_full", "is sent with credential: a write that sends credential sets both")
 	}
-	if raw, ok := obj["worker_image"]; ok {
-		image, ref := oneOrNull(raw, "/worker_image", workerImages)
-		if ref != nil {
-			return f, ref
-		}
-		f.imageSent, f.workerImage = true, image
-	}
-	// The worker's size is one too: a write that sends either field sets
-	// both, so one left out is null.
-	rawCPU, sentCPU := obj["worker_cpu"]
-	rawMemory, sentMemory := obj["worker_memory"]
 	if sentCPU || sentMemory {
-		var cpu, memory int64
-		var ref *refusal
-		if sentCPU {
-			if cpu, ref = wholeOrNull(rawCPU, "/worker_cpu", "is CPU units, 1024 to a vCPU, or null"); ref != nil {
-				return f, ref
-			}
-		}
-		if sentMemory {
-			if memory, ref = wholeOrNull(rawMemory, "/worker_memory", "is MiB, or null"); ref != nil {
-				return f, ref
-			}
-		}
 		allowed, knownCPU := workerMemory[cpu]
 		switch {
 		case cpu == 0 && memory == 0:
@@ -864,14 +1024,6 @@ func readAppFields(obj map[string]json.RawMessage) (appFields, *refusal) {
 			return f, invalid("/worker_memory", "is MiB that Fargate allows with worker_cpu, at most 16 GB")
 		}
 		f.sizeSent, f.workerCPU, f.workerMemory = true, cpu, memory
-	}
-	// Once every field is read: a write that sends both developers and
-	// github_logins is checked here, at the entry; one that sends only one of
-	// them is checked against the record.
-	if f.githubLogins != nil && f.developers != nil {
-		if l := unmappedLogin(f.githubLogins, f.developers); l != nil {
-			return f, invalid(f.loginAt[l.Login], "names a developer the app doesn't list: each GitHub login's developer is one of the app's developers")
-		}
 	}
 	return f, nil
 }
@@ -975,7 +1127,8 @@ func (rec *appRecord) holds(f appFields) bool {
 		(!f.policySent || (f.credential == rec.credential && f.whenSeatsFull == rec.whenSeatsFull)) &&
 		(!f.imageSent || f.workerImage == rec.workerImage) &&
 		(!f.sizeSent || (f.workerCPU == rec.workerCPU && f.workerMemory == rec.workerMemory)) &&
-		(!f.autoSent || sameAutoReview(f.autoReview, rec.autoReview))
+		(!f.autoSent || sameAutoReview(f.autoReview, rec.autoReview)) &&
+		(f.alsoReads == nil || slices.Equal(f.alsoReads, rec.alsoReads))
 }
 
 // repoOwner names the app other than except that owns repo, matched without
@@ -1027,7 +1180,10 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 	if !appNamePattern.MatchString(name) || len(name) > maxAppName {
 		return 0, nil, invalid("/name", "an app's name is a lowercase letter or digit, then lowercase letters, digits, _ and -, at most 64 characters")
 	}
-	f, ref := readAppFields(obj)
+	// Each GitHub login's developer is one of the app's developers, and what
+	// its reviews also read is of its repositories' owner: a create that
+	// sends no developers, or no repos, has none (readAppFields).
+	f, ref := readAppFields(obj, true)
 	if ref != nil {
 		return 0, nil, ref
 	}
@@ -1036,18 +1192,14 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 		accepts = []Accept{}
 	}
 	logins := sortLogins(f.githubLogins)
-	// Each GitHub login's developer is one of the app's developers; a
-	// create that sends no developers has none.
-	if l := unmappedLogin(logins, devs); l != nil {
-		return 0, nil, invalid(f.loginAt[l.Login], "names a developer the app doesn't list: each GitHub login's developer is one of the app's developers")
-	}
+	alsoReads := orEmpty(f.alsoReads)
 	now := time.Now()
 	if existing, ok := s.apps[name]; ok {
 		same := slices.Equal(existing.repos, repos) && acceptsEqual(existing.accepts, accepts) && slices.Equal(existing.developers, devs) &&
 			slices.Equal(existing.githubLogins, logins) &&
 			existing.credential == f.credential && existing.whenSeatsFull == f.whenSeatsFull &&
 			existing.workerImage == f.workerImage && existing.workerCPU == f.workerCPU && existing.workerMemory == f.workerMemory &&
-			sameAutoReview(existing.autoReview, f.autoReview)
+			sameAutoReview(existing.autoReview, f.autoReview) && slices.Equal(existing.alsoReads, alsoReads)
 		if !same {
 			return 0, nil, &refusal{http.StatusConflict, "name_taken", "an app with this name exists with other fields", "/name"}
 		}
@@ -1059,7 +1211,7 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 	rec := &appRecord{name: name, repos: repos, accepts: accepts, developers: devs, githubLogins: logins,
 		credential: f.credential, whenSeatsFull: f.whenSeatsFull,
 		workerImage: f.workerImage, workerCPU: f.workerCPU, workerMemory: f.workerMemory,
-		autoReview:  f.autoReview,
+		autoReview: f.autoReview, alsoReads: alsoReads,
 		lockVersion: 1, createdAt: now, updatedAt: now}
 	s.apps[name] = rec
 	return http.StatusCreated, rec.json(), nil
@@ -1091,7 +1243,13 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 	if ref := refuseUnknown(obj, "", appWritable...); ref != nil {
 		return nil, ref
 	}
-	f, ref := readAppFields(obj)
+	// A change that sends both developers and github_logins, or both repos
+	// and review_also_reads, is checked as it is read, before a repeat one
+	// version behind is matched against the record; one that sends one of a
+	// pair is checked against the record below. (AutoPilot reads the body
+	// before it finds a change two or more versions behind stale; this fake
+	// finds it stale first.)
+	f, ref := readAppFields(obj, false)
 	if ref != nil {
 		return nil, ref
 	}
@@ -1117,6 +1275,25 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 				return nil, invalid("/github_logins", "names a developer the app doesn't list: each GitHub login's developer is one of the app's developers")
 			}
 			return nil, invalid("/developers", "takes out a developer that github_logins still names; take their GitHub logins out too")
+		}
+	}
+	// What its reviews also read is of its repositories' owner and never one
+	// of them, by what the change leaves, held only on a change that sends
+	// one of the two, as the GitHub logins are.
+	if (f.repos != nil || f.alsoReads != nil) && !rec.holds(f) {
+		repos, alsoReads := rec.repos, rec.alsoReads
+		if f.repos != nil {
+			repos = f.repos
+		}
+		if f.alsoReads != nil {
+			alsoReads = f.alsoReads
+		}
+		if _, why := alsoReadsProblem(repos, alsoReads); why != "" {
+			if f.alsoReads != nil {
+				return nil, invalid("/review_also_reads", why)
+			}
+			return nil, invalid("/repos", "leaves review_also_reads naming a repository the app owns, or of an owner none of its "+
+				"repositories has; change review_also_reads in the same write")
 		}
 	}
 	if ref := s.refuseTakenRepos(f.repos, name); ref != nil {
@@ -1148,6 +1325,9 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 	}
 	if f.autoSent && !sameAutoReview(f.autoReview, rec.autoReview) {
 		rec.autoReview, changed = f.autoReview, true
+	}
+	if f.alsoReads != nil && !slices.Equal(f.alsoReads, rec.alsoReads) {
+		rec.alsoReads, changed = f.alsoReads, true
 	}
 	if changed {
 		rec.lockVersion++

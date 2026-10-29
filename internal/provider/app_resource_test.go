@@ -1,14 +1,21 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/CruGlobal/terraform-provider-autopilot/internal/autopilottest"
@@ -16,9 +23,12 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
+	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	fwresource "github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
@@ -3722,6 +3732,717 @@ func TestApp_importWithAutoReviewWorkflows(t *testing.T) {
 				Config: same,
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// validRepo is AutoPilot's own rule for a repository an app's reviews also
+// read: owner/name, the owner letters, digits and -, at most 39, the name
+// letters, digits, ., _ and -, at most 100, and not dots alone.
+func TestValidRepo(t *testing.T) {
+	good := []string{
+		"example-org/terraform-modules", "Example-Org/Terraform-Modules", "a/b", "0/0", "-/x", "a-/x", "x/-", "x/_",
+		"x/.github", "x/a.", "x/.a", "x/..a", "x/a..b", "x/a.b.c",
+		strings.Repeat("o", 39) + "/" + strings.Repeat("n", 100),
+	}
+	for _, s := range good {
+		if !validRepo(s) {
+			t.Errorf("%q refused", s)
+		}
+	}
+	bad := []string{
+		"", "example-org", "example-org/", "/modules", "/", "example-org/a/b", "example-org//b", "example_org/modules",
+		"example.org/modules", "example org/modules", "example-org/a b", "example-org/a+b", "example-org/a@b",
+		"example-org/.", "example-org/..", "example-org/...", strings.Repeat("o", 40) + "/n",
+		"o/" + strings.Repeat("n", 101), " example-org/modules", "example-org/modules ", "example-org/modules\n",
+		"example-org/modulé", "Kelvin/modules", "example-org/modules\x00",
+	}
+	for _, s := range bad {
+		if validRepo(s) {
+			t.Errorf("%q taken", s)
+		}
+	}
+}
+
+// alsoReadsRepoValidator refuses a repository AutoPilot would refuse, and
+// waits for one not known yet.
+func TestAlsoReadsRepoValidator(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		value   types.String
+		refused bool
+	}{
+		{types.StringValue("example-org/terraform-modules"), false},
+		{types.StringNull(), false},
+		{types.StringUnknown(), false},
+		{types.StringValue("example-org"), true},
+		{types.StringValue("example-org/.."), true},
+		{types.StringValue("example_org/modules"), true},
+	}
+	for _, c := range cases {
+		req := validator.StringRequest{Path: path.Root("review_also_reads"), ConfigValue: c.value}
+		var resp validator.StringResponse
+		alsoReadsRepoValidator{}.ValidateString(ctx, req, &resp)
+		if resp.Diagnostics.HasError() != c.refused {
+			t.Errorf("%s: refused = %v, want %v (%v)", c.value, resp.Diagnostics.HasError(), c.refused, resp.Diagnostics)
+		}
+	}
+}
+
+// tfStrings is a set of strings as Terraform holds it; a nil value is one not
+// known yet.
+func tfStrings(values ...*string) tftypes.Value {
+	typ := tftypes.Set{ElementType: tftypes.String}
+	elems := make([]tftypes.Value, 0, len(values))
+	for _, v := range values {
+		if v == nil {
+			elems = append(elems, tftypes.NewValue(tftypes.String, tftypes.UnknownValue))
+		} else {
+			elems = append(elems, tftypes.NewValue(tftypes.String, *v))
+		}
+	}
+	return tftypes.NewValue(typ, elems)
+}
+
+// known strings, for tfStrings.
+func ks(values ...string) []*string {
+	out := make([]*string, 0, len(values))
+	for i := range values {
+		out = append(out, &values[i])
+	}
+	return out
+}
+
+var (
+	nullStrings    = tftypes.NewValue(tftypes.Set{ElementType: tftypes.String}, nil)
+	unknownStrings = tftypes.NewValue(tftypes.Set{ElementType: tftypes.String}, tftypes.UnknownValue)
+)
+
+// validateApp asks the provider's own validation, the attribute validators
+// and ValidateConfig alike, about an app with these repos and
+// review_also_reads, and returns the summaries of the errors it gives.
+func validateApp(t *testing.T, repos, alsoReads tftypes.Value) []string {
+	t.Helper()
+	ctx := context.Background()
+	var sresp fwresource.SchemaResponse
+	NewAppResource().Schema(ctx, fwresource.SchemaRequest{}, &sresp)
+	objType, ok := sresp.Schema.Type().TerraformType(ctx).(tftypes.Object)
+	if !ok {
+		t.Fatal("the app's schema isn't an object")
+	}
+	vals := map[string]tftypes.Value{}
+	for name, typ := range objType.AttributeTypes {
+		vals[name] = tftypes.NewValue(typ, nil)
+	}
+	vals["name"] = tftypes.NewValue(tftypes.String, "infrastructure")
+	vals["repos"], vals["review_also_reads"] = repos, alsoReads
+	config, err := tfprotov6.NewDynamicValue(objType, tftypes.NewValue(objType, vals))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := providerserver.NewProtocol6(New("test")())()
+	resp, err := server.ValidateResourceConfig(ctx, &tfprotov6.ValidateResourceConfigRequest{TypeName: "autopilot_app", Config: &config})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, d := range resp.Diagnostics {
+		if d.Severity == tfprotov6.DiagnosticSeverityError {
+			out = append(out, d.Summary)
+		}
+	}
+	return out
+}
+
+// The plan refuses what AutoPilot refuses in review_also_reads: a repository
+// it can't take, more than 5, two that differ only in case, and, beside the
+// app's repositories, one of them or one of another owner, in any case. It
+// waits while repos, or one of them, isn't known yet, and skips a repository
+// to read that isn't.
+func TestReviewAlsoReads_Validation(t *testing.T) {
+	own := tfStrings(ks("example-org/infra", "other/thing")...)
+	var six []string
+	for i := range 6 {
+		six = append(six, fmt.Sprintf("example-org/modules-%d", i))
+	}
+	cases := []struct {
+		name             string
+		repos, alsoReads tftypes.Value
+		want             string
+	}{
+		{"none", own, nullStrings, ""},
+		{"empty", own, tfStrings(), ""},
+		{"empty, with no repos", nullStrings, tfStrings(), ""},
+		{"a neighbor", own, tfStrings(ks("example-org/terraform-modules")...), ""},
+		{"a neighbor of each owner", own, tfStrings(ks("example-org/terraform-modules", "other/.github")...), ""},
+		{"the owner in another case", own, tfStrings(ks("EXAMPLE-ORG/terraform-modules", "Other/modules")...), ""},
+		{"five", own, tfStrings(ks(six[:5]...)...), ""},
+		{"six", own, tfStrings(ks(six...)...), "Invalid Attribute Value"},
+		{"one it owns", own, tfStrings(ks("example-org/infra")...), "Repository the app owns"},
+		{"one it owns, in another case", own, tfStrings(ks("Example-Org/INFRA")...), "Repository the app owns"},
+		{"another owner", own, tfStrings(ks("example-org/modules", "third/modules")...), "Repository of another owner"},
+		{"no repos", nullStrings, tfStrings(ks("example-org/modules")...), "Repository of another owner"},
+		{"repos empty", tfStrings(), tfStrings(ks("example-org/modules")...), "Repository of another owner"},
+		{"case only", own, tfStrings(ks("example-org/modules", "Example-Org/Modules")...), "Repeated repositories"},
+		{"not owner/name", own, tfStrings(ks("example-org")...), "Invalid repository"},
+		{"dots alone", own, tfStrings(ks("example-org/..")...), "Invalid repository"},
+		{"a name too long", own, tfStrings(ks("example-org/" + strings.Repeat("n", 101))...), "Invalid repository"},
+		// Not known yet: repos waits; one repository to read is skipped.
+		{"repos not known yet", unknownStrings, tfStrings(ks("third/modules")...), ""},
+		{"one of repos not known yet", tfStrings(append(ks("example-org/infra"), nil)...), tfStrings(ks("third/modules")...), ""},
+		{"one to read not known yet", own, tfStrings(append(ks("example-org/modules"), nil)...), ""},
+		{"one to read not known yet, one of another owner", own, tfStrings(append(ks("third/modules"), nil)...), "Repository of another owner"},
+		{"none known yet", own, unknownStrings, ""},
+	}
+	for _, c := range cases {
+		got := validateApp(t, c.repos, c.alsoReads)
+		switch {
+		case c.want == "" && len(got) > 0:
+			t.Errorf("%s: refused with %q", c.name, got)
+		case c.want != "" && !slices.Contains(got, c.want):
+			t.Errorf("%s: errors %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// A refusal AutoPilot names review_also_reads in points at the attribute.
+func TestAttributeFor_ReviewAlsoReads(t *testing.T) {
+	for _, pointer := range []string{"/review_also_reads", "/review_also_reads/3"} {
+		if got := attributeFor(pointer, appAPIFields); got != "review_also_reads" {
+			t.Errorf("%s: attribute %q", pointer, got)
+		}
+	}
+}
+
+// alsoReadsRepos is an app's own repository and another of the same owner
+// for its reviews to read: made up for the fake, and from the live
+// AutoPilot's repositories for a live run. ok is false when a live run has
+// no two of one owner.
+func (e *testEnv) alsoReadsRepos() (own, neighbor string, ok bool) {
+	repos, have := e.liveRepos(2)
+	if !have || !strings.EqualFold(repoOwner(repos[0]), repoOwner(repos[1])) {
+		return "", "", false
+	}
+	return repos[0], repos[1], true
+}
+
+// checkAlsoReads checks what AutoPilot holds for the app's reviews to read.
+func (e *testEnv) checkAlsoReads(t *testing.T, name string, want ...string) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		a, err := e.apiClient(t).GetApp(context.Background(), name)
+		if err != nil {
+			return err
+		}
+		// None is [] from AutoPilot and no values here; Equal takes them as one.
+		if !slices.Equal(a.ReviewAlsoReads, want) {
+			return fmt.Errorf("AutoPilot holds review_also_reads %q, want %q", a.ReviewAlsoReads, want)
+		}
+		return nil
+	}
+}
+
+// What reviews also read is none unless set; set, changed (in case alone
+// too) and removed, AutoPilot holds what the configuration says, and the
+// plan after each shows nothing. [] is the same as none at AutoPilot.
+func TestApp_reviewAlsoReadsLifecycle(t *testing.T) {
+	env := newTestEnv(t)
+	own, neighbor, ok := env.alsoReadsRepos()
+	if !ok {
+		t.Skipf("%s names no two repositories of one owner", envAccRepos)
+	}
+	name := randName()
+	upper := strings.ToUpper(neighbor)
+	config := func(also string) string {
+		return appConfig(env, name, fmt.Sprintf("  repos = %s\n%s", hcl(own), also))
+	}
+	update := resource.ConfigPlanChecks{
+		PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "review_also_reads.#"),
+					env.checkAlsoReads(t, name),
+				),
+			},
+			{
+				Config:           config(fmt.Sprintf("  review_also_reads = %s", hcl(neighbor))),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "review_also_reads.#", "1"),
+					resource.TestCheckTypeSetElemAttr(appRes, "review_also_reads.*", neighbor),
+					env.checkAlsoReads(t, name, neighbor),
+				),
+			},
+			{
+				// A change of case alone is a change, kept as sent.
+				Config:           config(fmt.Sprintf("  review_also_reads = %s", hcl(upper))),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckTypeSetElemAttr(appRes, "review_also_reads.*", upper),
+					env.checkAlsoReads(t, name, upper),
+				),
+			},
+			{
+				// Removed, it is taken away.
+				Config:           config(""),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "review_also_reads.#"),
+					env.checkAlsoReads(t, name),
+				),
+			},
+			{
+				Config: config("  review_also_reads = []"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "review_also_reads.#", "0"),
+					env.checkAlsoReads(t, name),
+				),
+			},
+		},
+	})
+}
+
+// What reviews also read is sent sorted and each once, only when it changed
+// and lists some, and as [] when some are removed: never when it lists none,
+// left out or [], so an AutoPilot that predates the field still takes the
+// app. Moving to another owner
+// sends repos and review_also_reads in one write, and a configuration that
+// would leave one of another owner is refused at plan, with nothing sent.
+func TestApp_reviewAlsoReadsSent(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name, dev := randName(), randLogin()
+	path := "/v1/admin/apps/" + name
+	lastPatch := func() map[string]any {
+		patches := env.fake.RequestsMatching(http.MethodPatch, path)
+		if len(patches) == 0 {
+			return nil
+		}
+		return requestBody(t, patches[len(patches)-1])
+	}
+	sent := func(want string) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			if got := mustJSON(t, lastPatch()); got != want {
+				return fmt.Errorf("the change sent %s, want %s", got, want)
+			}
+			return nil
+		}
+	}
+	config := func(repos, also, devs string) string {
+		body := "  repos = " + repos
+		if also != "" {
+			body += "\n  review_also_reads = " + also
+		}
+		if devs != "" {
+			body += "\n  developers = " + devs
+		}
+		return appConfig(env, name, body)
+	}
+	infra := hcl("example-org/infra")
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: config(infra, "", ""),
+				Check: func(*terraform.State) error {
+					post := requestBody(t, env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0])
+					if _, ok := post["review_also_reads"]; ok {
+						return fmt.Errorf("the create sent review_also_reads: %v", post)
+					}
+					return nil
+				},
+			},
+			{
+				Config: config(infra, hcl("example-org/zeta", "Example-Org/modules"), ""),
+				Check:  sent(`{"review_also_reads":["Example-Org/modules","example-org/zeta"]}`),
+			},
+			{
+				// In another order, or one listed twice, it plans nothing.
+				Config: config(infra, hcl("example-org/zeta", "Example-Org/modules", "example-org/zeta"), ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Another change doesn't send it.
+				Config: config(infra, hcl("Example-Org/modules", "example-org/zeta"), hcl(dev)),
+				Check:  sent(fmt.Sprintf(`{"developers":[%q]}`, dev)),
+			},
+			{
+				// Moving the app to another owner and leaving them behind is
+				// refused before anything is sent.
+				Config:      config(hcl("other/thing"), hcl("Example-Org/modules", "example-org/zeta"), hcl(dev)),
+				ExpectError: expectErr("Repository of another owner"),
+			},
+			{
+				Config: config(hcl("other/thing"), hcl("other/modules"), hcl(dev)),
+				Check:  sent(`{"repos":["other/thing"],"review_also_reads":["other/modules"]}`),
+			},
+			{
+				Config: config(hcl("other/thing"), "", hcl(dev)),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					sent(`{"review_also_reads":[]}`),
+					resource.TestCheckNoResourceAttr(appRes, "review_also_reads.#"),
+				),
+			},
+			{
+				// Left out, it is never sent again.
+				Config: config(hcl("other/thing"), "", ""),
+				Check:  sent(`{"developers":[]}`),
+			},
+			{
+				// Nor is [], which is none too.
+				Config: config(hcl("other/thing"), "[]", hcl(dev)),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					sent(fmt.Sprintf(`{"developers":[%q]}`, dev)),
+					resource.TestCheckResourceAttr(appRes, "review_also_reads.#", "0"),
+				),
+			},
+		},
+	})
+	if n := len(env.fake.RequestsMatching(http.MethodPatch, path)); n != 6 {
+		t.Errorf("%d changes were sent, want 6", n)
+	}
+
+	// A create that lists none doesn't send it.
+	empty := randName()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			Config: appConfig(env, empty, fmt.Sprintf("  repos = %s\n  review_also_reads = []", infra)),
+			Check: func(*terraform.State) error {
+				for _, r := range env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps") {
+					if body := requestBody(t, r); body["name"] == empty {
+						if _, ok := body["review_also_reads"]; ok {
+							return fmt.Errorf("the create sent review_also_reads: %v", body)
+						}
+					}
+				}
+				return nil
+			},
+		}},
+	})
+
+	// A create that sets it sends it.
+	other := randName()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			Config: appConfig(env, other, fmt.Sprintf("  repos = %s\n  review_also_reads = %s", infra, hcl("example-org/zeta", "example-org/modules"))),
+			Check: func(*terraform.State) error {
+				for _, r := range env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps") {
+					if body := requestBody(t, r); body["name"] == other {
+						if got := mustJSON(t, body["review_also_reads"]); got != `["example-org/modules","example-org/zeta"]` {
+							return fmt.Errorf("the create sent review_also_reads %s", got)
+						}
+						return nil
+					}
+				}
+				return fmt.Errorf("no create for %s", other)
+			},
+		}},
+	})
+}
+
+// The plan refuses what AutoPilot refuses in review_also_reads, before
+// anything is sent.
+func TestApp_reviewAlsoReadsRefusedAtPlan(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	var six []string
+	for i := range 6 {
+		six = append(six, fmt.Sprintf("example-org/modules-%d", i))
+	}
+	infra := "  repos = " + hcl("example-org/infra") + "\n"
+	cases := []struct{ body, err string }{
+		{infra + "  review_also_reads = " + hcl("example-org/infra"), "Repository the app owns ... already read"},
+		{infra + "  review_also_reads = " + hcl("EXAMPLE-ORG/Infra"), "Repository the app owns"},
+		{infra + "  review_also_reads = " + hcl("other/modules"), "Repository of another owner ... same GitHub App installation"},
+		{"  review_also_reads = " + hcl("example-org/modules"), "Repository of another owner ... owns no repository"},
+		{"  repos = []\n  review_also_reads = " + hcl("example-org/modules"), "Repository of another owner ... owns no repository"},
+		{infra + "  review_also_reads = " + hcl(six...), "set must contain at most 5 elements"},
+		{infra + "  review_also_reads = " + hcl("example-org/modules", "Example-Org/Modules"), "Repeated repositories"},
+		{infra + "  review_also_reads = " + hcl("example-org"), "Invalid repository"},
+		{infra + "  review_also_reads = " + hcl("example-org/.."), "Invalid repository ... not dots alone"},
+		{infra + "  review_also_reads = " + hcl("example_org/modules"), "Invalid repository"},
+		{infra + "  review_also_reads = " + hcl("example-org/a/b"), "Invalid repository"},
+	}
+	for _, c := range cases {
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{{Config: appConfig(env, randName(), c.body), ExpectError: expectErr(c.err)}},
+		})
+	}
+	if posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps"); len(posts) != 0 {
+		t.Errorf("%d creates were sent", len(posts))
+	}
+}
+
+// repos not known until apply: the plan waits, and the apply checks what
+// reviews also read beside them then, before anything is sent.
+func TestApp_reviewAlsoReadsWithReposNotKnownYet(t *testing.T) {
+	env := newTestEnv(t)
+	own, neighbor, ok := env.alsoReadsRepos()
+	if !ok {
+		t.Skipf("%s names no two repositories of one owner", envAccRepos)
+	}
+	name := randName()
+	config := func(repos string) string {
+		return env.providerConfig() + fmt.Sprintf(`
+resource "terraform_data" "repos" {
+  input = %s
+}
+
+resource "autopilot_app" "test" {
+  name              = %q
+  repos             = terraform_data.repos.output
+  review_also_reads = %s
+}
+`, repos, name, hcl(neighbor))
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(hcl(own)),
+				Check:  env.checkAlsoReads(t, name, neighbor),
+			},
+			{
+				// The app's repositories turn out to be of another owner.
+				Config:      config(hcl("unrelated-owner-for-tests/repo")),
+				ExpectError: expectErr("Repository of another owner"),
+			},
+		},
+	})
+	if env.fake != nil {
+		if patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name); len(patches) != 0 {
+			t.Errorf("%d changes were sent", len(patches))
+		}
+	}
+}
+
+// What reviews also read, changed outside Terraform, shows as a change, and
+// the apply puts it back as the configuration says: as [] when the
+// configuration leaves it out.
+func TestApp_reviewAlsoReadsChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	cases := []struct {
+		also    string
+		outside []string
+		want    []string
+	}{
+		{"", []string{"example-org/modules"}, []string{}},
+		{"  review_also_reads = " + hcl("example-org/modules"), []string{"example-org/modules", "example-org/zeta"}, []string{"example-org/modules"}},
+		{"  review_also_reads = " + hcl("example-org/modules"), []string{"Example-Org/Modules"}, []string{"example-org/modules"}},
+	}
+	for _, c := range cases {
+		name := randName()
+		config := appConfig(env, name, "  repos = "+hcl("example-org/infra")+"\n"+c.also)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() {
+						env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) { v.ReviewAlsoReads = c.outside })
+					},
+					Config: config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: func(*terraform.State) error {
+						if v, _ := env.fake.App(name); !slices.Equal(v.ReviewAlsoReads, c.want) {
+							return fmt.Errorf("review_also_reads = %q, not put back", v.ReviewAlsoReads)
+						}
+						return nil
+					},
+				},
+			},
+		})
+	}
+}
+
+// An imported app's review_also_reads is read into state, so a configuration
+// that lists the same in another order plans nothing.
+func TestApp_importWithReviewAlsoReads(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{
+		Name: name, Repos: []string{"example-org/infra"}, ReviewAlsoReads: []string{"example-org/zeta", "example-org/modules"},
+	})
+	same := appConfig(env, name, fmt.Sprintf("  repos = %s\n  review_also_reads = %s",
+		hcl("example-org/infra"), hcl("example-org/modules", "example-org/zeta")))
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             same,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: same,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A refusal only AutoPilot can make, such as a repository outside what its
+// apps may reach, is reported at review_also_reads.
+func TestApp_reviewAlsoReadsRefusedByAutoPilot(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	env.fake.RespondNext(http.MethodPost, "/v1/admin/apps", http.StatusUnprocessableEntity, "application/json",
+		`{"error":"invalid_attribute","code":"invalid_attribute","field":"/review_also_reads/0",`+
+			`"message":"apps here may not reach that repository"}`)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			Config: appConfig(env, randName(), fmt.Sprintf("  repos = %s\n  review_also_reads = %s",
+				hcl("example-org/infra"), hcl("example-org/modules"))),
+			ExpectError: expectErr("Error creating AutoPilot app ... review_also_reads = ... may not reach that repository"),
+		}},
+	})
+}
+
+// olderAutoPilot puts a proxy in front of the test's fake that, while older
+// is set, plays an AutoPilot that predates review_also_reads or was rolled
+// back past it: its answers leave the field out, and it refuses a write that
+// sends it as a field it doesn't know. What the fake holds is kept, as such
+// an AutoPilot keeps a stored list.
+func olderAutoPilot(t *testing.T, env *testEnv) (*testEnv, *atomic.Bool) {
+	t.Helper()
+	var older atomic.Bool
+	target, err := url.Parse(env.fake.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ModifyResponse = func(r *http.Response) error {
+		if !older.Load() || r.Header.Get("Content-Type") != "application/json" {
+			return nil
+		}
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			return err
+		}
+		var record map[string]any
+		if json.Unmarshal(b, &record) == nil {
+			delete(record, "review_also_reads")
+			if b, err = json.Marshal(record); err != nil {
+				return err
+			}
+		}
+		r.Body = io.NopCloser(bytes.NewReader(b))
+		r.ContentLength = int64(len(b))
+		r.Header.Set("Content-Length", strconv.Itoa(len(b)))
+		return nil
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if older.Load() && (r.Method == http.MethodPost || r.Method == http.MethodPatch) {
+			b, _ := io.ReadAll(r.Body)
+			var body map[string]any
+			if json.Unmarshal(b, &body) == nil {
+				if _, sent := body["review_also_reads"]; sent {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					_, _ = w.Write([]byte(`{"error":"invalid_attribute","code":"invalid_attribute",` +
+						`"field":"/review_also_reads","message":"AutoPilot doesn't know this field"}`))
+					return
+				}
+			}
+			r.Body = io.NopCloser(bytes.NewReader(b))
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+	return &testEnv{endpoint: server.URL, token: env.token, fake: env.fake}, &older
+}
+
+// An AutoPilot that predates the field takes an app that lists none, left
+// out or [], and plans nothing after. Rolled back past it, AutoPilot reads
+// as listing none: a configuration that still lists some is refused, one
+// that takes them out applies other changes and plans nothing, and once
+// AutoPilot is rolled forward the list it kept shows as a change and is
+// taken away.
+func TestApp_reviewAlsoReadsWithAnOlderAutoPilot(t *testing.T) {
+	base := newTestEnv(t)
+	base.requireFake(t)
+	env, older := olderAutoPilot(t, base)
+	infra := hcl("example-org/infra")
+
+	older.Store(true)
+	for _, also := range []string{"", "\n  review_also_reads = []"} {
+		config := appConfig(env, randName(), "  repos = "+infra+also)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{Config: config, PlanOnly: true},
+			},
+		})
+	}
+
+	older.Store(false)
+	name := randName()
+	config := func(also, dev string) string {
+		body := fmt.Sprintf("  repos = %s\n  developers = %s", infra, hcl(dev))
+		if also != "" {
+			body += "\n  review_also_reads = " + also
+		}
+		return appConfig(env, name, body)
+	}
+	modules := hcl("example-org/modules")
+	alice, bob := randLogin(), randLogin()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config(modules, alice)},
+			{
+				// Rolled back, a configuration that lists some is refused.
+				PreConfig:   func() { older.Store(true) },
+				Config:      config(modules, alice),
+				ExpectError: expectErr("review_also_reads ... doesn't know this field"),
+			},
+			{
+				// Taken out, the app reads as listing none, so nothing shows
+				// as a change.
+				Config: config("", alice),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Other changes apply, and nothing is sent for it.
+				Config: config("", bob),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "review_also_reads.#"),
+					func(*terraform.State) error {
+						patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)
+						if got := mustJSON(t, requestBody(t, patches[len(patches)-1])); got != fmt.Sprintf(`{"developers":[%q]}`, bob) {
+							return fmt.Errorf("the change sent %s", got)
+						}
+						return nil
+					},
+				),
+			},
+			{Config: config("", bob), PlanOnly: true},
+			{
+				// Rolled forward, the list AutoPilot kept is taken away.
+				PreConfig: func() { older.Store(false) },
+				Config:    config("", bob),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					if v, _ := env.fake.App(name); len(v.ReviewAlsoReads) != 0 {
+						return fmt.Errorf("AutoPilot still holds %q", v.ReviewAlsoReads)
+					}
+					return nil
 				},
 			},
 		},
