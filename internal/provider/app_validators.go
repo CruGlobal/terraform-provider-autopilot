@@ -35,11 +35,20 @@ var (
 	// A repository an app's reviews also read, in AutoPilot's own pattern:
 	// owner/name, as GitHub spells them. validRepo checks the rest.
 	alsoReadsPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}/([A-Za-z0-9._-]{1,100})$`)
+	// A work tracker project's identifier, in AutoPilot's own pattern: a
+	// capital letter, then capital letters and digits, at most 10 characters.
+	projectPattern = regexp.MustCompile(`^[A-Z][A-Z0-9]{0,9}$`)
 )
 
-// maxAlsoReads is the most repositories an app's reviews may also read, as
-// AutoPilot has it.
-const maxAlsoReads = 5
+// The most repositories an app's reviews may also read, the most work
+// tracker projects they may read items of, and the most an app may set as
+// its repositories' daily cap on the reviews people ask for from GitHub, as
+// AutoPilot has them.
+const (
+	maxAlsoReads              = 5
+	maxWorkItemProjects       = 20
+	maxReviewsPerDay    int64 = 200
+)
 
 // validRepo is AutoPilot's own rule for a repository an app's reviews also
 // read, step for step: owner/name, the owner letters, digits and -, at most
@@ -407,6 +416,9 @@ func (acceptsValidator) ValidateSet(ctx context.Context, req validator.SetReques
 
 // isTrue reports whether a flag is known and true.
 func isTrue(b types.Bool) bool { return !b.IsNull() && !b.IsUnknown() && b.ValueBool() }
+
+// isFalse reports whether a flag is known and false.
+func isFalse(b types.Bool) bool { return !b.IsNull() && !b.IsUnknown() && !b.ValueBool() }
 
 // lacksKind reports whether a known set of kinds holds none of wanted. A kind
 // not known yet may turn out to be one of them, so the answer is false until

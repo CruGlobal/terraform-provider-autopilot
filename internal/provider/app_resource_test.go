@@ -4312,11 +4312,11 @@ func TestApp_reviewAlsoReadsRefusedByAutoPilot(t *testing.T) {
 }
 
 // olderAutoPilot puts a proxy in front of the test's fake that, while older
-// is set, plays an AutoPilot that predates review_also_reads or was rolled
-// back past it: its answers leave the field out, and it refuses a write that
-// sends it as a field it doesn't know. What the fake holds is kept, as such
-// an AutoPilot keeps a stored list.
-func olderAutoPilot(t *testing.T, env *testEnv) (*testEnv, *atomic.Bool) {
+// is set, plays an AutoPilot that predates fields or was rolled back past
+// them: its answers leave them out, and it refuses a write that sends one as
+// a field it doesn't know. What the fake holds is kept, as such an AutoPilot
+// keeps a stored value.
+func olderAutoPilot(t *testing.T, env *testEnv, fields ...string) (*testEnv, *atomic.Bool) {
 	t.Helper()
 	var older atomic.Bool
 	target, err := url.Parse(env.fake.URL)
@@ -4334,7 +4334,9 @@ func olderAutoPilot(t *testing.T, env *testEnv) (*testEnv, *atomic.Bool) {
 		}
 		var record map[string]any
 		if json.Unmarshal(b, &record) == nil {
-			delete(record, "review_also_reads")
+			for _, f := range fields {
+				delete(record, f)
+			}
 			if b, err = json.Marshal(record); err != nil {
 				return err
 			}
@@ -4349,12 +4351,14 @@ func olderAutoPilot(t *testing.T, env *testEnv) (*testEnv, *atomic.Bool) {
 			b, _ := io.ReadAll(r.Body)
 			var body map[string]any
 			if json.Unmarshal(b, &body) == nil {
-				if _, sent := body["review_also_reads"]; sent {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusUnprocessableEntity)
-					_, _ = w.Write([]byte(`{"error":"invalid_attribute","code":"invalid_attribute",` +
-						`"field":"/review_also_reads","message":"AutoPilot doesn't know this field"}`))
-					return
+				for _, f := range fields {
+					if _, sent := body[f]; sent {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusUnprocessableEntity)
+						_, _ = w.Write([]byte(`{"error":"invalid_attribute","code":"invalid_attribute",` +
+							`"field":"/` + f + `","message":"AutoPilot doesn't know this field"}`))
+						return
+					}
 				}
 			}
 			r.Body = io.NopCloser(bytes.NewReader(b))
@@ -4374,7 +4378,7 @@ func olderAutoPilot(t *testing.T, env *testEnv) (*testEnv, *atomic.Bool) {
 func TestApp_reviewAlsoReadsWithAnOlderAutoPilot(t *testing.T) {
 	base := newTestEnv(t)
 	base.requireFake(t)
-	env, older := olderAutoPilot(t, base)
+	env, older := olderAutoPilot(t, base, "review_also_reads")
 	infra := hcl("example-org/infra")
 
 	older.Store(true)
@@ -4447,4 +4451,874 @@ func TestApp_reviewAlsoReadsWithAnOlderAutoPilot(t *testing.T) {
 			},
 		},
 	})
+}
+
+// projectPattern is AutoPilot's own rule for a work tracker project's
+// identifier: a capital letter, then capital letters and digits, at most 10
+// characters.
+func TestProjectPattern(t *testing.T) {
+	for _, s := range []string{"A", "Z", "PROJ", "GAMMA2", "Q0", "ABCDEFGHIJ", "A123456789"} {
+		if !projectPattern.MatchString(s) {
+			t.Errorf("%q refused", s)
+		}
+	}
+	for _, s := range []string{
+		"", "proj", "Proj", "pROJ", "1PROJ", "9", "PROJ-1", "PROJ-123", "PROJ_1", "PROJ 1", " PROJ", "PROJ ",
+		"PROJ\n", "ABCDEFGHIJK", "ÄPI", "P.J",
+	} {
+		if projectPattern.MatchString(s) {
+			t.Errorf("%q taken", s)
+		}
+	}
+}
+
+// A refusal AutoPilot names either new field in points at its attribute.
+func TestAttributeFor_WorkItemProjectsAndMaxReviewsPerDay(t *testing.T) {
+	for pointer, want := range map[string]string{
+		"/work_item_projects":   "work_item_projects",
+		"/work_item_projects/3": "work_item_projects",
+		"/max_reviews_per_day":  "max_reviews_per_day",
+	} {
+		if got := attributeFor(pointer, appAPIFields); got != want {
+			t.Errorf("%s: attribute %q, want %q", pointer, got, want)
+		}
+	}
+}
+
+// checkWorkItemProjects checks the work tracker projects AutoPilot holds for
+// the app's reviews to read.
+func (e *testEnv) checkWorkItemProjects(t *testing.T, name string, want ...string) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		a, err := e.apiClient(t).GetApp(context.Background(), name)
+		if err != nil {
+			return err
+		}
+		// None is [] from AutoPilot and no values here; Equal takes them as one.
+		if !slices.Equal(a.WorkItemProjects, want) {
+			return fmt.Errorf("AutoPilot holds work_item_projects %q, want %q", a.WorkItemProjects, want)
+		}
+		return nil
+	}
+}
+
+// The work tracker projects reviews may read are none unless set; set,
+// changed and removed, AutoPilot holds what the configuration says, and the
+// plan after each shows nothing. [] is the same as none at AutoPilot.
+func TestApp_workItemProjectsLifecycle(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	config := func(projects string) string {
+		if projects == "" {
+			return appConfig(env, name, "")
+		}
+		return appConfig(env, name, "  work_item_projects = "+projects)
+	}
+	update := resource.ConfigPlanChecks{
+		PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+	}
+	empty := resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "work_item_projects.#"),
+					env.checkWorkItemProjects(t, name),
+				),
+			},
+			{
+				Config:           config(hcl("BETA", "ALPHA")),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "work_item_projects.#", "2"),
+					resource.TestCheckTypeSetElemAttr(appRes, "work_item_projects.*", "ALPHA"),
+					resource.TestCheckTypeSetElemAttr(appRes, "work_item_projects.*", "BETA"),
+					env.checkWorkItemProjects(t, name, "ALPHA", "BETA"),
+				),
+			},
+			{Config: config(hcl("ALPHA", "BETA")), ConfigPlanChecks: empty},
+			{
+				Config:           config(hcl("GAMMA2")),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "work_item_projects.#", "1"),
+					resource.TestCheckTypeSetElemAttr(appRes, "work_item_projects.*", "GAMMA2"),
+					env.checkWorkItemProjects(t, name, "GAMMA2"),
+				),
+			},
+			{
+				// Removed, they are taken away.
+				Config:           config(""),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "work_item_projects.#"),
+					env.checkWorkItemProjects(t, name),
+				),
+			},
+			{Config: config(""), ConfigPlanChecks: empty},
+			{
+				Config: config("[]"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "work_item_projects.#", "0"),
+					env.checkWorkItemProjects(t, name),
+				),
+			},
+		},
+	})
+}
+
+// The work tracker projects are sent sorted and each once, only when they
+// changed and list some, and as [] when some are removed: never when they
+// list none, left out or [], so an AutoPilot that predates the field still
+// takes the app.
+func TestApp_workItemProjectsSent(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name, dev := randName(), randLogin()
+	path := "/v1/admin/apps/" + name
+	sent := func(want string) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			patches := env.fake.RequestsMatching(http.MethodPatch, path)
+			if len(patches) == 0 {
+				return fmt.Errorf("no change was sent")
+			}
+			if got := mustJSON(t, requestBody(t, patches[len(patches)-1])); got != want {
+				return fmt.Errorf("the change sent %s, want %s", got, want)
+			}
+			return nil
+		}
+	}
+	config := func(projects, devs string) string {
+		var body []string
+		if projects != "" {
+			body = append(body, "  work_item_projects = "+projects)
+		}
+		if devs != "" {
+			body = append(body, "  developers = "+devs)
+		}
+		return appConfig(env, name, strings.Join(body, "\n"))
+	}
+	createSent := func(app string, want string) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			for _, r := range env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps") {
+				if body := requestBody(t, r); body["name"] == app {
+					got, ok := body["work_item_projects"]
+					switch {
+					case want == "" && ok:
+						return fmt.Errorf("the create sent work_item_projects: %v", body)
+					case want != "" && mustJSON(t, got) != want:
+						return fmt.Errorf("the create sent work_item_projects %s, want %s", mustJSON(t, got), want)
+					}
+					return nil
+				}
+			}
+			return fmt.Errorf("no create for %s", app)
+		}
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config("", ""), Check: createSent(name, "")},
+			{
+				Config: config(hcl("BETA", "ALPHA"), ""),
+				Check:  sent(`{"work_item_projects":["ALPHA","BETA"]}`),
+			},
+			{
+				// In another order, or one listed twice, it plans nothing.
+				Config: config(hcl("ALPHA", "BETA", "ALPHA"), ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Another change doesn't send it.
+				Config: config(hcl("ALPHA", "BETA"), hcl(dev)),
+				Check:  sent(fmt.Sprintf(`{"developers":[%q]}`, dev)),
+			},
+			{
+				Config: config("", hcl(dev)),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					sent(`{"work_item_projects":[]}`),
+					resource.TestCheckNoResourceAttr(appRes, "work_item_projects.#"),
+				),
+			},
+			{
+				// Left out, it is never sent again.
+				Config: config("", ""),
+				Check:  sent(`{"developers":[]}`),
+			},
+			{
+				// Nor is [], which is none too.
+				Config: config("[]", hcl(dev)),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					sent(fmt.Sprintf(`{"developers":[%q]}`, dev)),
+					resource.TestCheckResourceAttr(appRes, "work_item_projects.#", "0"),
+				),
+			},
+		},
+	})
+	if n := len(env.fake.RequestsMatching(http.MethodPatch, path)); n != 5 {
+		t.Errorf("%d changes were sent, want 5", n)
+	}
+
+	// A create that lists none doesn't send it; one that lists some does.
+	empty, some := randName(), randName()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			Config: appConfig(env, empty, "  work_item_projects = []"),
+			Check:  createSent(empty, ""),
+		}},
+	})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			Config: appConfig(env, some, "  work_item_projects = "+hcl("BETA", "ALPHA")),
+			Check:  createSent(some, `["ALPHA","BETA"]`),
+		}},
+	})
+}
+
+// The plan refuses what AutoPilot refuses in work_item_projects, before
+// anything is sent.
+func TestApp_workItemProjectsRefusedAtPlan(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	var many []string
+	for i := range 21 {
+		many = append(many, fmt.Sprintf("P%d", i))
+	}
+	const notAProject = "must be a project identifier: a capital letter, then capital letters and digits, at most 10"
+	cases := []struct{ projects, err string }{
+		{hcl("proj"), notAProject},
+		{hcl("Proj"), notAProject},
+		{hcl("PROJ-123"), notAProject},
+		{hcl("1PROJ"), notAProject},
+		{hcl("PROJ_1"), notAProject},
+		{hcl("ABCDEFGHIJK"), notAProject},
+		{hcl(""), notAProject},
+		{hcl("BETA", "beta"), notAProject},
+		{hcl(many...), "set must contain at most 20 elements"},
+	}
+	for _, c := range cases {
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{{
+				Config:      appConfig(env, randName(), "  work_item_projects = "+c.projects),
+				ExpectError: expectErr(c.err),
+			}},
+		})
+	}
+	if posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps"); len(posts) != 0 {
+		t.Errorf("%d creates were sent", len(posts))
+	}
+	// Twenty is allowed.
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{Config: appConfig(env, randName(), "  work_item_projects = "+hcl(many[:20]...))}},
+	})
+}
+
+// Work tracker projects changed outside Terraform show as a change, and the
+// apply puts them back as the configuration says: as [] when the
+// configuration leaves them out.
+func TestApp_workItemProjectsChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	cases := []struct {
+		projects string
+		outside  []string
+		want     []string
+	}{
+		{"", []string{"BETA"}, []string{}},
+		{"  work_item_projects = " + hcl("BETA"), []string{"ALPHA", "BETA"}, []string{"BETA"}},
+		{"  work_item_projects = " + hcl("BETA"), []string{}, []string{"BETA"}},
+	}
+	for _, c := range cases {
+		name := randName()
+		config := appConfig(env, name, c.projects)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() {
+						env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) { v.WorkItemProjects = c.outside })
+					},
+					Config: config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: func(*terraform.State) error {
+						if v, _ := env.fake.App(name); !slices.Equal(v.WorkItemProjects, c.want) {
+							return fmt.Errorf("work_item_projects = %q, not put back", v.WorkItemProjects)
+						}
+						return nil
+					},
+				},
+			},
+		})
+	}
+}
+
+// An imported app's work tracker projects and daily cap are read into
+// state, so a configuration that sets the same plans nothing.
+func TestApp_importWithWorkItemProjectsAndMaxReviewsPerDay(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{Name: name, WorkItemProjects: []string{"BETA", "ALPHA"}, MaxReviewsPerDay: 75})
+	same := appConfig(env, name, fmt.Sprintf("  work_item_projects  = %s\n  max_reviews_per_day = 75", hcl("ALPHA", "BETA")))
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             same,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: same,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A refusal only AutoPilot can make is reported at work_item_projects.
+func TestApp_workItemProjectsRefusedByAutoPilot(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	env.fake.RespondNext(http.MethodPost, "/v1/admin/apps", http.StatusUnprocessableEntity, "application/json",
+		`{"error":"invalid_attribute","code":"invalid_attribute","field":"/work_item_projects/0",`+
+			`"message":"a project identifier is 1 to 10 capital letters and digits"}`)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			Config:      appConfig(env, randName(), "  work_item_projects = "+hcl("BETA")),
+			ExpectError: expectErr("Error creating AutoPilot app ... work_item_projects ... capital letters and digits"),
+		}},
+	})
+}
+
+// The repositories' daily cap is set, changed and taken away: sent when set,
+// and as null when removed, which takes the app back to AutoPilot's default.
+func TestApp_maxReviewsPerDay(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, "  max_reviews_per_day = 100"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "max_reviews_per_day", "100"),
+					func(*terraform.State) error {
+						if env.live() {
+							return nil
+						}
+						for _, r := range env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps") {
+							if body := requestBody(t, r); body["name"] == name && body["max_reviews_per_day"] != float64(100) {
+								return fmt.Errorf("the create sent %v", body)
+							}
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: appConfig(env, name, "  max_reviews_per_day = 100"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: appConfig(env, name, "  max_reviews_per_day = 200"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "max_reviews_per_day", "200"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					lastAppPatch(t, env, name, map[string]any{"max_reviews_per_day": float64(200)}),
+				),
+			},
+			{
+				Config: appConfig(env, name, "  max_reviews_per_day = 1"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "max_reviews_per_day", "1"),
+					lastAppPatch(t, env, name, map[string]any{"max_reviews_per_day": float64(1)}),
+				),
+			},
+			{
+				Config: appConfig(env, name, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "max_reviews_per_day"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "4"),
+					lastAppPatch(t, env, name, map[string]any{"max_reviews_per_day": nil}),
+					func(*terraform.State) error {
+						if env.live() {
+							return nil
+						}
+						if v, _ := env.fake.App(name); v.MaxReviewsPerDay != 0 {
+							return fmt.Errorf("AutoPilot still holds %d", v.MaxReviewsPerDay)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: appConfig(env, name, ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A create that leaves the daily cap out doesn't send it, and a change to
+// another argument leaves it out, so the app keeps it.
+func TestApp_maxReviewsPerDayNotSentWhenUnchanged(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	plain, name := randName(), randName()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			Config: appConfig(env, plain, ""),
+			Check: func(*terraform.State) error {
+				for _, r := range env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps") {
+					if body := requestBody(t, r); body["name"] == plain {
+						if _, ok := body["max_reviews_per_day"]; ok {
+							return fmt.Errorf("the create sent max_reviews_per_day: %v", body)
+						}
+					}
+				}
+				return nil
+			},
+		}},
+	})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, name, "  max_reviews_per_day = 50")},
+			{
+				Config: appConfig(env, name, "  max_reviews_per_day = 50\n  developers = [\"someone@example.com\"]"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, name, map[string]any{"developers": []any{"someone@example.com"}}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(name); v.MaxReviewsPerDay != 50 {
+							return fmt.Errorf("AutoPilot holds %d", v.MaxReviewsPerDay)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// A daily cap changed outside Terraform shows as a change, and the apply
+// puts the configured one back; one set outside Terraform on an app that
+// configures none is taken away.
+func TestApp_maxReviewsPerDayChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	cases := []struct {
+		body    string
+		outside int64
+		sent    any
+		want    int64
+	}{
+		{"  max_reviews_per_day = 100", 150, float64(100), 100},
+		{"  max_reviews_per_day = 100", 0, float64(100), 100},
+		{"", 30, nil, 0},
+	}
+	for _, c := range cases {
+		name := randName()
+		config := appConfig(env, name, c.body)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() {
+						env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) { v.MaxReviewsPerDay = c.outside })
+					},
+					Config: config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: resource.ComposeAggregateTestCheckFunc(
+						lastAppPatch(t, env, name, map[string]any{"max_reviews_per_day": c.sent}),
+						func(*terraform.State) error {
+							if v, _ := env.fake.App(name); v.MaxReviewsPerDay != c.want {
+								return fmt.Errorf("AutoPilot holds %d, want %d", v.MaxReviewsPerDay, c.want)
+							}
+							return nil
+						},
+					),
+				},
+			},
+		})
+	}
+}
+
+// The daily cap's range fails the plan.
+func TestApp_maxReviewsPerDayPlanTimeValidation(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	var steps []resource.TestStep
+	for _, n := range []string{"0", "201", "-1", "1000"} {
+		steps = append(steps, resource.TestStep{
+			Config:      appConfig(env, name, "  max_reviews_per_day = "+n),
+			PlanOnly:    true,
+			ExpectError: expectErr("value must be between 1 and 200"),
+		})
+	}
+	runTest(t, resource.TestCase{Steps: steps})
+}
+
+// A daily cap that is somehow still unknown at apply is an error, never sent
+// as none: that would take the app back to AutoPilot's default.
+func TestUnknownMaxReviewsPerDayIsAnError(t *testing.T) {
+	var diags diag.Diagnostics
+	if got := reviewsPerDayFromModel(appModel{MaxReviewsPerDay: types.Int64Unknown()}, &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown max_reviews_per_day gave %v, %v", got, diags)
+	}
+	diags = nil
+	if got := reviewsPerDayFromModel(appModel{MaxReviewsPerDay: types.Int64Null()}, &diags); got == nil || *got != 0 || diags.HasError() {
+		t.Errorf("no cap gave %v, %v; it takes the app back to the default", got, diags)
+	}
+	if got := reviewsPerDayFromModel(appModel{MaxReviewsPerDay: types.Int64Value(120)}, &diags); got == nil || *got != 120 || diags.HasError() {
+		t.Errorf("a cap of 120 gave %v, %v", got, diags)
+	}
+}
+
+// An AutoPilot that predates work_item_projects, max_reviews_per_day and
+// approve_as_user takes an app that sets none of them, work_item_projects
+// left out or [] and approve_as_user left out or false, and plans nothing
+// after. Rolled back past them, AutoPilot reads as setting none: a
+// configuration that still sets one is refused, one that takes them out
+// applies other changes and plans nothing, and once AutoPilot is rolled
+// forward what it kept shows as a change and is taken away.
+func TestApp_newAppFieldsWithAnOlderAutoPilot(t *testing.T) {
+	base := newTestEnv(t)
+	base.requireFake(t)
+	env, older := olderAutoPilot(t, base, "work_item_projects", "max_reviews_per_day", "approve_as_user")
+
+	older.Store(true)
+	for _, body := range []string{"", "  work_item_projects = []\n  approve_as_user    = false"} {
+		config := appConfig(env, randName(), body)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{Config: config, PlanOnly: true},
+			},
+		})
+	}
+
+	older.Store(false)
+	name := randName()
+	config := func(extra, dev string) string {
+		return appConfig(env, name, fmt.Sprintf("  developers = %s\n%s", hcl(dev), extra))
+	}
+	all := "  work_item_projects  = [\"BETA\"]\n  max_reviews_per_day = 100\n  approve_as_user     = true"
+	alice, bob := randLogin(), randLogin()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config(all, alice)},
+			{
+				// Rolled back, a configuration that sets them is refused.
+				PreConfig:   func() { older.Store(true) },
+				Config:      config(all, alice),
+				ExpectError: expectErr("doesn't know this field"),
+			},
+			{
+				Config:      config("  max_reviews_per_day = 100", alice),
+				ExpectError: expectErr("max_reviews_per_day ... doesn't know this field"),
+			},
+			{
+				Config:      config("  approve_as_user = true", alice),
+				ExpectError: expectErr("approve_as_user ... doesn't know this field"),
+			},
+			{
+				// Taken out, the app reads as setting neither, so nothing
+				// shows as a change.
+				Config: config("", alice),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Other changes apply, and nothing is sent for them.
+				Config: config("", bob),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "work_item_projects.#"),
+					resource.TestCheckNoResourceAttr(appRes, "max_reviews_per_day"),
+					resource.TestCheckNoResourceAttr(appRes, "approve_as_user"),
+					lastAppPatch(t, env, name, map[string]any{"developers": []any{bob}}),
+				),
+			},
+			{Config: config("", bob), PlanOnly: true},
+			{
+				// Rolled forward, what AutoPilot kept is taken away.
+				PreConfig: func() { older.Store(false) },
+				Config:    config("", bob),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, name, map[string]any{
+						"work_item_projects": []any{}, "max_reviews_per_day": nil, "approve_as_user": false,
+					}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(name); len(v.WorkItemProjects) != 0 || v.MaxReviewsPerDay != 0 || v.ApproveAsUser {
+							return fmt.Errorf("AutoPilot still holds %q, %d and %v", v.WorkItemProjects, v.MaxReviewsPerDay, v.ApproveAsUser)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// appPatches counts the changes sent for an app, on the fake.
+func appPatches(env *testEnv, name string) int {
+	return len(env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name))
+}
+
+// Approvals as the code owner user are turned on, off and taken out: sent
+// as true to turn them on and as false to turn them off, and never from off
+// to off, false and left out alike. The plan after each shows nothing.
+func TestApp_approveAsUser(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	empty := resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}
+	update := resource.ConfigPlanChecks{
+		PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+	}
+	holds := func(want bool) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			a, err := env.apiClient(t).GetApp(context.Background(), name)
+			if err != nil {
+				return err
+			}
+			if a.ApproveAsUser != want {
+				return fmt.Errorf("AutoPilot holds approve_as_user %v, want %v", a.ApproveAsUser, want)
+			}
+			return nil
+		}
+	}
+	// patches checks, on the fake, how many changes were sent so far.
+	patches := func(want int) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			if env.live() {
+				return nil
+			}
+			if got := appPatches(env, name); got != want {
+				return fmt.Errorf("%d changes were sent, want %d", got, want)
+			}
+			return nil
+		}
+	}
+	on, off := appConfig(env, name, "  approve_as_user = true"), appConfig(env, name, "  approve_as_user = false")
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, ""),
+				Check:  resource.ComposeAggregateTestCheckFunc(resource.TestCheckNoResourceAttr(appRes, "approve_as_user"), holds(false)),
+			},
+			{
+				Config:           on,
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "approve_as_user", "true"),
+					lastAppPatch(t, env, name, map[string]any{"approve_as_user": true}),
+					holds(true),
+				),
+			},
+			{Config: on, ConfigPlanChecks: empty},
+			{
+				Config:           off,
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "approve_as_user", "false"),
+					lastAppPatch(t, env, name, map[string]any{"approve_as_user": false}),
+					patches(2),
+					holds(false),
+				),
+			},
+			{Config: off, ConfigPlanChecks: empty},
+			{
+				// From false to left out is off to off: only the state changes.
+				Config: appConfig(env, name, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "approve_as_user"),
+					patches(2),
+					holds(false),
+				),
+			},
+			{Config: on, Check: resource.ComposeAggregateTestCheckFunc(patches(3), holds(true))},
+			{
+				// Taken out, it is sent as false.
+				Config: appConfig(env, name, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "approve_as_user"),
+					lastAppPatch(t, env, name, map[string]any{"approve_as_user": false}),
+					patches(4),
+					holds(false),
+				),
+			},
+			{Config: appConfig(env, name, ""), ConfigPlanChecks: empty},
+		},
+	})
+}
+
+// A create sends approve_as_user only when it is true, and a change to
+// another argument leaves it out.
+func TestApp_approveAsUserSentOnlyWhenOn(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	off, on := randName(), randName()
+	created := func(app string) map[string]any {
+		for _, r := range env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps") {
+			if body := requestBody(t, r); body["name"] == app {
+				return body
+			}
+		}
+		return nil
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, off, "  approve_as_user = false"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "approve_as_user", "false"),
+					func(*terraform.State) error {
+						if body := created(off); body == nil || body["approve_as_user"] != nil {
+							return fmt.Errorf("the create sent %v", body)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: appConfig(env, off, "  approve_as_user = false"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, on, "  approve_as_user = true"),
+				Check: func(*terraform.State) error {
+					if body := created(on); body == nil || body["approve_as_user"] != true {
+						return fmt.Errorf("the create sent %v", body)
+					}
+					return nil
+				},
+			},
+			{
+				Config: appConfig(env, on, "  approve_as_user = true\n  developers = [\"someone@example.com\"]"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, on, map[string]any{"developers": []any{"someone@example.com"}}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(on); !v.ApproveAsUser {
+							return fmt.Errorf("AutoPilot turned it off")
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// approve_as_user changed outside Terraform shows as a change, and the apply
+// puts it back as the configuration says: off, left out or false, is sent as
+// false.
+func TestApp_approveAsUserChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	for _, c := range []struct {
+		body    string
+		outside bool
+	}{
+		{"  approve_as_user = true", false},
+		{"  approve_as_user = false", true},
+		{"", true},
+	} {
+		name := randName()
+		config := appConfig(env, name, c.body)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() {
+						env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) { v.ApproveAsUser = c.outside })
+					},
+					Config: config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: resource.ComposeAggregateTestCheckFunc(
+						lastAppPatch(t, env, name, map[string]any{"approve_as_user": !c.outside}),
+						func(*terraform.State) error {
+							if v, _ := env.fake.App(name); v.ApproveAsUser == c.outside {
+								return fmt.Errorf("approve_as_user = %v, not put back", v.ApproveAsUser)
+							}
+							return nil
+						},
+					),
+				},
+			},
+		})
+	}
+}
+
+// An imported app's approve_as_user is read into state, so a configuration
+// that sets the same plans nothing.
+func TestApp_importWithApproveAsUser(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{Name: name, ApproveAsUser: true})
+	config := appConfig(env, name, "  approve_as_user = true")
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config, ResourceName: appRes, ImportState: true, ImportStateId: name, ImportStatePersist: true},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// approve_as_user takes only true or false.
+func TestApp_approveAsUserPlanTimeValidation(t *testing.T) {
+	env := newTestEnv(t)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			Config:      appConfig(env, randName(), `  approve_as_user = "sometimes"`),
+			PlanOnly:    true,
+			ExpectError: expectErr("Inappropriate value for attribute \"approve_as_user\""),
+		}},
+	})
+}
+
+// approve_as_user somehow still unknown at apply is an error, never sent as
+// off; null is off.
+func TestUnknownApproveAsUserIsAnError(t *testing.T) {
+	var diags diag.Diagnostics
+	if got := approveAsUserFromModel(appModel{ApproveAsUser: types.BoolUnknown()}, &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown approve_as_user gave %v, %v", got, diags)
+	}
+	diags = nil
+	if got := approveAsUserFromModel(appModel{ApproveAsUser: types.BoolNull()}, &diags); got == nil || *got || diags.HasError() {
+		t.Errorf("null approve_as_user gave %v, %v; it is off", got, diags)
+	}
 }

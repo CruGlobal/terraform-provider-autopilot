@@ -40,19 +40,22 @@ type appResource struct {
 }
 
 type appModel struct {
-	Name            types.String `tfsdk:"name"`
-	Repos           types.Set    `tfsdk:"repos"`
-	Accepts         types.Set    `tfsdk:"accepts"`
-	Developers      types.Set    `tfsdk:"developers"`
-	GitHubLogins    types.Set    `tfsdk:"github_logins"`
-	Credential      types.String `tfsdk:"credential"`
-	WhenSeatsFull   types.String `tfsdk:"when_seats_full"`
-	WorkerImage     types.String `tfsdk:"worker_image"`
-	WorkerCPU       types.Int64  `tfsdk:"worker_cpu"`
-	WorkerMemory    types.Int64  `tfsdk:"worker_memory"`
-	AutoReview      types.Object `tfsdk:"auto_review"`
-	ReviewAlsoReads types.Set    `tfsdk:"review_also_reads"`
-	LockVersion     types.Int64  `tfsdk:"lock_version"`
+	Name             types.String `tfsdk:"name"`
+	Repos            types.Set    `tfsdk:"repos"`
+	Accepts          types.Set    `tfsdk:"accepts"`
+	Developers       types.Set    `tfsdk:"developers"`
+	GitHubLogins     types.Set    `tfsdk:"github_logins"`
+	Credential       types.String `tfsdk:"credential"`
+	WhenSeatsFull    types.String `tfsdk:"when_seats_full"`
+	WorkerImage      types.String `tfsdk:"worker_image"`
+	WorkerCPU        types.Int64  `tfsdk:"worker_cpu"`
+	WorkerMemory     types.Int64  `tfsdk:"worker_memory"`
+	AutoReview       types.Object `tfsdk:"auto_review"`
+	ReviewAlsoReads  types.Set    `tfsdk:"review_also_reads"`
+	WorkItemProjects types.Set    `tfsdk:"work_item_projects"`
+	MaxReviewsPerDay types.Int64  `tfsdk:"max_reviews_per_day"`
+	ApproveAsUser    types.Bool   `tfsdk:"approve_as_user"`
+	LockVersion      types.Int64  `tfsdk:"lock_version"`
 }
 
 type autoReviewModel struct {
@@ -117,51 +120,60 @@ var gitHubLoginObjectType = types.ObjectType{AttrTypes: gitHubLoginAttrTypes}
 
 // appAPIFields maps the API's field names to this resource's attributes.
 var appAPIFields = map[string]string{
-	"name":              "name",
-	"repos":             "repos",
-	"accepts":           "accepts",
-	"developers":        "developers",
-	"github_logins":     "github_logins",
-	"credential":        "credential",
-	"when_seats_full":   "when_seats_full",
-	"worker_image":      "worker_image",
-	"worker_cpu":        "worker_cpu",
-	"worker_memory":     "worker_memory",
-	"auto_review":       "auto_review",
-	"review_also_reads": "review_also_reads",
+	"name":                "name",
+	"repos":               "repos",
+	"accepts":             "accepts",
+	"developers":          "developers",
+	"github_logins":       "github_logins",
+	"credential":          "credential",
+	"when_seats_full":     "when_seats_full",
+	"worker_image":        "worker_image",
+	"worker_cpu":          "worker_cpu",
+	"worker_memory":       "worker_memory",
+	"auto_review":         "auto_review",
+	"review_also_reads":   "review_also_reads",
+	"work_item_projects":  "work_item_projects",
+	"max_reviews_per_day": "max_reviews_per_day",
+	"approve_as_user":     "approve_as_user",
 }
 
 // appToModel maps an app. Every list is optional and left out of the
 // configuration is null, while AutoPilot answers [] for it, so an empty
 // answer stays null where prior (the plan, or the state) was null. The
-// credential policy, the worker image and the worker size are null when
-// AutoPilot answers null, as it does for an app without them.
+// credential policy, the worker image, the worker size and the repositories'
+// daily cap are null when AutoPilot answers null, as it does for an app
+// without them. approve_as_user is optional with no default, so off is null
+// unless prior set it to false.
 func appToModel(a *client.App, prior appModel) appModel {
 	return appModel{
-		Name:            types.StringValue(a.Name),
-		Repos:           setOrNull(a.Repos, prior.Repos),
-		Accepts:         acceptsToSet(a.Accepts, prior.Accepts),
-		Developers:      setOrNull(a.Developers, prior.Developers),
-		GitHubLogins:    gitHubLoginsToSet(a.GitHubLogins, prior.GitHubLogins),
-		Credential:      types.StringPointerValue(a.Credential),
-		WhenSeatsFull:   types.StringPointerValue(a.WhenSeatsFull),
-		WorkerImage:     types.StringPointerValue(a.WorkerImage),
-		WorkerCPU:       types.Int64PointerValue(a.WorkerCPU),
-		WorkerMemory:    types.Int64PointerValue(a.WorkerMemory),
-		AutoReview:      autoReviewToObject(a.AutoReview),
-		ReviewAlsoReads: alsoReadsToSet(a.ReviewAlsoReads, prior.ReviewAlsoReads),
-		LockVersion:     types.Int64Value(a.LockVersion),
+		Name:             types.StringValue(a.Name),
+		Repos:            setOrNull(a.Repos, prior.Repos),
+		Accepts:          acceptsToSet(a.Accepts, prior.Accepts),
+		Developers:       setOrNull(a.Developers, prior.Developers),
+		GitHubLogins:     gitHubLoginsToSet(a.GitHubLogins, prior.GitHubLogins),
+		Credential:       types.StringPointerValue(a.Credential),
+		WhenSeatsFull:    types.StringPointerValue(a.WhenSeatsFull),
+		WorkerImage:      types.StringPointerValue(a.WorkerImage),
+		WorkerCPU:        types.Int64PointerValue(a.WorkerCPU),
+		WorkerMemory:     types.Int64PointerValue(a.WorkerMemory),
+		AutoReview:       autoReviewToObject(a.AutoReview),
+		ReviewAlsoReads:  newerListToSet(a.ReviewAlsoReads, prior.ReviewAlsoReads),
+		WorkItemProjects: newerListToSet(a.WorkItemProjects, prior.WorkItemProjects),
+		MaxReviewsPerDay: types.Int64PointerValue(a.MaxReviewsPerDay),
+		ApproveAsUser:    optionalFlag(a.ApproveAsUser, isFalse(prior.ApproveAsUser)),
+		LockVersion:      types.Int64Value(a.LockVersion),
 	}
 }
 
-// alsoReadsToSet maps the repositories AutoPilot answered that the app's
-// reviews also read to state, as setOrNull does, except that an answer
-// without the field is none: null, or [] where prior was []. Only an
-// AutoPilot that predates the field, or was rolled back past it, answers
-// so, and it ignores a list it kept, so no review reads one. Read as none, a
-// configuration that takes the list out plans nothing, where [] would send
-// the field, which that AutoPilot refuses.
-func alsoReadsToSet(values []string, prior types.Set) types.Set {
+// newerListToSet maps a list that AutoPilot added later, and that is never
+// sent while it lists none (review_also_reads, work_item_projects), to
+// state, as setOrNull does, except that an answer without the field is none:
+// null, or [] where prior was []. Only an AutoPilot that predates the field,
+// or was rolled back past it, answers so, and it ignores a list it kept, so
+// no review reads one. Read as none, a configuration that takes the list out
+// plans nothing, where [] would send the field, which that AutoPilot
+// refuses.
+func newerListToSet(values []string, prior types.Set) types.Set {
 	if values == nil && !emptySet(prior) {
 		return types.SetNull(types.StringType)
 	}
@@ -251,6 +263,30 @@ func sizeFromModel(m appModel, diags *diag.Diagnostics) *client.WorkerSize {
 		return nil
 	}
 	return &client.WorkerSize{CPU: m.WorkerCPU.ValueInt64(), Memory: m.WorkerMemory.ValueInt64()}
+}
+
+// reviewsPerDayFromModel is the repositories' daily cap the plan holds, as
+// the client sends it: 0 for none, which takes the app back to AutoPilot's
+// default. A value still unknown at apply is an error, never read as none.
+func reviewsPerDayFromModel(m appModel, diags *diag.Diagnostics) *int64 {
+	if m.MaxReviewsPerDay.IsUnknown() {
+		unknownAtApply(diags, "max_reviews_per_day")
+		return nil
+	}
+	n := m.MaxReviewsPerDay.ValueInt64()
+	return &n
+}
+
+// approveAsUserFromModel is whether the plan has the app's approvals go as
+// the code owner user, as the client sends it: false for off, null included.
+// A value still unknown at apply is an error, never read as off.
+func approveAsUserFromModel(m appModel, diags *diag.Diagnostics) *bool {
+	if m.ApproveAsUser.IsUnknown() {
+		unknownAtApply(diags, "approve_as_user")
+		return nil
+	}
+	on := m.ApproveAsUser.ValueBool()
+	return &on
 }
 
 // policyFromModel is the credential policy the plan holds, as the client
@@ -440,6 +476,14 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"`review_also_reads` lets the reviews of the app's repositories read other repositories of the same " +
 			"owner, read-only. Anyone who can push a branch to one of the app's repositories, and anyone who can read " +
 			"its reviews, can see what those repositories hold.\n\n" +
+			"`work_item_projects` lets the reviews of the app's repositories read the work items a pull request " +
+			"names, from the listed projects of the work tracker AutoPilot reads. Anyone who can push a branch to " +
+			"one of the app's repositories can have a review read any item of those projects, and anyone who can " +
+			"read its reviews can learn what such an item asks.\n\n" +
+			"`max_reviews_per_day` is the daily cap on the reviews people ask for from GitHub on each of the app's " +
+			"repositories.\n\n" +
+			"`approve_as_user` lets the app's reviews approve, as a separate GitHub user that is a code owner, on a " +
+			"repository where AutoPilot otherwise only comments.\n\n" +
 			"An app with this name that already exists is not taken over, even when its values match: the create " +
 			"fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a " +
 			"gateway's 502, say) before an identical app answered: that attempt may have made the app, and the " +
@@ -743,9 +787,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					"max_per_day": schema.Int64Attribute{
 						MarkdownDescription: "The most automatic reviews of this app's repositories in 24 hours, every " +
 							"one AutoPilot recorded counting, however it ended: `1` to `200`. Defaults to `50`. It is their " +
-							"only daily cap: they don't count against a repository's cap on the reviews people ask for, and " +
-							"those don't count against it. Each runs only on one of the organization's Claude seats, one " +
-							"review from GitHub at a time.",
+							"only daily cap: they don't count against a repository's cap on the reviews people ask for " +
+							"(`max_reviews_per_day`), and those don't count against it. Each runs only on one of the " +
+							"organization's Claude seats, one review from GitHub at a time.",
 						Optional:   true,
 						Computed:   true,
 						Default:    int64default.StaticInt64(defaultAutoPerDay),
@@ -825,6 +869,82 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					setvalidator.ValueStringsAre(alsoReadsRepoValidator{}),
 					noCaseRepeatsValidator{what: "repositories"},
 				},
+			},
+			"work_item_projects": schema.SetAttribute{
+				MarkdownDescription: "The projects of the work tracker AutoPilot reads whose work items the pull request " +
+					"reviews of this app's repositories may read, each by its project identifier: a capital letter, then " +
+					"capital letters and digits, at most 10 characters, such as `PROJ`. A review reads an item, and checks " +
+					"the change against what the item asks, only when the pull request names the item's key (such as " +
+					"`PROJ-123`) in its title, its head branch or the line AutoPilot adds to the pull requests it opens; " +
+					"the item's project is listed here; the pull request is from a branch of the repository itself, never " +
+					"a fork's; and the repository is private or internal, never public. A draft item is never read, nor " +
+					"one the work tracker doesn't show AutoPilot, while an item filed from outside, such as through a " +
+					"public form, is read like any other. Only the reviews of this app's repositories read them, and only " +
+					"where AutoPilot is set up to read the work tracker; elsewhere no review reads one, whatever this " +
+					"lists. A review reads an item as data, never as instructions, and never pastes its text, but what it " +
+					"says, posted on the pull request, can tell anyone who reads the repository's pull requests what the " +
+					"item asks. **Anyone who can push a branch to one of this app's repositories and have it reviewed can " +
+					"name any item of a listed project, and have the review read it:** list only projects whose items " +
+					"this app's repositories' writers, and the readers of its reviews, may read, and review this list as " +
+					"you would `repos`. Kept sorted, each once. At most 20. Left out, reviews read no work item, and " +
+					"removing it from the configuration takes every one away. A change reaches each review that starts " +
+					"after it. Listing some needs an AutoPilot that knows the field; an older one refuses it with a 422. " +
+					"Listing none, left out or `[]`, never sends it. An AutoPilot rolled back past the field ignores the " +
+					"stored list, so reviews read no work item, and refuses every write that sends it, but keeps it. " +
+					"Meanwhile the provider reads the app as listing none, so a configuration that lists some plans a " +
+					"change on every run and its applies fail: take them out of the configuration until AutoPilot is " +
+					"rolled forward. Then the next plan shows the list AutoPilot kept, and the apply takes it away unless " +
+					"the configuration lists it again.",
+				ElementType: types.StringType,
+				Optional:    true,
+				Validators: []validator.Set{
+					setvalidator.SizeAtMost(maxWorkItemProjects),
+					setvalidator.ValueStringsAre(stringvalidator.RegexMatches(projectPattern,
+						"must be a project identifier: a capital letter, then capital letters and digits, at most 10 characters")),
+				},
+			},
+			"max_reviews_per_day": schema.Int64Attribute{
+				MarkdownDescription: "The most reviews people ask for from GitHub, with the `autopilot-review` label or " +
+					"the review command, on each of this app's repositories in 24 hours, everyone's together: `1` to " +
+					"`200`. Each repository counts on its own: an app with two repositories and `100` takes 100 a day on " +
+					"each. Every such review AutoPilot recorded on the repository counts, whoever asked and whatever came " +
+					"of it. Automatic reviews and those a workflow asks for never count against it (they have " +
+					"`auto_review.max_per_day`), and nor do reviews asked for on AutoPilot's MCP server. Once a " +
+					"repository is at it, the next ask is refused with a reply on the pull request that names this " +
+					"number. It doesn't change each developer's own limits, and reviews from GitHub still run one at a " +
+					"time across AutoPilot, so a higher cap lets more of them wait in line, where one that waits too long " +
+					"lapses. Left out, a repository gets AutoPilot's default, 20, and removing it from the configuration " +
+					"takes the app back to that. A change reaches the asks that come after it. It needs an AutoPilot that " +
+					"knows the field; an older one refuses it with a 422. An AutoPilot rolled back past the field ignores " +
+					"a stored cap, so every repository is back at the default, and refuses every write that sends one, " +
+					"but keeps it. Meanwhile the provider reads the app as setting none, so a configuration that sets it " +
+					"plans a change on every run and its applies fail: take it out of the configuration until AutoPilot " +
+					"is rolled forward.",
+				Optional:   true,
+				Validators: []validator.Int64{int64validator.Between(1, maxReviewsPerDay)},
+			},
+			"approve_as_user": schema.BoolAttribute{
+				MarkdownDescription: "Whether this app's reviews may approve on a repository where AutoPilot otherwise " +
+					"only comments, by an approval AutoPilot's service posts as a separate GitHub user that is a code " +
+					"owner there, whose token the service holds, in place of AutoPilot's GitHub App, which can't be a " +
+					"code owner. It does nothing unless the service has that user's token configured, and nothing on any " +
+					"other repository. With both, AutoPilot's GitHub App never approves or requests changes there itself: " +
+					"it posts each review as a comment, an approval goes as that user, and a review that would request " +
+					"changes stays a comment. Only the reviews of the senders built into AutoPilot (`autopilot-mcp` and " +
+					"`autopilot-github`) and automatic reviews use it, and every other rule a deciding review meets " +
+					"still decides whether it approves: `can_decide` (an `accepts` entry's, or `auto_review`'s), " +
+					"`can_decide_own_pr`, `approve_up_to` and the risk rules. An approval from a code owner can meet a " +
+					"branch's required code owner review on its own, so turn this on only where that is acceptable. Off " +
+					"unless set: leaving it out is the same as `false`. Turning it off refuses or stops the reviews there " +
+					"still queued or running that may decide; approvals already posted are still dismissed when someone " +
+					"pushes, while the service holds the token. Turning it on needs an AutoPilot that knows the field; an " +
+					"older one refuses it with a 422. Off, left out or `false`, it is never sent, except as `false` to " +
+					"turn it off. An AutoPilot rolled back past the field ignores it, so those reviews only comment " +
+					"again, and refuses every write that sends it, but keeps it; it also stops watching the approvals " +
+					"already posted, so dismiss them first. Meanwhile the provider reads the app as off, so a " +
+					"configuration that turns it on plans a change on every run and its applies fail: take it out of the " +
+					"configuration until AutoPilot is rolled forward.",
+				Optional: true,
 			},
 			"lock_version": schema.Int64Attribute{
 				MarkdownDescription: "The record's version, which AutoPilot raises on every change. Sent as `If-Match` " +
@@ -1096,6 +1216,20 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 	if !noneSet(plan.ReviewAlsoReads) {
 		spec.ReviewAlsoReads = stringsFromSet(ctx, plan.ReviewAlsoReads, "review_also_reads", &resp.Diagnostics)
 	}
+	// The same goes for the work tracker projects reviews may read.
+	if !noneSet(plan.WorkItemProjects) {
+		spec.WorkItemProjects = stringsFromSet(ctx, plan.WorkItemProjects, "work_item_projects", &resp.Diagnostics)
+	}
+	// Sent only when set, so an AutoPilot that predates the field still takes
+	// an app that leaves it out.
+	if !plan.MaxReviewsPerDay.IsNull() {
+		spec.MaxReviewsPerDay = reviewsPerDayFromModel(plan, &resp.Diagnostics)
+	}
+	// Sent only when on: off is AutoPilot's default, and an AutoPilot that
+	// predates the field refuses it, false included.
+	if plan.ApproveAsUser.IsUnknown() || isTrue(plan.ApproveAsUser) {
+		spec.ApproveAsUser = approveAsUserFromModel(plan, &resp.Diagnostics)
+	}
 	if !plan.Credential.IsNull() {
 		spec.Policy = policyFromModel(plan, &resp.Diagnostics)
 	}
@@ -1171,7 +1305,8 @@ func (r *appResource) Read(ctx context.Context, req resource.ReadRequest, resp *
 // Update sends only what changed. A list removed from the configuration is
 // sent as [], so AutoPilot empties it as the plan says; a credential policy
 // removed is sent as credential null, which takes it away, and so are a
-// worker image, a worker size and automatic reviews removed.
+// worker image, a worker size, automatic reviews and the repositories' daily
+// cap removed. approve_as_user removed is sent as false.
 func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, state appModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -1228,6 +1363,23 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 	noneToNone := noneSet(plan.ReviewAlsoReads) && noneSet(state.ReviewAlsoReads)
 	if !plan.ReviewAlsoReads.Equal(state.ReviewAlsoReads) && !noneToNone {
 		spec.ReviewAlsoReads = orEmptyStrings(stringsFromSet(ctx, plan.ReviewAlsoReads, "review_also_reads", &resp.Diagnostics))
+	}
+	// The work tracker projects go the same way: sent when they changed,
+	// removed as [], and never from none to none.
+	noneToNone = noneSet(plan.WorkItemProjects) && noneSet(state.WorkItemProjects)
+	if !plan.WorkItemProjects.Equal(state.WorkItemProjects) && !noneToNone {
+		spec.WorkItemProjects = orEmptyStrings(stringsFromSet(ctx, plan.WorkItemProjects, "work_item_projects", &resp.Diagnostics))
+	}
+	// Removed, the cap is sent as null, which takes the app back to
+	// AutoPilot's default.
+	if !plan.MaxReviewsPerDay.Equal(state.MaxReviewsPerDay) {
+		spec.MaxReviewsPerDay = reviewsPerDayFromModel(plan, &resp.Diagnostics)
+	}
+	// Sent when it turns on or off, never from off to off (null and false
+	// alike), so an app that leaves it off still works with an AutoPilot
+	// that predates the field.
+	if plan.ApproveAsUser.IsUnknown() || isTrue(plan.ApproveAsUser) != isTrue(state.ApproveAsUser) {
+		spec.ApproveAsUser = approveAsUserFromModel(plan, &resp.Diagnostics)
 	}
 	if resp.Diagnostics.HasError() {
 		return
@@ -1308,11 +1460,13 @@ func (r *appResource) ImportState(ctx context.Context, req resource.ImportStateR
 		return
 	}
 	state := appToModel(a, appModel{
-		Repos:           types.SetNull(types.StringType),
-		Accepts:         types.SetNull(acceptObjectType),
-		Developers:      types.SetNull(types.StringType),
-		GitHubLogins:    types.SetNull(gitHubLoginObjectType),
-		ReviewAlsoReads: types.SetNull(types.StringType),
+		Repos:            types.SetNull(types.StringType),
+		Accepts:          types.SetNull(acceptObjectType),
+		Developers:       types.SetNull(types.StringType),
+		GitHubLogins:     types.SetNull(gitHubLoginObjectType),
+		ReviewAlsoReads:  types.SetNull(types.StringType),
+		WorkItemProjects: types.SetNull(types.StringType),
+		ApproveAsUser:    types.BoolNull(),
 	})
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }

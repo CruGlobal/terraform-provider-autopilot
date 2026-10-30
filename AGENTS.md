@@ -174,9 +174,36 @@ the examples, and the generated docs. Things worth knowing:
   isn't: it is sent sorted and each once only when it changed and lists
   some, or as `[]` to take some away, never from none to none (null and
   `[]` alike), and an answer without the field reads as none
-  (`alsoReadsToSet`). So an app that lists none still works with an
+  (`newerListToSet`). So an app that lists none still works with an
   AutoPilot that predates the field, and one rolled back past it can be
   taken out of the configuration.
+- An app's `work_item_projects` lists the work tracker projects, by
+  identifier, whose work items the reviews of the app's repositories may
+  read when a pull request names one. Each is checked with AutoPilot's own
+  pattern (`projectPattern`, in the provider and the fake): a capital
+  letter, then capital letters and digits, at most 10; at most 20. It is
+  handled as `review_also_reads` is: optional with no default, null in
+  state while AutoPilot answers `[]`, sent sorted and each once only when
+  it changed and lists some, or as `[]` to take some away, never from none
+  to none, and an answer without the field reads as none
+  (`newerListToSet`).
+- An app's `max_reviews_per_day` is its repositories' daily cap on the
+  reviews people ask for from GitHub: 1 to 200, or `null` for AutoPilot's
+  default. Like `worker_image`, it is optional with no default, read back
+  as null when AutoPilot answers `null` or leaves the field out, sent only
+  when set, so an older AutoPilot still takes an app that leaves it out,
+  and sent as `null` to take it away (`AppSpec.MaxReviewsPerDay`, 0 for
+  null).
+- An app's `approve_as_user` lets its reviews approve, on a repository
+  where AutoPilot otherwise only comments, by an approval AutoPilot's
+  service posts as a separate code owner user. AutoPilot takes `true` or
+  `false` (`null` is refused) and answers `false` when it was never set.
+  Like an `accepts` entry's `can_auto_merge`, it is optional with no
+  default, and off reads back as null unless the configuration says
+  `false` (`optionalFlag`). It is sent only when it turns on or off: on a
+  create only when `true`, and on a change as `true` or as `false` to turn
+  it off, never from off to off (null and `false` alike), so an older
+  AutoPilot still takes an app that leaves it off.
 - A sender's secrets are write-only (`*_wo`). The plan compares
   `client.Fingerprint` of the configured secrets with the stored
   fingerprints; see the comment at the top of `sender_resource.go`.

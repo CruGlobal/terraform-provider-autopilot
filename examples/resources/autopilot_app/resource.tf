@@ -77,6 +77,19 @@ resource "autopilot_app" "billing" {
     can_decide    = true
     approve_up_to = "low"
   }
+
+  # Let the reviews of this app's repositories read the work item a pull
+  # request names, such as EXAMPLE-123 in its title or branch, from these
+  # projects of the work tracker AutoPilot reads, and check the change
+  # against what the item asks. Anyone who can push a branch to these
+  # repositories and have it reviewed can have any item of these projects
+  # read, so list only projects they may read.
+  work_item_projects = ["EXAMPLE"]
+
+  # Take up to 50 reviews a day that people ask for from GitHub, with the
+  # label or the command, on each of this app's repositories, instead of
+  # AutoPilot's default of 20. Automatic reviews don't count against it.
+  max_reviews_per_day = 50
 }
 
 resource "autopilot_app" "infrastructure" {
@@ -101,4 +114,11 @@ resource "autopilot_app" "infrastructure" {
   # branch to example-org/infrastructure and have it reviewed, and anyone
   # who can read its reviews, can see what these repositories hold.
   review_also_reads = ["example-org/terraform-modules"]
+
+  # Where AutoPilot otherwise only comments on this repository, let a review
+  # that may approve (can_decide) post its approval as a separate GitHub user
+  # that is a code owner, whose token AutoPilot's service holds. AutoPilot's
+  # GitHub App then never approves or requests changes here itself. It does
+  # nothing unless the service has that user's token.
+  approve_as_user = true
 }
