@@ -1243,3 +1243,268 @@ func TestGetApp_ReviewAlsoReads(t *testing.T) {
 		}
 	}
 }
+
+// The work tracker projects an app's reviews may read are sent sorted and
+// each once. Left unset, they aren't sent, so an AutoPilot that predates the
+// field still takes the app; an empty list is sent as [], which takes them
+// all away.
+func TestAppSpec_SendsWorkItemProjects(t *testing.T) {
+	var bodies []string
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 2})
+	}))
+	ctx := context.Background()
+	for _, spec := range []AppSpec{
+		{},
+		{WorkItemProjects: []string{}},
+		{WorkItemProjects: []string{"BETA", "ALPHA", "BETA"}},
+		{Repos: []string{"example-org/billing-api"}, WorkItemProjects: []string{"GAMMA2"}},
+	} {
+		if _, err := c.UpdateApp(ctx, "billing", spec, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := c.CreateApp(ctx, "billing", AppSpec{Repos: []string{"example-org/billing-api"}}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		`{}`,
+		`{"work_item_projects":[]}`,
+		`{"work_item_projects":["ALPHA","BETA"]}`,
+		`{"repos":["example-org/billing-api"],"work_item_projects":["GAMMA2"]}`,
+		`{"name":"billing","repos":["example-org/billing-api"]}`,
+	}
+	for i := range want {
+		if bodies[i] != want[i] {
+			t.Errorf("body %d = %s\nwant      %s", i, bodies[i], want[i])
+		}
+	}
+	if (AppSpec{WorkItemProjects: []string{}}).Empty() {
+		t.Error("an empty list sends []")
+	}
+}
+
+// An app read back holds a change's work tracker projects only when they
+// match, in any order.
+func TestAppSpec_WorkItemProjectsReflectedIn(t *testing.T) {
+	held := &App{WorkItemProjects: []string{"ALPHA", "BETA"}}
+	cases := []struct {
+		spec AppSpec
+		app  *App
+		want bool
+	}{
+		{AppSpec{WorkItemProjects: []string{"BETA", "ALPHA"}}, held, true},
+		{AppSpec{WorkItemProjects: []string{"ALPHA"}}, held, false},
+		{AppSpec{WorkItemProjects: []string{}}, held, false},
+		{AppSpec{WorkItemProjects: []string{}}, &App{}, true},
+		{AppSpec{WorkItemProjects: []string{}}, &App{WorkItemProjects: []string{}}, true},
+		{AppSpec{}, held, true},
+	}
+	for i, c := range cases {
+		if got := c.spec.reflectedIn(c.app); got != c.want {
+			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// An answer without work_item_projects, from an AutoPilot that predates it,
+// reads as none; one with it reads as it is.
+func TestGetApp_WorkItemProjects(t *testing.T) {
+	answers := []struct {
+		answer map[string]any
+		want   []string
+	}{
+		{map[string]any{"name": "billing", "lock_version": 1}, nil},
+		{map[string]any{"name": "billing", "lock_version": 1, "work_item_projects": []string{}}, []string{}},
+		{map[string]any{"name": "billing", "lock_version": 1, "work_item_projects": []string{"ALPHA", "BETA"}}, []string{"ALPHA", "BETA"}},
+	}
+	for i, a := range answers {
+		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRecord(w, http.StatusOK, a.answer)
+		}))
+		app, err := c.GetApp(context.Background(), "billing")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(app.WorkItemProjects, a.want) || (a.want == nil) != (app.WorkItemProjects == nil) {
+			t.Errorf("answer %d: work_item_projects = %#v, want %#v", i, app.WorkItemProjects, a.want)
+		}
+	}
+}
+
+// The repositories' daily cap is sent when set, as null to take the app back
+// to AutoPilot's default, and not at all when nil, so an AutoPilot that
+// predates the field still takes the app.
+func TestUpdateApp_SendsMaxReviewsPerDay(t *testing.T) {
+	var bodies []string
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 2})
+	}))
+	ctx := context.Background()
+	num := func(n int64) *int64 { return &n }
+	for _, spec := range []AppSpec{
+		{},
+		{MaxReviewsPerDay: num(100)},
+		{MaxReviewsPerDay: num(0)},
+		{Developers: []string{"someone@example.com"}, MaxReviewsPerDay: num(1)},
+	} {
+		if _, err := c.UpdateApp(ctx, "billing", spec, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := c.CreateApp(ctx, "billing", AppSpec{MaxReviewsPerDay: num(200)}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		`{}`,
+		`{"max_reviews_per_day":100}`,
+		`{"max_reviews_per_day":null}`,
+		`{"developers":["someone@example.com"],"max_reviews_per_day":1}`,
+		`{"max_reviews_per_day":200,"name":"billing"}`,
+	}
+	for i := range want {
+		if bodies[i] != want[i] {
+			t.Errorf("body %d = %s\nwant      %s", i, bodies[i], want[i])
+		}
+	}
+	if (AppSpec{MaxReviewsPerDay: num(0)}).Empty() {
+		t.Error("a cap taken away sends null")
+	}
+}
+
+// An app read back holds a change's daily cap only when it matches, none
+// being null.
+func TestAppSpec_MaxReviewsPerDayReflectedIn(t *testing.T) {
+	num := func(n int64) *int64 { return &n }
+	held := &App{MaxReviewsPerDay: num(100)}
+	cases := []struct {
+		spec AppSpec
+		app  *App
+		want bool
+	}{
+		{AppSpec{MaxReviewsPerDay: num(100)}, held, true},
+		{AppSpec{MaxReviewsPerDay: num(99)}, held, false},
+		{AppSpec{MaxReviewsPerDay: num(0)}, held, false},
+		{AppSpec{MaxReviewsPerDay: num(0)}, &App{}, true},
+		{AppSpec{MaxReviewsPerDay: num(20)}, &App{}, false},
+		{AppSpec{}, held, true},
+	}
+	for i, c := range cases {
+		if got := c.spec.reflectedIn(c.app); got != c.want {
+			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// An answer without max_reviews_per_day, from an AutoPilot that predates it,
+// or with null, reads as none; one with a number reads as it is.
+func TestGetApp_MaxReviewsPerDay(t *testing.T) {
+	answers := []struct {
+		answer map[string]any
+		want   *int64
+	}{
+		{map[string]any{"name": "billing", "lock_version": 1}, nil},
+		{map[string]any{"name": "billing", "lock_version": 1, "max_reviews_per_day": nil}, nil},
+		{map[string]any{"name": "billing", "lock_version": 1, "max_reviews_per_day": 150}, func() *int64 { n := int64(150); return &n }()},
+	}
+	for i, a := range answers {
+		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRecord(w, http.StatusOK, a.answer)
+		}))
+		app, err := c.GetApp(context.Background(), "billing")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (a.want == nil) != (app.MaxReviewsPerDay == nil) || (a.want != nil && *a.want != *app.MaxReviewsPerDay) {
+			t.Errorf("answer %d: max_reviews_per_day = %v, want %v", i, app.MaxReviewsPerDay, a.want)
+		}
+	}
+}
+
+// Approvals as the code owner user are sent as set, false included, and not
+// at all when nil, so an AutoPilot that predates the field still takes the
+// app.
+func TestUpdateApp_SendsApproveAsUser(t *testing.T) {
+	var bodies []string
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 2})
+	}))
+	ctx := context.Background()
+	flag := func(b bool) *bool { return &b }
+	for _, spec := range []AppSpec{
+		{},
+		{ApproveAsUser: flag(true)},
+		{ApproveAsUser: flag(false)},
+	} {
+		if _, err := c.UpdateApp(ctx, "billing", spec, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := c.CreateApp(ctx, "billing", AppSpec{ApproveAsUser: flag(true)}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		`{}`,
+		`{"approve_as_user":true}`,
+		`{"approve_as_user":false}`,
+		`{"approve_as_user":true,"name":"billing"}`,
+	}
+	for i := range want {
+		if bodies[i] != want[i] {
+			t.Errorf("body %d = %s\nwant      %s", i, bodies[i], want[i])
+		}
+	}
+}
+
+// An app read back holds a change's approvals as the code owner user only
+// when it matches.
+func TestAppSpec_ApproveAsUserReflectedIn(t *testing.T) {
+	flag := func(b bool) *bool { return &b }
+	on := &App{ApproveAsUser: true}
+	cases := []struct {
+		spec AppSpec
+		app  *App
+		want bool
+	}{
+		{AppSpec{ApproveAsUser: flag(true)}, on, true},
+		{AppSpec{ApproveAsUser: flag(false)}, on, false},
+		{AppSpec{ApproveAsUser: flag(false)}, &App{}, true},
+		{AppSpec{ApproveAsUser: flag(true)}, &App{}, false},
+		{AppSpec{}, on, true},
+	}
+	for i, c := range cases {
+		if got := c.spec.reflectedIn(c.app); got != c.want {
+			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// An answer without approve_as_user, from an AutoPilot that predates it,
+// reads as off; one with it reads as it is.
+func TestGetApp_ApproveAsUser(t *testing.T) {
+	for i, a := range []struct {
+		answer map[string]any
+		want   bool
+	}{
+		{map[string]any{"name": "billing", "lock_version": 1}, false},
+		{map[string]any{"name": "billing", "lock_version": 1, "approve_as_user": false}, false},
+		{map[string]any{"name": "billing", "lock_version": 1, "approve_as_user": true}, true},
+	} {
+		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRecord(w, http.StatusOK, a.answer)
+		}))
+		app, err := c.GetApp(context.Background(), "billing")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if app.ApproveAsUser != a.want {
+			t.Errorf("answer %d: approve_as_user = %v, want %v", i, app.ApproveAsUser, a.want)
+		}
+	}
+}

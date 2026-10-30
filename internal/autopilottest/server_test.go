@@ -1343,6 +1343,19 @@ func TestAppFields_ReadInOrder(t *testing.T) {
 		{map[string]any{"worker_image": "bogus", "worker_memory": "x"}, "/worker_image"},
 		{map[string]any{"github_logins": unpaired, "credential": "seat_first"}, "/github_logins/0"},
 		{map[string]any{"credential": "seat_first", "worker_cpu": 1024}, "/when_seats_full"},
+		// max_reviews_per_day comes after github_logins and before
+		// review_also_reads; work_item_projects after when_seats_full and
+		// before the worker's fields.
+		{map[string]any{"github_logins": "x", "max_reviews_per_day": 0}, "/github_logins"},
+		{map[string]any{"max_reviews_per_day": 0, "review_also_reads": "x"}, "/max_reviews_per_day"},
+		{map[string]any{"when_seats_full": "bogus", "work_item_projects": "x"}, "/when_seats_full"},
+		{map[string]any{"work_item_projects": "x", "worker_cpu": "x"}, "/work_item_projects"},
+		// Each is read before the rules that span fields.
+		{map[string]any{"github_logins": unpaired, "max_reviews_per_day": 0}, "/max_reviews_per_day"},
+		{map[string]any{"credential": "seat_first", "work_item_projects": []string{"beta"}}, "/work_item_projects/0"},
+		// approve_as_user comes after accepts and before auto_review.
+		{map[string]any{"accepts": "x", "approve_as_user": 1}, "/accepts"},
+		{map[string]any{"approve_as_user": 1, "auto_review": "x"}, "/approve_as_user"},
 	}
 	for _, c := range cases {
 		body := map[string]any{"name": "billing"}
@@ -1354,5 +1367,273 @@ func TestAppFields_ReadInOrder(t *testing.T) {
 		if answer["field"] != c.field {
 			t.Errorf("%s: field = %v, want %s", mustJSON(c.body), answer["field"], c.field)
 		}
+	}
+}
+
+// work_item_projects is refused where AutoPilot refuses it, at the same
+// field: the list when it isn't a list or holds more than 20 after repeats
+// are kept once, an item that isn't a string at its place before any is read
+// as a project, and then the first that isn't a project's identifier.
+func TestWorkItemProjects_Refused(t *testing.T) {
+	s := New(t)
+	var many []string
+	for i := range 21 {
+		many = append(many, fmt.Sprintf("P%d", i))
+	}
+	cases := []struct {
+		what  string
+		value any
+		field string
+	}{
+		{"not a list", "BETA", "/work_item_projects"},
+		{"null", nil, "/work_item_projects"},
+		{"an object", map[string]any{}, "/work_item_projects"},
+		{"not a string", []any{1}, "/work_item_projects/0"},
+		{"null in it", []any{"BETA", nil}, "/work_item_projects/1"},
+		{"lowercase, then not a string", []any{"beta", 1}, "/work_item_projects/1"},
+		{"the first wrong, in the order sent", []string{"BETA", "alpha", "x"}, "/work_item_projects/1"},
+		{"twenty-one", many, "/work_item_projects"},
+	}
+	for _, bad := range []string{
+		"", "beta", "Beta", "bETA", "1BETA", "9", "BETA-1", "BETA_1", "BETA 1", " BETA", "BETA ", "BETA\n", "ABCDEFGHIJK",
+		"ÄPI", "W.B", "BETA-123",
+	} {
+		cases = append(cases, struct {
+			what  string
+			value any
+			field string
+		}{fmt.Sprintf("%q", bad), []string{"BETA", bad}, "/work_item_projects/1"})
+	}
+	for _, c := range cases {
+		st, answer := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "work_item_projects": c.value})
+		expect(t, c.what, st, http.StatusUnprocessableEntity, answer)
+		if answer["field"] != c.field {
+			t.Errorf("%s: field = %v (%v), want %s", c.what, answer["field"], answer["message"], c.field)
+		}
+	}
+	// Twenty, with one listed twice, is twenty.
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "work_item_projects": append(many[:20], "P0")})
+	expect(t, "twenty, one twice", st, http.StatusCreated, body)
+	// Identifiers at their edges.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "edges",
+		"work_item_projects": []string{"A", "Z", "ABCDEFGHIJ", "A123456789", "Q0"}})
+	expect(t, "identifiers at their edges", st, http.StatusCreated, body)
+}
+
+// work_item_projects is kept sorted, each once, and none unless sent; a
+// write that leaves it out keeps it, and [] takes it away. A create with it
+// is a retry only with the same.
+func TestWorkItemProjects_Kept(t *testing.T) {
+	s := New(t)
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "plain"})
+	expect(t, "none", st, http.StatusCreated, body)
+	if got := mustJSON(body["work_item_projects"]); got != "[]" {
+		t.Errorf("work_item_projects = %s, want []", got)
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing",
+		"work_item_projects": []string{"BETA", "ALPHA", "BETA"}})
+	expect(t, "create", st, http.StatusCreated, body)
+	want := `["ALPHA","BETA"]`
+	if got := mustJSON(body["work_item_projects"]); got != want {
+		t.Errorf("work_item_projects = %s, want %s", got, want)
+	}
+	// The same create again, in another order, is a retry; another isn't.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "work_item_projects": []string{"ALPHA", "BETA"}})
+	expect(t, "the same create again", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "work_item_projects": []string{"ALPHA"}})
+	expect(t, "a create with another list", st, http.StatusConflict, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing"})
+	expect(t, "a create without it", st, http.StatusConflict, body)
+
+	// A change that leaves it out keeps it.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"developers": []string{"alice@example.org"}})
+	expect(t, "left out", st, http.StatusOK, body)
+	if got := mustJSON(body["work_item_projects"]); got != want {
+		t.Errorf("work_item_projects = %s, want it kept", got)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"work_item_projects": []string{"GAMMA"}})
+	expect(t, "a change", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.LockVersion != 3 || !slices.Equal(v.WorkItemProjects, []string{"GAMMA"}) {
+		t.Errorf("work_item_projects = %v, lock_version %d", v.WorkItemProjects, v.LockVersion)
+	}
+	// The same list again changes nothing.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"work_item_projects": []string{"GAMMA", "GAMMA"}})
+	expect(t, "the same again", st, http.StatusOK, body)
+	if body["lock_version"] != float64(3) {
+		t.Errorf("lock_version = %v, want nothing changed", body["lock_version"])
+	}
+	// A repeat one version behind of the change the record holds is that
+	// change; another is stale. A value it can't take is refused first.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"work_item_projects": []string{"GAMMA"}})
+	expect(t, "a repeat one version behind", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"work_item_projects": []string{"BETA"}})
+	expect(t, "another change one version behind", st, http.StatusConflict, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"work_item_projects": []string{"ops"}})
+	expect(t, "a value it can't take, one version behind", st, http.StatusUnprocessableEntity, body)
+	// [] takes them all away.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"work_item_projects": []string{}})
+	expect(t, "[]", st, http.StatusOK, body)
+	if got := mustJSON(body["work_item_projects"]); got != "[]" || body["lock_version"] != float64(4) {
+		t.Errorf("work_item_projects = %s, lock_version %v", got, body["lock_version"])
+	}
+
+	// What is given from outside a write is kept as AutoPilot reads it: only
+	// what it can read, each once, sorted, at most 20.
+	var given []string
+	for i := range 25 {
+		given = append(given, fmt.Sprintf("P%02d", i))
+	}
+	s.SeedApp(AppView{Name: "seeded", WorkItemProjects: append(given, "beta", "P03", "")})
+	if v, _ := s.App("seeded"); !slices.Equal(v.WorkItemProjects, given[:20]) {
+		t.Errorf("seeded work_item_projects = %v", v.WorkItemProjects)
+	}
+}
+
+// max_reviews_per_day is a whole number from 1 to 200, or null, refused at
+// /max_reviews_per_day otherwise, as AutoPilot refuses it.
+func TestMaxReviewsPerDay_Refused(t *testing.T) {
+	s := New(t)
+	for _, raw := range []string{`0`, `201`, `-1`, `1.5`, `200.5`, `"20"`, `true`, `false`, `[]`, `{}`, `1e3`} {
+		st, answer := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "max_reviews_per_day": json.RawMessage(raw)})
+		expect(t, raw, st, http.StatusUnprocessableEntity, answer)
+		if answer["field"] != "/max_reviews_per_day" {
+			t.Errorf("%s: field = %v, want /max_reviews_per_day", raw, answer["field"])
+		}
+	}
+	for i, c := range []struct {
+		raw  string
+		want any
+	}{{`1`, float64(1)}, {`200`, float64(200)}, {`1.0`, float64(1)}, {`2e1`, float64(20)}, {`null`, nil}} {
+		name := fmt.Sprintf("app-%d", i)
+		st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": name, "max_reviews_per_day": json.RawMessage(c.raw)})
+		expect(t, c.raw, st, http.StatusCreated, body)
+		if body["max_reviews_per_day"] != c.want {
+			t.Errorf("%s: max_reviews_per_day = %v, want %v", c.raw, body["max_reviews_per_day"], c.want)
+		}
+	}
+}
+
+// max_reviews_per_day is null unless sent; a write that leaves it out keeps
+// it, and null takes it back to AutoPilot's default. A create with it is a
+// retry only with the same.
+func TestMaxReviewsPerDay_Kept(t *testing.T) {
+	s := New(t)
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "plain"})
+	expect(t, "none", st, http.StatusCreated, body)
+	if v, ok := body["max_reviews_per_day"]; !ok || v != nil {
+		t.Errorf("max_reviews_per_day = %v (sent %v), want null", v, ok)
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "max_reviews_per_day": 100})
+	expect(t, "create", st, http.StatusCreated, body)
+	if body["max_reviews_per_day"] != float64(100) {
+		t.Errorf("max_reviews_per_day = %v, want 100", body["max_reviews_per_day"])
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "max_reviews_per_day": 100})
+	expect(t, "the same create again", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "max_reviews_per_day": 99})
+	expect(t, "a create with another cap", st, http.StatusConflict, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing"})
+	expect(t, "a create without it", st, http.StatusConflict, body)
+
+	// A change that leaves it out keeps it.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"developers": []string{"alice@example.org"}})
+	expect(t, "left out", st, http.StatusOK, body)
+	if body["max_reviews_per_day"] != float64(100) {
+		t.Errorf("max_reviews_per_day = %v, want it kept", body["max_reviews_per_day"])
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"max_reviews_per_day": 200})
+	expect(t, "a change", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.LockVersion != 3 || v.MaxReviewsPerDay != 200 {
+		t.Errorf("max_reviews_per_day = %d, lock_version %d", v.MaxReviewsPerDay, v.LockVersion)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"max_reviews_per_day": 200})
+	expect(t, "the same again", st, http.StatusOK, body)
+	if body["lock_version"] != float64(3) {
+		t.Errorf("lock_version = %v, want nothing changed", body["lock_version"])
+	}
+	// A repeat one version behind of the change the record holds is that
+	// change; another is stale. A value it can't take is refused first.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"max_reviews_per_day": 200})
+	expect(t, "a repeat one version behind", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"max_reviews_per_day": 150})
+	expect(t, "another change one version behind", st, http.StatusConflict, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"max_reviews_per_day": 0})
+	expect(t, "a value it can't take, one version behind", st, http.StatusUnprocessableEntity, body)
+	// null takes it back to the default.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"max_reviews_per_day": nil})
+	expect(t, "null", st, http.StatusOK, body)
+	if v, ok := body["max_reviews_per_day"]; !ok || v != nil || body["lock_version"] != float64(4) {
+		t.Errorf("max_reviews_per_day = %v, lock_version %v", v, body["lock_version"])
+	}
+
+	// What is given from outside a write is kept as AutoPilot reads it: a
+	// cap outside 1 to 200 reads as none.
+	for given, want := range map[int64]int64{5: 5, 200: 200, 0: 0, 201: 0, -3: 0} {
+		s.SeedApp(AppView{Name: "seeded", MaxReviewsPerDay: given})
+		if v, _ := s.App("seeded"); v.MaxReviewsPerDay != want {
+			t.Errorf("seeded %d: max_reviews_per_day = %d, want %d", given, v.MaxReviewsPerDay, want)
+		}
+	}
+}
+
+// approve_as_user is true or false, refused at /approve_as_user otherwise,
+// null included; false unless sent; a write that leaves it out keeps it. A
+// create with it is a retry only with the same.
+func TestApproveAsUser(t *testing.T) {
+	s := New(t)
+	for _, raw := range []string{`null`, `"true"`, `1`, `0`, `[]`, `{}`} {
+		st, answer := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "approve_as_user": json.RawMessage(raw)})
+		expect(t, raw, st, http.StatusUnprocessableEntity, answer)
+		if answer["field"] != "/approve_as_user" {
+			t.Errorf("%s: field = %v, want /approve_as_user", raw, answer["field"])
+		}
+	}
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "plain"})
+	expect(t, "none", st, http.StatusCreated, body)
+	if body["approve_as_user"] != false {
+		t.Errorf("approve_as_user = %v, want false", body["approve_as_user"])
+	}
+	// false sent on a create is the default, so a create without it is a
+	// retry of it.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "plain", "approve_as_user": false})
+	expect(t, "false, a retry", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "approve_as_user": true})
+	expect(t, "create", st, http.StatusCreated, body)
+	if body["approve_as_user"] != true {
+		t.Errorf("approve_as_user = %v, want true", body["approve_as_user"])
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "approve_as_user": true})
+	expect(t, "the same create again", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing"})
+	expect(t, "a create without it", st, http.StatusConflict, body)
+
+	// A change that leaves it out keeps it.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"developers": []string{"alice@example.org"}})
+	expect(t, "left out", st, http.StatusOK, body)
+	if body["approve_as_user"] != true {
+		t.Errorf("approve_as_user = %v, want it kept", body["approve_as_user"])
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"approve_as_user": false})
+	expect(t, "off", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.LockVersion != 3 || v.ApproveAsUser {
+		t.Errorf("approve_as_user = %v, lock_version %d", v.ApproveAsUser, v.LockVersion)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"approve_as_user": false})
+	expect(t, "off again", st, http.StatusOK, body)
+	if body["lock_version"] != float64(3) {
+		t.Errorf("lock_version = %v, want nothing changed", body["lock_version"])
+	}
+	// A repeat one version behind of the change the record holds is that
+	// change; another is stale. A value it can't take is refused first.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"approve_as_user": false})
+	expect(t, "a repeat one version behind", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"approve_as_user": true})
+	expect(t, "another change one version behind", st, http.StatusConflict, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"approve_as_user": nil})
+	expect(t, "a value it can't take, one version behind", st, http.StatusUnprocessableEntity, body)
+
+	s.SeedApp(AppView{Name: "seeded", ApproveAsUser: true})
+	if v, _ := s.App("seeded"); !v.ApproveAsUser {
+		t.Error("seeded approve_as_user is off")
 	}
 }

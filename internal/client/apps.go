@@ -9,8 +9,10 @@ import (
 // App is a unit of consent: the repositories it owns, the senders it accepts
 // work from (with the kinds it accepts from each), the people who may start
 // work for it themselves, and their GitHub logins. It also holds the app's
-// credential policy, the worker its tasks run in, its automatic reviews, and
-// the other repositories its reviews also read.
+// credential policy, the worker its tasks run in, its automatic reviews, the
+// other repositories and the work tracker projects its reviews also read,
+// its repositories' daily cap on the reviews people ask for from GitHub, and
+// whether its reviews' approvals may go as a code owner user.
 type App struct {
 	Name       string   `json:"name"`
 	Repos      []string `json:"repos"`
@@ -40,9 +42,23 @@ type App struct {
 	// of the app's own repositories also read, read-only. Empty (or nil, when
 	// the AutoPilot predates the field) is none.
 	ReviewAlsoReads []string `json:"review_also_reads"`
-	LockVersion     int64    `json:"lock_version"`
-	CreatedAt       string   `json:"created_at"`
-	UpdatedAt       string   `json:"updated_at"`
+	// WorkItemProjects are the work tracker projects, by identifier, whose
+	// work items the reviews of the app's repositories may read when a pull
+	// request names one. Empty (or nil, when the AutoPilot predates the
+	// field) is none.
+	WorkItemProjects []string `json:"work_item_projects"`
+	// MaxReviewsPerDay is the most reviews people ask for from GitHub on each
+	// of the app's repositories in 24 hours, from 1 to 200, or nil for
+	// AutoPilot's default (or when the AutoPilot predates the field).
+	MaxReviewsPerDay *int64 `json:"max_reviews_per_day"`
+	// ApproveAsUser lets the app's reviews approve, on a repository where
+	// AutoPilot otherwise only comments, by an approval AutoPilot's service
+	// posts as a separate code owner user. False when the AutoPilot predates
+	// the field.
+	ApproveAsUser bool   `json:"approve_as_user"`
+	LockVersion   int64  `json:"lock_version"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
 }
 
 // AutoEvents are the pull_request actions an app's automatic reviews may
@@ -154,8 +170,8 @@ type WorkerSize struct {
 }
 
 // AppSpec is what a create or a change sends. A nil list is not sent at all;
-// an empty, non-nil list is sent as []. A nil Policy, WorkerImage or Size is
-// not sent either.
+// an empty, non-nil list is sent as []. A nil Policy, WorkerImage, Size,
+// MaxReviewsPerDay or ApproveAsUser is not sent either.
 type AppSpec struct {
 	Repos        []string
 	Accepts      []Accept
@@ -173,6 +189,21 @@ type AppSpec struct {
 	// AutoPilot that predates the field still takes the app), and an empty,
 	// non-nil list is sent as [], which takes them all away.
 	ReviewAlsoReads []string
+	// WorkItemProjects are the work tracker projects whose items the app's
+	// reviews may read, sent sorted and each once. Like every list, nil is
+	// not sent (so an AutoPilot that predates the field still takes the
+	// app), and an empty, non-nil list is sent as [], which takes them all
+	// away.
+	WorkItemProjects []string
+	// MaxReviewsPerDay is the app's repositories' daily cap on the reviews
+	// people ask for from GitHub, or 0 to take the app back to AutoPilot's
+	// default (sent as null). Nil is not sent, so an AutoPilot that predates
+	// the field still takes the app.
+	MaxReviewsPerDay *int64
+	// ApproveAsUser is sent as it is: true to turn approvals as the code
+	// owner user on, false to turn them off. Nil is not sent, so an
+	// AutoPilot that predates the field still takes the app.
+	ApproveAsUser *bool
 }
 
 func (s AppSpec) fields() Fields {
@@ -222,6 +253,19 @@ func (s AppSpec) fields() Fields {
 	}
 	if s.ReviewAlsoReads != nil {
 		f["review_also_reads"] = sortedUnique(s.ReviewAlsoReads)
+	}
+	if s.WorkItemProjects != nil {
+		f["work_item_projects"] = sortedUnique(s.WorkItemProjects)
+	}
+	if s.MaxReviewsPerDay != nil {
+		if *s.MaxReviewsPerDay == 0 {
+			f["max_reviews_per_day"] = nil
+		} else {
+			f["max_reviews_per_day"] = *s.MaxReviewsPerDay
+		}
+	}
+	if s.ApproveAsUser != nil {
+		f["approve_as_user"] = *s.ApproveAsUser
 	}
 	return f
 }
@@ -383,6 +427,15 @@ func (s AppSpec) reflectedIn(app *App) bool {
 		return false
 	}
 	if s.ReviewAlsoReads != nil && !slices.Equal(sortedUnique(s.ReviewAlsoReads), sortedUnique(app.ReviewAlsoReads)) {
+		return false
+	}
+	if s.WorkItemProjects != nil && !slices.Equal(sortedUnique(s.WorkItemProjects), sortedUnique(app.WorkItemProjects)) {
+		return false
+	}
+	if s.MaxReviewsPerDay != nil && derefInt(app.MaxReviewsPerDay) != *s.MaxReviewsPerDay {
+		return false
+	}
+	if s.ApproveAsUser != nil && app.ApproveAsUser != *s.ApproveAsUser {
 		return false
 	}
 	return true
