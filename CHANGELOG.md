@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.7.0...v0.8.0) (2026-10-30)
+
+
+### Added
+
+* **app:** add work_item_projects, max_reviews_per_day and approve_as_user ([#24](https://github.com/CruGlobal/terraform-provider-autopilot/issues/24)) ([ac3d0b7](https://github.com/CruGlobal/terraform-provider-autopilot/commit/ac3d0b7cd0bfc76d8ae07a94000e3f65253c525c))
+
 ## [0.7.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.6.0...v0.7.0) (2026-10-29)
 
 
