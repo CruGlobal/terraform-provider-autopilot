@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -1284,6 +1285,551 @@ func TestSender_overlapEndingIsReadNotFought(t *testing.T) {
 				Config: senderConfig(env, name, second, `  kinds = ["research"]`),
 				Check:  resource.TestCheckResourceAttr(senderRes, "lock_version", "3"),
 			},
+		},
+	})
+}
+
+// lastSenderPatch checks, on the fake, that the last change sent for the
+// sender sent exactly want.
+func lastSenderPatch(t *testing.T, env *testEnv, name string, want map[string]any) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		if env.live() {
+			return nil
+		}
+		patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/senders/"+name)
+		if len(patches) == 0 {
+			return fmt.Errorf("no change was sent")
+		}
+		if body := requestBody(t, patches[len(patches)-1]); !reflect.DeepEqual(body, want) {
+			return fmt.Errorf("the change sent %v, want %v", body, want)
+		}
+		return nil
+	}
+}
+
+// senderCreated is the body of the create the fake was sent for the sender,
+// or nil.
+func senderCreated(t *testing.T, env *testEnv, name string) map[string]any {
+	for _, r := range env.fake.RequestsMatching(http.MethodPost, "/v1/admin/senders") {
+		if body := requestBody(t, r); body["name"] == name {
+			return body
+		}
+	}
+	return nil
+}
+
+// The right to send urgent tasks is turned on, off and taken out: sent as
+// true to turn it on and as false to turn it off, and never from off to off,
+// false and left out alike. The plan after each shows nothing.
+func TestSender_maySendUrgent(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	empty := resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}
+	update := resource.ConfigPlanChecks{
+		PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionUpdate)},
+	}
+	holds := func(want bool) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			s, err := env.apiClient(t).GetSender(context.Background(), name)
+			if err != nil {
+				return err
+			}
+			if s.MaySendUrgent != want {
+				return fmt.Errorf("AutoPilot holds may_send_urgent %v, want %v", s.MaySendUrgent, want)
+			}
+			return nil
+		}
+	}
+	// patches checks, on the fake, how many changes were sent so far.
+	patches := func(want int) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			if env.live() {
+				return nil
+			}
+			if got := len(env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/senders/"+name)); got != want {
+				return fmt.Errorf("%d changes were sent, want %d", got, want)
+			}
+			return nil
+		}
+	}
+	none := senderConfig(env, name, secrets, "")
+	on, off := senderConfig(env, name, secrets, "  may_send_urgent = true"), senderConfig(env, name, secrets, "  may_send_urgent = false")
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkSendersGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: none,
+				Check:  resource.ComposeAggregateTestCheckFunc(resource.TestCheckNoResourceAttr(senderRes, "may_send_urgent"), holds(false)),
+			},
+			{
+				Config:           on,
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "may_send_urgent", "true"),
+					resource.TestCheckResourceAttr(senderRes, "lock_version", "2"),
+					lastSenderPatch(t, env, name, map[string]any{"may_send_urgent": true}),
+					holds(true),
+				),
+			},
+			{Config: on, ConfigPlanChecks: empty},
+			{
+				Config:           off,
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "may_send_urgent", "false"),
+					lastSenderPatch(t, env, name, map[string]any{"may_send_urgent": false}),
+					patches(2),
+					holds(false),
+				),
+			},
+			{Config: off, ConfigPlanChecks: empty},
+			{
+				// From false to left out is off to off: only the state changes.
+				Config: none,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(senderRes, "may_send_urgent"),
+					resource.TestCheckResourceAttr(senderRes, "lock_version", "3"),
+					patches(2),
+					holds(false),
+				),
+			},
+			{Config: on, Check: resource.ComposeAggregateTestCheckFunc(patches(3), holds(true))},
+			{
+				// Taken out, it is sent as false.
+				Config: none,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(senderRes, "may_send_urgent"),
+					lastSenderPatch(t, env, name, map[string]any{"may_send_urgent": false}),
+					patches(4),
+					holds(false),
+				),
+			},
+			{Config: none, ConfigPlanChecks: empty},
+		},
+	})
+}
+
+// A create sends may_send_urgent only when it is true, and a change to
+// another argument leaves it out, so the sender keeps it.
+func TestSender_maySendUrgentSentOnlyWhenOn(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	off, on := randName(), randName()
+	offSecrets, onSecrets := newSecretPair(t), newSecretPair(t)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: senderConfig(env, off, offSecrets, "  may_send_urgent = false"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "may_send_urgent", "false"),
+					func(*terraform.State) error {
+						if body := senderCreated(t, env, off); body == nil || body["may_send_urgent"] != nil {
+							return fmt.Errorf("the create sent %v", keysOf(body))
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: senderConfig(env, off, offSecrets, "  may_send_urgent = false"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: senderConfig(env, on, onSecrets, "  may_send_urgent = true"),
+				Check: func(*terraform.State) error {
+					if body := senderCreated(t, env, on); body == nil || body["may_send_urgent"] != true {
+						return fmt.Errorf("the create sent %v", keysOf(body))
+					}
+					return nil
+				},
+			},
+			{
+				Config: senderConfig(env, on, onSecrets, "  may_send_urgent = true\n  kinds = [\"fix-error\"]"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastSenderPatch(t, env, on, map[string]any{"kinds": []any{"fix-error"}}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.Sender(on); !v.MaySendUrgent {
+							return fmt.Errorf("AutoPilot turned it off")
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// may_send_urgent changed outside Terraform shows as a change, and the apply
+// puts it back as the configuration says: off, left out or false, is sent as
+// false.
+func TestSender_maySendUrgentChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	for _, c := range []struct {
+		body    string
+		outside bool
+	}{
+		{"  may_send_urgent = true", false},
+		{"  may_send_urgent = false", true},
+		{"", true},
+	} {
+		name := randName()
+		config := senderConfig(env, name, newSecretPair(t), c.body)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() {
+						env.fake.ChangeSenderOutOfBand(name, func(v *autopilottest.SenderView) { v.MaySendUrgent = c.outside })
+					},
+					Config: config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: resource.ComposeAggregateTestCheckFunc(
+						lastSenderPatch(t, env, name, map[string]any{"may_send_urgent": !c.outside}),
+						func(*terraform.State) error {
+							if v, _ := env.fake.Sender(name); v.MaySendUrgent == c.outside {
+								return fmt.Errorf("may_send_urgent = %v, not put back", v.MaySendUrgent)
+							}
+							return nil
+						},
+					),
+				},
+				{
+					Config: config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+					},
+				},
+			},
+		})
+	}
+}
+
+// An imported sender's may_send_urgent is read into state, so a
+// configuration that sets the same plans nothing.
+func TestSender_importWithMaySendUrgent(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	env.fake.SeedSender(autopilottest.SenderSeed{Name: name, MaySendUrgent: true,
+		RequestSecret: secrets.request, CallbackSecret: secrets.callback})
+	config := senderConfig(env, name, secrets, "  may_send_urgent = true")
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config, ResourceName: senderRes, ImportState: true, ImportStateId: name, ImportStatePersist: true},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+
+	// An import can't tell false from left out, so a configuration that says
+	// false plans one update after it, which only records the false: it
+	// sends nothing, and the plan after is empty.
+	off := randName()
+	offSecrets := newSecretPair(t)
+	env.fake.SeedSender(autopilottest.SenderSeed{Name: off, RequestSecret: offSecrets.request, CallbackSecret: offSecrets.callback})
+	offConfig := senderConfig(env, off, offSecrets, "  may_send_urgent = false")
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: offConfig, ResourceName: senderRes, ImportState: true, ImportStateId: off, ImportStatePersist: true},
+			{
+				Config: offConfig,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "may_send_urgent", "false"),
+					resource.TestCheckResourceAttr(senderRes, "lock_version", "1"),
+					func(*terraform.State) error {
+						if n := len(env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/senders/"+off)); n != 0 {
+							return fmt.Errorf("%d changes were sent, want none", n)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: offConfig,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A create for a name AutoPilot already holds is a retry, or taken over,
+// only when may_send_urgent matches too, since AutoPilot compares it with
+// the other fields: a sender that may send urgent tasks is not one whose
+// configuration leaves that out.
+func TestSender_maySendUrgentDecidesWhetherARecordIsTheSame(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	env.fake.SeedSender(autopilottest.SenderSeed{Name: name, MaySendUrgent: true,
+		RequestSecret: secrets.request, CallbackSecret: secrets.callback})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			Config:      senderConfig(env, name, secrets, ""),
+			ExpectError: expectErr("A sender with this name already exists"),
+		}},
+	})
+	diags := runTestRecordingDiagnostics(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: senderConfig(env, name, secrets, "  may_send_urgent = true"),
+				Check:  resource.TestCheckResourceAttr(senderRes, "may_send_urgent", "true"),
+			},
+		},
+	})
+	if !diags.hasWarning("Sender already existed") {
+		t.Error("adopting an identical sender should warn")
+	}
+
+	// A sender without it matches a configuration that says false, which
+	// sends nothing for it, and the state keeps the false.
+	off := randName()
+	offSecrets := newSecretPair(t)
+	env.fake.SeedSender(autopilottest.SenderSeed{Name: off, RequestSecret: offSecrets.request, CallbackSecret: offSecrets.callback})
+	config := senderConfig(env, off, offSecrets, "  may_send_urgent = false")
+	diags = runTestRecordingDiagnostics(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "may_send_urgent", "false"),
+					resource.TestCheckResourceAttr(senderRes, "lock_version", "1"),
+				),
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+	if !diags.hasWarning("Sender already existed") {
+		t.Error("adopting an identical sender should warn")
+	}
+}
+
+// A create and a change whose answers are lost are sent again, with
+// may_send_urgent: AutoPilot answers the repeat of the create with the
+// sender it made, and the repeat one version behind of the change with 200,
+// so neither is taken for someone else's.
+func TestSender_maySendUrgentLostAnswers(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	secrets := newSecretPair(t)
+	path := "/v1/admin/senders/" + name
+	diags := runTestRecordingDiagnostics(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPost, "/v1/admin/senders") },
+				Config:    senderConfig(env, name, secrets, "  may_send_urgent = true"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "may_send_urgent", "true"),
+					resource.TestCheckResourceAttr(senderRes, "lock_version", "1"),
+					func(*terraform.State) error {
+						posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/senders")
+						if len(posts) != 2 || posts[0].Status != http.StatusCreated || posts[1].Status != http.StatusOK {
+							return fmt.Errorf("want a 201 whose answer was lost, then a 200 for the same create; got %d creates", len(posts))
+						}
+						for _, p := range posts {
+							if requestBody(t, p)["may_send_urgent"] != true {
+								return fmt.Errorf("a create left out may_send_urgent")
+							}
+						}
+						return nil
+					},
+				),
+			},
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPatch, path) },
+				Config:    senderConfig(env, name, secrets, "  may_send_urgent = false"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "may_send_urgent", "false"),
+					resource.TestCheckResourceAttr(senderRes, "lock_version", "2"),
+					lastSenderPatch(t, env, name, map[string]any{"may_send_urgent": false}),
+					func(*terraform.State) error {
+						patches := env.fake.RequestsMatching(http.MethodPatch, path)
+						if len(patches) != 2 || patches[1].Status != http.StatusOK || patches[1].Header.Get("If-Match") != `"1"` {
+							return fmt.Errorf("want a change whose answer was lost, then the same change answered 200; got %d changes", len(patches))
+						}
+						if v, _ := env.fake.Sender(name); v.MaySendUrgent {
+							return fmt.Errorf("AutoPilot still holds may_send_urgent")
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+	if diags.hasWarning("Sender already existed") {
+		t.Error("the provider's own lost create was reported as someone else's sender")
+	}
+}
+
+// terraform apply -replace brings the sender back with the right to send
+// urgent tasks, since the create that revives it sends it.
+func TestSender_replaceKeepsMaySendUrgent(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	config := senderConfig(env, name, newSecretPair(t), "  may_send_urgent = true")
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkSendersGone(t, env),
+		Steps: []resource.TestStep{
+			{Config: config},
+			{
+				Taint:  []string{senderRes},
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionDestroyBeforeCreate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(senderRes, "may_send_urgent", "true"),
+					func(*terraform.State) error {
+						s, err := env.apiClient(t).GetSender(context.Background(), name)
+						if err != nil {
+							return err
+						}
+						if !s.MaySendUrgent {
+							return fmt.Errorf("the revived sender may not send urgent tasks")
+						}
+						return nil
+					},
+				),
+			},
+			{Config: config, ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}},
+		},
+	})
+}
+
+// may_send_urgent takes only true or false.
+func TestSender_maySendUrgentPlanTimeValidation(t *testing.T) {
+	env := newTestEnv(t)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			Config:      senderConfig(env, randName(), newSecretPair(t), `  may_send_urgent = "sometimes"`),
+			PlanOnly:    true,
+			ExpectError: expectErr("Inappropriate value for attribute \"may_send_urgent\""),
+		}},
+	})
+}
+
+// may_send_urgent somehow still unknown at apply is an error, never sent as
+// off; null is off.
+func TestUnknownMaySendUrgentIsAnError(t *testing.T) {
+	var diags diag.Diagnostics
+	if got := maySendUrgentFromModel(senderModel{MaySendUrgent: types.BoolUnknown()}, &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown may_send_urgent gave %v, %v", got, diags)
+	}
+	diags = nil
+	if got := maySendUrgentFromModel(senderModel{MaySendUrgent: types.BoolNull()}, &diags); got == nil || *got || diags.HasError() {
+		t.Errorf("null may_send_urgent gave %v, %v; it is off", got, diags)
+	}
+	if got := maySendUrgentFromModel(senderModel{MaySendUrgent: types.BoolValue(true)}, &diags); got == nil || !*got || diags.HasError() {
+		t.Errorf("true may_send_urgent gave %v, %v", got, diags)
+	}
+}
+
+// An AutoPilot that predates may_send_urgent takes a sender that leaves it
+// out or sets it to false, and plans nothing after. Rolled back past it,
+// AutoPilot reads as the sender not having it: a configuration that still
+// sets it is refused, one that takes it out applies other changes and plans
+// nothing, and once AutoPilot is rolled forward what it kept shows as a
+// change and is taken away.
+func TestSender_maySendUrgentWithAnOlderAutoPilot(t *testing.T) {
+	base := newTestEnv(t)
+	base.requireFake(t)
+	env, older := olderAutoPilot(t, base, "may_send_urgent")
+
+	older.Store(true)
+	for _, body := range []string{"", "  may_send_urgent = false"} {
+		config := senderConfig(env, randName(), newSecretPair(t), body)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{Config: config, PlanOnly: true},
+			},
+		})
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			// A create that sets it is refused before anything is made.
+			Config:      senderConfig(env, randName(), newSecretPair(t), "  may_send_urgent = true"),
+			ExpectError: expectErr("may_send_urgent ... doesn't know this field"),
+		}},
+	})
+
+	older.Store(false)
+	name := randName()
+	secrets := newSecretPair(t)
+	config := func(extra, kind string) string {
+		return senderConfig(env, name, secrets, fmt.Sprintf("  kinds = %s\n%s", hcl(kind), extra))
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config("  may_send_urgent = true", "research")},
+			{
+				// Rolled back, a configuration that sets it is refused.
+				PreConfig:   func() { older.Store(true) },
+				Config:      config("  may_send_urgent = true", "research"),
+				ExpectError: expectErr("may_send_urgent ... doesn't know this field"),
+			},
+			{
+				// Taken out, the sender reads as not having it, so nothing
+				// shows as a change.
+				Config: config("", "research"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Other changes apply, and nothing is sent for it.
+				Config: config("", "fix-error"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(senderRes, "may_send_urgent"),
+					lastSenderPatch(t, env, name, map[string]any{"kinds": []any{"fix-error"}}),
+				),
+			},
+			{Config: config("", "fix-error"), PlanOnly: true},
+			{
+				// Rolled forward, what AutoPilot kept is taken away.
+				PreConfig: func() { older.Store(false) },
+				Config:    config("", "fix-error"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(senderRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(senderRes, "may_send_urgent"),
+					lastSenderPatch(t, env, name, map[string]any{"may_send_urgent": false}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.Sender(name); v.MaySendUrgent {
+							return fmt.Errorf("AutoPilot still holds may_send_urgent")
+						}
+						return nil
+					},
+				),
+			},
+			{Config: config("", "fix-error"), PlanOnly: true},
 		},
 	})
 }

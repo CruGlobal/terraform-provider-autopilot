@@ -1508,3 +1508,97 @@ func TestGetApp_ApproveAsUser(t *testing.T) {
 		}
 	}
 }
+
+// A sender's right to send urgent tasks is sent as set, false included, and
+// not at all when nil, so an AutoPilot that predates the field still takes
+// the sender.
+func TestUpdateSender_SendsMaySendUrgent(t *testing.T) {
+	var bodies []string
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		writeRecord(w, http.StatusOK, map[string]any{"name": "tracker", "lock_version": 2})
+	}))
+	ctx := context.Background()
+	flag := func(b bool) *bool { return &b }
+	for _, spec := range []SenderSpec{
+		{},
+		{MaySendUrgent: flag(true)},
+		{MaySendUrgent: flag(false)},
+	} {
+		if _, err := c.UpdateSender(ctx, "tracker", spec, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	secrets := &SenderSecrets{Request: "r", Callback: "c"}
+	for _, spec := range []SenderSpec{
+		{Secrets: secrets},
+		{Secrets: secrets, MaySendUrgent: flag(true)},
+	} {
+		if _, _, err := c.CreateSender(ctx, "tracker", spec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{
+		`{}`,
+		`{"may_send_urgent":true}`,
+		`{"may_send_urgent":false}`,
+		`{"callback_secret":"c","name":"tracker","request_secret":"r"}`,
+		`{"callback_secret":"c","may_send_urgent":true,"name":"tracker","request_secret":"r"}`,
+	}
+	if len(bodies) != len(want) {
+		t.Fatalf("%d bodies, want %d: %q", len(bodies), len(want), bodies)
+	}
+	for i := range want {
+		if bodies[i] != want[i] {
+			t.Errorf("body %d = %s\nwant      %s", i, bodies[i], want[i])
+		}
+	}
+}
+
+// A sender read back holds a change's right to send urgent tasks only when
+// it matches.
+func TestSenderSpec_MaySendUrgentReflectedIn(t *testing.T) {
+	flag := func(b bool) *bool { return &b }
+	on := &Sender{MaySendUrgent: true}
+	cases := []struct {
+		spec   SenderSpec
+		sender *Sender
+		want   bool
+	}{
+		{SenderSpec{MaySendUrgent: flag(true)}, on, true},
+		{SenderSpec{MaySendUrgent: flag(false)}, on, false},
+		{SenderSpec{MaySendUrgent: flag(false)}, &Sender{}, true},
+		{SenderSpec{MaySendUrgent: flag(true)}, &Sender{}, false},
+		{SenderSpec{}, on, true},
+	}
+	for i, c := range cases {
+		if got := c.spec.reflectedIn(c.sender); got != c.want {
+			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// An answer without may_send_urgent, from an AutoPilot that predates it,
+// reads as off; one with it reads as it is.
+func TestGetSender_MaySendUrgent(t *testing.T) {
+	for i, a := range []struct {
+		answer map[string]any
+		want   bool
+	}{
+		{map[string]any{"name": "tracker", "lock_version": 1}, false},
+		{map[string]any{"name": "tracker", "lock_version": 1, "may_send_urgent": false}, false},
+		{map[string]any{"name": "tracker", "lock_version": 1, "may_send_urgent": true}, true},
+	} {
+		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRecord(w, http.StatusOK, a.answer)
+		}))
+		s, err := c.GetSender(context.Background(), "tracker")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.MaySendUrgent != a.want {
+			t.Errorf("answer %d: may_send_urgent = %v, want %v", i, s.MaySendUrgent, a.want)
+		}
+	}
+}

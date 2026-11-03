@@ -56,6 +56,7 @@ type senderModel struct {
 	Name                      types.String `tfsdk:"name"`
 	CallbackHosts             types.Set    `tfsdk:"callback_hosts"`
 	Kinds                     types.Set    `tfsdk:"kinds"`
+	MaySendUrgent             types.Bool   `tfsdk:"may_send_urgent"`
 	BranchPrefix              types.String `tfsdk:"branch_prefix"`
 	RequestSecretWO           types.String `tfsdk:"request_secret_wo"`
 	CallbackSecretWO          types.String `tfsdk:"callback_secret_wo"`
@@ -73,28 +74,44 @@ var senderAPIFields = map[string]string{
 	"name":            "name",
 	"callback_hosts":  "callback_hosts",
 	"kinds":           "kinds",
+	"may_send_urgent": "may_send_urgent",
 	"branch_prefix":   "branch_prefix",
 	"request_secret":  "request_secret_wo",
 	"callback_secret": "callback_secret_wo",
 }
 
 // senderToModel maps a sender. The secrets are write-only and never in state,
-// so they are always null here; secrets_wo_version is carried by the caller.
-func senderToModel(s *client.Sender, secretsVersion types.Int64) senderModel {
+// so they are always null here; secrets_wo_version is carried from prior (the
+// plan, or the state). may_send_urgent is optional with no default, so off
+// is null unless prior set it to false.
+func senderToModel(s *client.Sender, prior senderModel) senderModel {
 	return senderModel{
 		Name:                      types.StringValue(s.Name),
 		CallbackHosts:             setFromStrings(s.CallbackHosts),
 		Kinds:                     setFromStrings(s.Kinds),
+		MaySendUrgent:             optionalFlag(s.MaySendUrgent, isFalse(prior.MaySendUrgent)),
 		BranchPrefix:              types.StringValue(s.BranchPrefix),
 		RequestSecretWO:           types.StringNull(),
 		CallbackSecretWO:          types.StringNull(),
-		SecretsWOVersion:          secretsVersion,
+		SecretsWOVersion:          prior.SecretsWOVersion,
 		RequestSecretFingerprint:  types.StringValue(s.RequestSecretFingerprint),
 		CallbackSecretFingerprint: types.StringValue(s.CallbackSecretFingerprint),
 		SecretsChangedAt:          types.StringValue(s.SecretsChangedAt),
 		PreviousSecretsUntil:      types.StringPointerValue(s.PreviousSecretsUntil),
 		LockVersion:               types.Int64Value(s.LockVersion),
 	}
+}
+
+// maySendUrgentFromModel is whether the plan lets the sender's tasks be
+// urgent, as the client sends it: false for off, null included. A value still
+// unknown at apply is an error, never read as off.
+func maySendUrgentFromModel(m senderModel, diags *diag.Diagnostics) *bool {
+	if m.MaySendUrgent.IsUnknown() {
+		unknownAtApply(diags, "may_send_urgent")
+		return nil
+	}
+	on := m.MaySendUrgent.ValueBool()
+	return &on
 }
 
 func (r *senderResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -108,11 +125,15 @@ func (r *senderResource) Configure(_ context.Context, req resource.ConfigureRequ
 func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "A sender: a system that sends AutoPilot tasks, such as an issue tracker. It names the " +
-			"hosts its callbacks may go to, the kinds of task it may send, the prefix its branches start with, and " +
-			"its two secrets. The sender signs its calls to AutoPilot with the request secret, and AutoPilot signs " +
-			"its callbacks to the sender with the callback secret.\n\n" +
+			"hosts its callbacks may go to, the kinds of task it may send, whether it may send urgent tasks, the " +
+			"prefix its branches start with, and its two secrets. The sender signs its calls to AutoPilot with the " +
+			"request secret, and AutoPilot signs its callbacks to the sender with the callback secret.\n\n" +
 			"An app must also accept the sender (see `autopilot_app`) before AutoPilot takes its tasks for that " +
 			"app. The two can be applied in either order.\n\n" +
+			"`may_send_urgent` lets the sender's urgent tasks start before every queued task that isn't urgent " +
+			"while AutoPilot's limit on running tasks is reached, and without waiting for the day's spend under its " +
+			"daily cap on Bedrock spend, though a task whose own `limits.max_usd` is over the whole cap still can't " +
+			"run on Bedrock.\n\n" +
 			"## The secrets\n\n" +
 			"`request_secret_wo` and `callback_secret_wo` are [write-only arguments](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments): " +
 			"Terraform sends them on apply and never writes them to the plan or the state file. They need " +
@@ -196,6 +217,30 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					setvalidator.SizeAtLeast(1),
 					setvalidator.ValueStringsAre(stringvalidator.RegexMatches(kindPattern, "must be a kind of task, such as implement-work-item")),
 				},
+			},
+			"may_send_urgent": schema.BoolAttribute{
+				MarkdownDescription: "Whether the sender's tasks may be urgent (`urgent: true`, in version 2 of " +
+					"AutoPilot's task API). An urgent task jumps the queue: while AutoPilot is running as many tasks as " +
+					"it allows, it starts before every queued task that isn't urgent, as soon as a running task " +
+					"finishes, oldest first among the urgent ones. A running task is never stopped to make room. It " +
+					"also starts without waiting for the day's spend under AutoPilot's daily cap on Bedrock spend, " +
+					"however much today's other tasks have cost or may cost. What it may cost still counts toward the cap, so the " +
+					"tasks behind it may wait for the cap sooner, and a task whose own `limits.max_usd` is over the " +
+					"whole cap still can't run on Bedrock. Everything else still holds for it: its kind, its branch, " +
+					"the apps' consent, its app's credential policy and AutoPilot's other limits, and it still waits " +
+					"while another task runs on its same repository and branch. Grant it only to a " +
+					"sender whose urgent tasks are few and can't wait, such as fixes for a production incident: each " +
+					"one goes ahead of every other sender's work. Off unless set: leaving it out is the same as " +
+					"`false`. Without it, AutoPilot refuses a task from this sender that sets `urgent: true` " +
+					"(`urgent_not_allowed`). Turning it off refuses the sender's urgent tasks still queued, when " +
+					"AutoPilot gets to them; one already running runs on. Turning it on needs an AutoPilot that knows " +
+					"the field; an older one refuses it with a 422. Off, left out or `false`, it is never sent, except " +
+					"as `false` to turn it off. An AutoPilot rolled back past the field ignores it: it takes an urgent " +
+					"task from any sender and starts it in its turn, like any other. It also refuses every write that " +
+					"sends the field, but keeps the value. Meanwhile the provider reads the sender as off, so a " +
+					"configuration that turns it on plans a change on every run and its applies fail: take it out of " +
+					"the configuration until AutoPilot is rolled forward.",
+				Optional: true,
 			},
 			"branch_prefix": schema.StringAttribute{
 				MarkdownDescription: "What the sender's branches start with: a lowercase word and a `/` (`^[a-z][a-z0-9-]*/$`), " +
@@ -413,6 +458,11 @@ func (r *senderResource) Create(ctx context.Context, req resource.CreateRequest,
 	if hosts := stringsFromSet(ctx, plan.CallbackHosts, "callback_hosts", &resp.Diagnostics); len(hosts) > 0 {
 		spec.CallbackHosts = hosts
 	}
+	// Sent only when on: off is AutoPilot's default, and an AutoPilot that
+	// predates the field refuses it, false included.
+	if plan.MaySendUrgent.IsUnknown() || isTrue(plan.MaySendUrgent) {
+		spec.MaySendUrgent = maySendUrgentFromModel(plan, &resp.Diagnostics)
+	}
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -432,7 +482,7 @@ func (r *senderResource) Create(ctx context.Context, req resource.CreateRequest,
 			fmt.Sprintf("AutoPilot already had a sender named %q with exactly these values, so Terraform now manages "+
 				"that sender. If another configuration also declares it, keep it in one of them only.", name))
 	}
-	state := senderToModel(created, plan.SecretsWOVersion)
+	state := senderToModel(created, plan)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -518,13 +568,13 @@ func (r *senderResource) Read(ctx context.Context, req resource.ReadRequest, res
 		addAPIError(&resp.Diagnostics, "Error reading AutoPilot sender", err, senderAPIFields)
 		return
 	}
-	newState := senderToModel(s, state.SecretsWOVersion)
+	newState := senderToModel(s, state)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
 // Update sends only what changed. The secrets are sent when the configured
 // ones' fingerprints differ from the stored ones, or secrets_wo_version
-// changed.
+// changed. may_send_urgent removed is sent as false.
 func (r *senderResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, state, config senderModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -545,6 +595,12 @@ func (r *senderResource) Update(ctx context.Context, req resource.UpdateRequest,
 	if !plan.Kinds.IsUnknown() && !plan.Kinds.IsNull() && !plan.Kinds.Equal(state.Kinds) {
 		spec.Kinds = stringsFromSet(ctx, plan.Kinds, "kinds", &resp.Diagnostics)
 	}
+	// Sent when it turns on or off, never from off to off (null and false
+	// alike), so a sender that leaves it off still works with an AutoPilot
+	// that predates the field.
+	if plan.MaySendUrgent.IsUnknown() || isTrue(plan.MaySendUrgent) != isTrue(state.MaySendUrgent) {
+		spec.MaySendUrgent = maySendUrgentFromModel(plan, &resp.Diagnostics)
+	}
 	requestSecret, callbackSecret := config.RequestSecretWO.ValueString(), config.CallbackSecretWO.ValueString()
 	if client.Fingerprint(requestSecret) != state.RequestSecretFingerprint.ValueString() ||
 		client.Fingerprint(callbackSecret) != state.CallbackSecretFingerprint.ValueString() ||
@@ -558,8 +614,9 @@ func (r *senderResource) Update(ctx context.Context, req resource.UpdateRequest,
 	var updated *client.Sender
 	var err error
 	if spec.Empty() {
-		// A secret that was unknown at plan time turned out to match: there is
-		// nothing to send, only the record to read.
+		// A secret that was unknown at plan time turned out to match, or
+		// may_send_urgent went from false to left out, which is off to off:
+		// there is nothing to send, only the record to read.
 		updated, err = r.client.GetSender(ctx, name)
 	} else {
 		updated, err = r.client.UpdateSender(ctx, name, spec, state.LockVersion.ValueInt64())
@@ -580,7 +637,7 @@ func (r *senderResource) Update(ctx context.Context, req resource.UpdateRequest,
 		addAPIError(&resp.Diagnostics, "Error updating AutoPilot sender", err, senderAPIFields)
 		return
 	}
-	newState := senderToModel(updated, plan.SecretsWOVersion)
+	newState := senderToModel(updated, plan)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
@@ -628,7 +685,7 @@ func (r *senderResource) ImportState(ctx context.Context, req resource.ImportSta
 		addAPIError(&resp.Diagnostics, "Error importing AutoPilot sender", err, senderAPIFields)
 		return
 	}
-	state := senderToModel(s, types.Int64Null())
+	state := senderToModel(s, senderModel{SecretsWOVersion: types.Int64Null(), MaySendUrgent: types.BoolNull()})
 	resp.Diagnostics.AddWarning("Imported sender has no secrets in Terraform",
 		"AutoPilot never sends a sender's secrets back, and they are write-only here, so they are not in state. "+
 			"Put them in configuration: the provider compares their fingerprints with the stored ones, so matching "+
