@@ -34,10 +34,12 @@ var (
 )
 
 // senderRecord is a sender as the fake stores it, secrets included.
+// maySendUrgent is false unless set.
 type senderRecord struct {
 	name                   string
 	callbackHosts          []string
 	kinds                  []string
+	maySendUrgent          bool
 	branchPrefix           string
 	requestSecret          string
 	callbackSecret         string
@@ -60,9 +62,11 @@ type senderRecord struct {
 
 // SenderView is a copy of a stored sender, secrets included, for assertions.
 type SenderView struct {
-	Name                   string
-	CallbackHosts          []string
-	Kinds                  []string
+	Name          string
+	CallbackHosts []string
+	Kinds         []string
+	// MaySendUrgent lets the sender's tasks be urgent.
+	MaySendUrgent          bool
 	BranchPrefix           string
 	RequestSecret          string
 	CallbackSecret         string
@@ -77,7 +81,7 @@ type SenderView struct {
 func (rec *senderRecord) view() SenderView {
 	return SenderView{
 		Name: rec.name, CallbackHosts: slices.Clone(rec.callbackHosts), Kinds: slices.Clone(rec.kinds),
-		BranchPrefix: rec.branchPrefix, RequestSecret: rec.requestSecret, CallbackSecret: rec.callbackSecret,
+		MaySendUrgent: rec.maySendUrgent, BranchPrefix: rec.branchPrefix, RequestSecret: rec.requestSecret, CallbackSecret: rec.callbackSecret,
 		PreviousRequestSecret: rec.previousRequestSecret, PreviousCallbackSecret: rec.previousCallbackSecret,
 		PreviousSecretsUntil: rec.previousSecretsUntil, LockVersion: rec.lockVersion, Retired: rec.retired,
 		Tombstone: rec.tombstone,
@@ -99,6 +103,7 @@ func (rec *senderRecord) json(now time.Time) map[string]any {
 		"name":                        rec.name,
 		"callback_hosts":              sortedUnique(rec.callbackHosts),
 		"kinds":                       sortedUnique(rec.kinds),
+		"may_send_urgent":             rec.maySendUrgent,
 		"branch_prefix":               rec.branchPrefix,
 		"request_secret_fingerprint":  Fingerprint(rec.requestSecret),
 		"callback_secret_fingerprint": Fingerprint(rec.callbackSecret),
@@ -117,7 +122,8 @@ type SenderSeed struct {
 	Name           string
 	CallbackHosts  []string
 	Kinds          []string // DefaultKinds when nil
-	BranchPrefix   string   // the name and a / when empty
+	MaySendUrgent  bool
+	BranchPrefix   string // the name and a / when empty
 	RequestSecret  string
 	CallbackSecret string
 }
@@ -137,7 +143,7 @@ func (s *Server) SeedSender(seed SenderSeed) {
 	}
 	s.senders[seed.Name] = &senderRecord{
 		name: seed.Name, callbackHosts: sortedUnique(seed.CallbackHosts), kinds: sortedUnique(kinds),
-		branchPrefix: prefix, requestSecret: seed.RequestSecret, callbackSecret: seed.CallbackSecret,
+		maySendUrgent: seed.MaySendUrgent, branchPrefix: prefix, requestSecret: seed.RequestSecret, callbackSecret: seed.CallbackSecret,
 		secretsChangedAt: now, lockVersion: 1, createdAt: now, updatedAt: now,
 	}
 }
@@ -173,6 +179,7 @@ func (s *Server) ChangeSenderOutOfBand(name string, change func(v *SenderView)) 
 	}
 	// A branch prefix never changes, from outside or not.
 	rec.callbackHosts, rec.kinds = sortedUnique(v.CallbackHosts), sortedUnique(v.Kinds)
+	rec.maySendUrgent = v.MaySendUrgent
 	rec.requestSecret, rec.callbackSecret = v.RequestSecret, v.CallbackSecret
 	rec.lockVersion++
 	rec.updatedAt = now
@@ -356,9 +363,11 @@ func notFound(what string) refusal {
 }
 
 // senderFields are the writable fields of a sender, as read from a body.
+// maySendUrgent is nil when the body leaves it out.
 type senderFields struct {
 	callbackHosts  []string
 	kinds          []string
+	maySendUrgent  *bool
 	branchPrefix   *string
 	requestSecret  *string
 	callbackSecret *string
@@ -411,6 +420,18 @@ func readSenderFields(obj map[string]json.RawMessage) (senderFields, *refusal) {
 		}
 		f.branchPrefix = &prefix
 	}
+	// AutoPilot reads fields in sorted order: may_send_urgent after
+	// branch_prefix, callback_hosts, callback_secret and kinds, and before
+	// name and request_secret. This fake reads it before both secrets, and
+	// the name first, so only a body with two wrong fields can tell. It
+	// takes true or false; null is refused.
+	if raw, ok := obj["may_send_urgent"]; ok {
+		may, ref := boolValue(raw, "/may_send_urgent")
+		if ref != nil {
+			return f, ref
+		}
+		f.maySendUrgent = &may
+	}
 	for _, k := range []string{"request_secret", "callback_secret"} {
 		raw, ok := obj[k]
 		if !ok {
@@ -449,6 +470,9 @@ func (rec *senderRecord) holds(f senderFields) bool {
 		return false
 	}
 	if f.kinds != nil && !slices.Equal(f.kinds, rec.kinds) {
+		return false
+	}
+	if f.maySendUrgent != nil && *f.maySendUrgent != rec.maySendUrgent {
 		return false
 	}
 	if f.requestSecret != nil && (Fingerprint(*f.requestSecret) != Fingerprint(rec.requestSecret) ||
@@ -493,7 +517,7 @@ func (s *Server) createSender(r *http.Request) (int, map[string]any, *refusal) {
 			return 0, nil, invalid("/"+k, "this field is read-only")
 		}
 	}
-	if ref := refuseUnknown(obj, "", "name", "callback_hosts", "kinds", "branch_prefix", "request_secret", "callback_secret"); ref != nil {
+	if ref := refuseUnknown(obj, "", "name", "callback_hosts", "kinds", "may_send_urgent", "branch_prefix", "request_secret", "callback_secret"); ref != nil {
 		return 0, nil, ref
 	}
 	raw, ok := obj["name"]
@@ -525,6 +549,8 @@ func (s *Server) createSender(r *http.Request) (int, map[string]any, *refusal) {
 	if kinds == nil {
 		kinds = DefaultKinds
 	}
+	// Left out, it is false, on a create and a revival alike.
+	urgent := f.maySendUrgent != nil && *f.maySendUrgent
 	prefix := name + "/"
 	prefixField := "/name" // the default prefix is the name's
 	if f.branchPrefix != nil {
@@ -545,15 +571,15 @@ func (s *Server) createSender(r *http.Request) (int, map[string]any, *refusal) {
 				return 0, nil, prefixTaken
 			}
 			rec := &senderRecord{
-				name: name, callbackHosts: sortedUnique(hosts), kinds: sortedUnique(kinds), branchPrefix: prefix,
-				requestSecret: *f.requestSecret, callbackSecret: *f.callbackSecret,
+				name: name, callbackHosts: sortedUnique(hosts), kinds: sortedUnique(kinds), maySendUrgent: urgent,
+				branchPrefix: prefix, requestSecret: *f.requestSecret, callbackSecret: *f.callbackSecret,
 				secretsChangedAt: now, lockVersion: existing.lockVersion + 1, createdAt: existing.createdAt, updatedAt: now,
 			}
 			s.senders[name] = rec
 			return http.StatusCreated, rec.json(now), nil
 		}
 		same := slices.Equal(existing.callbackHosts, sortedUnique(hosts)) && slices.Equal(existing.kinds, sortedUnique(kinds)) &&
-			existing.branchPrefix == prefix && existing.requestSecret == *f.requestSecret && existing.callbackSecret == *f.callbackSecret
+			existing.maySendUrgent == urgent && existing.branchPrefix == prefix && existing.requestSecret == *f.requestSecret && existing.callbackSecret == *f.callbackSecret
 		if !same {
 			return 0, nil, &refusal{http.StatusConflict, "name_taken", "a sender with this name exists with other fields", "/name"}
 		}
@@ -564,8 +590,8 @@ func (s *Server) createSender(r *http.Request) (int, map[string]any, *refusal) {
 		return 0, nil, prefixTaken
 	}
 	rec := &senderRecord{
-		name: name, callbackHosts: sortedUnique(hosts), kinds: sortedUnique(kinds), branchPrefix: prefix,
-		requestSecret: *f.requestSecret, callbackSecret: *f.callbackSecret,
+		name: name, callbackHosts: sortedUnique(hosts), kinds: sortedUnique(kinds), maySendUrgent: urgent,
+		branchPrefix: prefix, requestSecret: *f.requestSecret, callbackSecret: *f.callbackSecret,
 		secretsChangedAt: now, lockVersion: 1, createdAt: now, updatedAt: now,
 	}
 	s.senders[name] = rec
@@ -595,7 +621,7 @@ func (s *Server) patchSender(r *http.Request) (map[string]any, *refusal) {
 			return nil, invalid("/"+k, "this field is read-only")
 		}
 	}
-	if ref := refuseUnknown(obj, "", "callback_hosts", "kinds", "branch_prefix", "request_secret", "callback_secret"); ref != nil {
+	if ref := refuseUnknown(obj, "", "callback_hosts", "kinds", "may_send_urgent", "branch_prefix", "request_secret", "callback_secret"); ref != nil {
 		return nil, ref
 	}
 	if _, ok := obj["branch_prefix"]; ok {
@@ -626,6 +652,9 @@ func (s *Server) patchSender(r *http.Request) (map[string]any, *refusal) {
 	}
 	if f.kinds != nil && !slices.Equal(f.kinds, rec.kinds) {
 		rec.kinds, changed = f.kinds, true
+	}
+	if f.maySendUrgent != nil && *f.maySendUrgent != rec.maySendUrgent {
+		rec.maySendUrgent, changed = *f.maySendUrgent, true
 	}
 	if f.requestSecret != nil && (*f.requestSecret != rec.requestSecret || *f.callbackSecret != rec.callbackSecret) {
 		rec.previousRequestSecret, rec.previousCallbackSecret = rec.requestSecret, rec.callbackSecret

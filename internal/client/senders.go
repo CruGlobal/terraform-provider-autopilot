@@ -7,21 +7,26 @@ import (
 )
 
 // Sender is a system that sends AutoPilot tasks: its name, the hosts its
-// callbacks may go to, the kinds of task it may send, the prefix its
-// branches start with, and fingerprints of its two secrets. AutoPilot never
-// sends the secrets back.
+// callbacks may go to, the kinds of task it may send, whether it may send
+// urgent tasks, the prefix its branches start with, and fingerprints of its
+// two secrets. AutoPilot never sends the secrets back.
 type Sender struct {
-	Name                      string   `json:"name"`
-	CallbackHosts             []string `json:"callback_hosts"`
-	Kinds                     []string `json:"kinds"`
-	BranchPrefix              string   `json:"branch_prefix"`
-	RequestSecretFingerprint  string   `json:"request_secret_fingerprint"`
-	CallbackSecretFingerprint string   `json:"callback_secret_fingerprint"`
-	SecretsChangedAt          string   `json:"secrets_changed_at"`
-	PreviousSecretsUntil      *string  `json:"previous_secrets_until"`
-	LockVersion               int64    `json:"lock_version"`
-	CreatedAt                 string   `json:"created_at"`
-	UpdatedAt                 string   `json:"updated_at"`
+	Name          string   `json:"name"`
+	CallbackHosts []string `json:"callback_hosts"`
+	Kinds         []string `json:"kinds"`
+	// MaySendUrgent lets the sender's tasks be urgent: while AutoPilot's
+	// limit on running tasks is reached, they start before every queued task
+	// that isn't, and they don't wait for the day's spend under its daily
+	// cap on Bedrock spend. False when the AutoPilot predates the field.
+	MaySendUrgent             bool    `json:"may_send_urgent"`
+	BranchPrefix              string  `json:"branch_prefix"`
+	RequestSecretFingerprint  string  `json:"request_secret_fingerprint"`
+	CallbackSecretFingerprint string  `json:"callback_secret_fingerprint"`
+	SecretsChangedAt          string  `json:"secrets_changed_at"`
+	PreviousSecretsUntil      *string `json:"previous_secrets_until"`
+	LockVersion               int64   `json:"lock_version"`
+	CreatedAt                 string  `json:"created_at"`
+	UpdatedAt                 string  `json:"updated_at"`
 }
 
 func (s *Sender) recordName() string {
@@ -46,11 +51,16 @@ type SenderSecrets struct {
 }
 
 // SenderSpec is what a create or a change sends. A nil list, a nil
-// BranchPrefix or nil Secrets is not sent at all; an empty, non-nil list is
-// sent as []. BranchPrefix is for a create only: it never changes.
+// MaySendUrgent, a nil BranchPrefix or nil Secrets is not sent at all; an
+// empty, non-nil list is sent as []. BranchPrefix is for a create only: it
+// never changes.
 type SenderSpec struct {
 	CallbackHosts []string
 	Kinds         []string
+	// MaySendUrgent is sent as it is: true to let the sender's tasks be
+	// urgent, false to take that away. Nil is not sent, so an AutoPilot that
+	// predates the field still takes the sender.
+	MaySendUrgent *bool
 	BranchPrefix  *string
 	Secrets       *SenderSecrets
 }
@@ -62,6 +72,9 @@ func (s SenderSpec) fields() Fields {
 	}
 	if s.Kinds != nil {
 		f["kinds"] = sortedUnique(s.Kinds)
+	}
+	if s.MaySendUrgent != nil {
+		f["may_send_urgent"] = *s.MaySendUrgent
 	}
 	if s.BranchPrefix != nil {
 		f["branch_prefix"] = *s.BranchPrefix
@@ -82,6 +95,9 @@ func (s SenderSpec) reflectedIn(sender *Sender) bool {
 		return false
 	}
 	if s.Kinds != nil && !slices.Equal(sortedUnique(s.Kinds), sortedUnique(sender.Kinds)) {
+		return false
+	}
+	if s.MaySendUrgent != nil && sender.MaySendUrgent != *s.MaySendUrgent {
 		return false
 	}
 	if s.BranchPrefix != nil && *s.BranchPrefix != sender.BranchPrefix {

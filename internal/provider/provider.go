@@ -66,7 +66,8 @@ func (p *autopilotProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 			"AutoPilot, and what each app allows, through AutoPilot's admin API. AutoPilot runs AI agents on " +
 			"work that senders such as issue trackers send it, and opens pull requests a person reviews.\n\n" +
 			"- A **sender** (`autopilot_sender`) is a system that sends tasks: the hosts its callbacks may go to, " +
-			"the kinds of task it may send, the prefix its branches start with, and its two secrets.\n" +
+			"the kinds of task it may send, whether it may send urgent tasks, the prefix its branches start with, " +
+			"and its two secrets.\n" +
 			"- An **app** (`autopilot_app`) is a unit of consent: the repositories it owns, the senders it accepts " +
 			"work from and the kinds it accepts from each, and the people who may start work for it themselves, " +
 			"with their GitHub logins.\n\n" +

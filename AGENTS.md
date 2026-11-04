@@ -204,6 +204,19 @@ the examples, and the generated docs. Things worth knowing:
   create only when `true`, and on a change as `true` or as `false` to turn
   it off, never from off to off (null and `false` alike), so an older
   AutoPilot still takes an app that leaves it off.
+- A sender's `may_send_urgent` lets its tasks be urgent: while AutoPilot's
+  limit on running tasks is reached, they start before every queued task
+  that isn't, and they don't wait for the day's spend under the daily cap
+  on Bedrock spend. AutoPilot takes `true` or `false` (`null` is refused),
+  answers `false` when it was never set, and a create or a revival that
+  leaves it out sets `false`, so a create matches a sender that has it
+  (a retry, or one to take over) only when it sends it too. Like an app's
+  `approve_as_user`, it is optional with no default, off reads back as
+  null unless the configuration says `false` (`optionalFlag`), and it is
+  sent only when it turns on or off: on a create only when `true`, and on
+  a change as `true` or as `false` to turn it off, never from off to off
+  (null and `false` alike), so an older AutoPilot still takes a sender
+  that leaves it off.
 - A sender's secrets are write-only (`*_wo`). The plan compares
   `client.Fingerprint` of the configured secrets with the stored
   fingerprints; see the comment at the top of `sender_resource.go`.

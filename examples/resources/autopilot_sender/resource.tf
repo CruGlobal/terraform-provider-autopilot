@@ -20,6 +20,14 @@ resource "autopilot_sender" "tracker" {
   # The kinds of task it may send. AutoPilot's default is implement-work-item.
   kinds = ["implement-work-item", "fix-error", "research"]
 
+  # Let this sender's urgent tasks start before every queued task that isn't
+  # urgent while AutoPilot is running as many tasks as it allows, and without
+  # waiting for the day's spend under its daily cap on Bedrock spend (a task
+  # whose own max_usd is over the whole cap still can't run on Bedrock).
+  # Grant it only to a sender whose urgent tasks are few and can't wait, such
+  # as fixes for a production incident. Off unless set.
+  may_send_urgent = true
+
   # What its branches start with. AutoPilot's default is the name and a /.
   branch_prefix = "tracker/"
 

@@ -1637,3 +1637,128 @@ func TestApproveAsUser(t *testing.T) {
 		t.Error("seeded approve_as_user is off")
 	}
 }
+
+// may_send_urgent is true or false, refused at /may_send_urgent otherwise,
+// null included; false unless sent; a write that leaves it out keeps it. A
+// create with it is a retry only with the same, and a revival sets it as
+// the create sends it, false when left out.
+func TestSender_MaySendUrgent(t *testing.T) {
+	s := New(t)
+	for _, raw := range []string{`null`, `"true"`, `1`, `0`, `[]`, `{}`} {
+		st, answer := call(t, s, http.MethodPost, "/v1/admin/senders", "", map[string]any{"name": "tracker",
+			"request_secret": randomSecret(t), "callback_secret": randomSecret(t), "may_send_urgent": json.RawMessage(raw)})
+		expect(t, raw, st, http.StatusUnprocessableEntity, answer)
+		if answer["field"] != "/may_send_urgent" {
+			t.Errorf("%s: field = %v, want /may_send_urgent", raw, answer["field"])
+		}
+	}
+
+	plain := map[string]any{"name": "plain", "request_secret": randomSecret(t), "callback_secret": randomSecret(t)}
+	st, body := call(t, s, http.MethodPost, "/v1/admin/senders", "", plain)
+	expect(t, "none", st, http.StatusCreated, body)
+	if body["may_send_urgent"] != false {
+		t.Errorf("may_send_urgent = %v, want false", body["may_send_urgent"])
+	}
+	// false sent on a create is the default, so it is a retry of a create
+	// without it.
+	plain["may_send_urgent"] = false
+	st, body = call(t, s, http.MethodPost, "/v1/admin/senders", "", plain)
+	expect(t, "false, a retry", st, http.StatusOK, body)
+
+	request, callback := randomSecret(t), randomSecret(t)
+	urgent := map[string]any{"name": "tracker", "request_secret": request, "callback_secret": callback, "may_send_urgent": true}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/senders", "", urgent)
+	expect(t, "create", st, http.StatusCreated, body)
+	if body["may_send_urgent"] != true {
+		t.Errorf("may_send_urgent = %v, want true", body["may_send_urgent"])
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/senders", "", urgent)
+	expect(t, "the same create again", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/senders", "", map[string]any{
+		"name": "tracker", "request_secret": request, "callback_secret": callback})
+	expect(t, "a create without it", st, http.StatusConflict, body)
+	if body["code"] != "name_taken" {
+		t.Errorf("code = %v, want name_taken", body["code"])
+	}
+
+	// A change that leaves it out keeps it.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/senders/tracker", "1", map[string]any{"kinds": []string{"fix-error"}})
+	expect(t, "left out", st, http.StatusOK, body)
+	if body["may_send_urgent"] != true {
+		t.Errorf("may_send_urgent = %v, want it kept", body["may_send_urgent"])
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/senders/tracker", "2", map[string]any{"may_send_urgent": false})
+	expect(t, "off", st, http.StatusOK, body)
+	if v, _ := s.Sender("tracker"); v.LockVersion != 3 || v.MaySendUrgent {
+		t.Errorf("may_send_urgent = %v, lock_version %d", v.MaySendUrgent, v.LockVersion)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/senders/tracker", "3", map[string]any{"may_send_urgent": false})
+	expect(t, "off again", st, http.StatusOK, body)
+	if body["lock_version"] != float64(3) {
+		t.Errorf("lock_version = %v, want nothing changed", body["lock_version"])
+	}
+	// A repeat one version behind of the change the record holds is that
+	// change; another is stale. A value it can't take is refused first.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/senders/tracker", "2", map[string]any{"may_send_urgent": false})
+	expect(t, "a repeat one version behind", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/senders/tracker", "2", map[string]any{"may_send_urgent": true})
+	expect(t, "another change one version behind", st, http.StatusConflict, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/senders/tracker", "2", map[string]any{"may_send_urgent": nil})
+	expect(t, "a value it can't take, one version behind", st, http.StatusUnprocessableEntity, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/senders/tracker", "3", map[string]any{"may_send_urgent": true})
+	expect(t, "on", st, http.StatusOK, body)
+
+	// A revival is the create it was sent: left out, it is off; sent, it is
+	// as sent.
+	st, body = call(t, s, http.MethodDelete, "/v1/admin/senders/tracker", "", nil)
+	expect(t, "delete", st, http.StatusNoContent, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/senders", "", map[string]any{
+		"name": "tracker", "request_secret": request, "callback_secret": callback})
+	expect(t, "revive without it", st, http.StatusCreated, body)
+	if body["may_send_urgent"] != false {
+		t.Errorf("revived with may_send_urgent = %v, want false", body["may_send_urgent"])
+	}
+	call(t, s, http.MethodDelete, "/v1/admin/senders/tracker", "", nil)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/senders", "", urgent)
+	expect(t, "revive with it", st, http.StatusCreated, body)
+	if body["may_send_urgent"] != true {
+		t.Errorf("revived with may_send_urgent = %v, want true", body["may_send_urgent"])
+	}
+
+	s.SeedSender(SenderSeed{Name: "seeded", MaySendUrgent: true, RequestSecret: randomSecret(t), CallbackSecret: randomSecret(t)})
+	if v, _ := s.Sender("seeded"); !v.MaySendUrgent {
+		t.Error("seeded may_send_urgent is off")
+	}
+	s.ChangeSenderOutOfBand("seeded", func(v *SenderView) { v.MaySendUrgent = false })
+	if v, _ := s.Sender("seeded"); v.MaySendUrgent || v.LockVersion != 2 {
+		t.Errorf("changed out of band: may_send_urgent = %v, lock_version %d", v.MaySendUrgent, v.LockVersion)
+	}
+}
+
+// AutoPilot reads a sender's fields in sorted order, so a body with two
+// wrong names the first. may_send_urgent comes after branch_prefix,
+// callback_hosts and kinds, and before request_secret. (This fake reads the
+// name first, and the callback secret with the request secret.)
+func TestSenderFields_MaySendUrgentReadInOrder(t *testing.T) {
+	s := New(t)
+	cases := []struct {
+		body  map[string]any
+		field string
+	}{
+		{map[string]any{"branch_prefix": "Bots", "may_send_urgent": 1}, "/branch_prefix"},
+		{map[string]any{"callback_hosts": "x", "may_send_urgent": 1}, "/callback_hosts"},
+		{map[string]any{"kinds": "x", "may_send_urgent": 1}, "/kinds"},
+		{map[string]any{"may_send_urgent": 1, "request_secret": "short"}, "/may_send_urgent"},
+	}
+	for _, c := range cases {
+		body := map[string]any{"name": "tracker", "request_secret": randomSecret(t), "callback_secret": randomSecret(t)}
+		for k, v := range c.body {
+			body[k] = v
+		}
+		st, answer := call(t, s, http.MethodPost, "/v1/admin/senders", "", body)
+		expect(t, mustJSON(c.body), st, http.StatusUnprocessableEntity, answer)
+		if answer["field"] != c.field {
+			t.Errorf("%s: field = %v, want %s", mustJSON(c.body), answer["field"], c.field)
+		}
+	}
+}

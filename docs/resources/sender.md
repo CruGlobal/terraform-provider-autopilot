@@ -3,8 +3,9 @@
 page_title: "autopilot_sender Resource - autopilot"
 subcategory: ""
 description: |-
-  A sender: a system that sends AutoPilot tasks, such as an issue tracker. It names the hosts its callbacks may go to, the kinds of task it may send, the prefix its branches start with, and its two secrets. The sender signs its calls to AutoPilot with the request secret, and AutoPilot signs its callbacks to the sender with the callback secret.
+  A sender: a system that sends AutoPilot tasks, such as an issue tracker. It names the hosts its callbacks may go to, the kinds of task it may send, whether it may send urgent tasks, the prefix its branches start with, and its two secrets. The sender signs its calls to AutoPilot with the request secret, and AutoPilot signs its callbacks to the sender with the callback secret.
   An app must also accept the sender (see autopilot_app) before AutoPilot takes its tasks for that app. The two can be applied in either order.
+  may_send_urgent lets the sender's urgent tasks start before every queued task that isn't urgent while AutoPilot's limit on running tasks is reached, and without waiting for the day's spend under its daily cap on Bedrock spend, though a task whose own limits.max_usd is over the whole cap still can't run on Bedrock.
   The secrets
   request_secret_wo and callback_secret_wo are write-only arguments https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments: Terraform sends them on apply and never writes them to the plan or the state file. They need Terraform 1.11 or later. Make them in the sender's own configuration with a plain random_password (not an ephemeral value, which changes on every run), pass them here, and store them where the sender reads its secrets.
   This resource never stores the secrets, but the random_password resources that make them keep them in that configuration's state, so protect that state as you would the secrets. And make them random: a fingerprint is an unsalted SHA-256, quick to compute and shown in plans and state, so a secret someone could guess could be found from its fingerprint.
@@ -20,9 +21,11 @@ description: |-
 
 # autopilot_sender (Resource)
 
-A sender: a system that sends AutoPilot tasks, such as an issue tracker. It names the hosts its callbacks may go to, the kinds of task it may send, the prefix its branches start with, and its two secrets. The sender signs its calls to AutoPilot with the request secret, and AutoPilot signs its callbacks to the sender with the callback secret.
+A sender: a system that sends AutoPilot tasks, such as an issue tracker. It names the hosts its callbacks may go to, the kinds of task it may send, whether it may send urgent tasks, the prefix its branches start with, and its two secrets. The sender signs its calls to AutoPilot with the request secret, and AutoPilot signs its callbacks to the sender with the callback secret.
 
 An app must also accept the sender (see `autopilot_app`) before AutoPilot takes its tasks for that app. The two can be applied in either order.
+
+`may_send_urgent` lets the sender's urgent tasks start before every queued task that isn't urgent while AutoPilot's limit on running tasks is reached, and without waiting for the day's spend under its daily cap on Bedrock spend, though a task whose own `limits.max_usd` is over the whole cap still can't run on Bedrock.
 
 ## The secrets
 
@@ -77,6 +80,14 @@ resource "autopilot_sender" "tracker" {
   # The kinds of task it may send. AutoPilot's default is implement-work-item.
   kinds = ["implement-work-item", "fix-error", "research"]
 
+  # Let this sender's urgent tasks start before every queued task that isn't
+  # urgent while AutoPilot is running as many tasks as it allows, and without
+  # waiting for the day's spend under its daily cap on Bedrock spend (a task
+  # whose own max_usd is over the whole cap still can't run on Bedrock).
+  # Grant it only to a sender whose urgent tasks are few and can't wait, such
+  # as fixes for a production incident. Off unless set.
+  may_send_urgent = true
+
   # What its branches start with. AutoPilot's default is the name and a /.
   branch_prefix = "tracker/"
 
@@ -105,6 +116,7 @@ resource "autopilot_sender" "tracker" {
 It is set when the sender is created and **never changes**. A deleted sender's name and prefix stay taken for good, so a different prefix means a new sender with a new `name`: the plan refuses a new prefix under the same name (keep it, or change `name` too, which replaces the sender), and a new name with the old prefix. After an import, set it to the sender's current prefix unless that is the default.
 - `callback_hosts` (Set of String) Host names the sender's callbacks may go to (over https on port 443): lowercase DNS names with at least one dot, not IP addresses and not `localhost`. At most 10. Empty (the default) for a sender that only polls.
 - `kinds` (Set of String) The kinds of task the sender may send, such as `implement-work-item`, `fix-error`, `review-pr` or `research`. Each must be one AutoPilot knows. At least one. Defaults to `["implement-work-item"]`, AutoPilot's own default, so removing it from the configuration puts that back, and a change made outside Terraform shows in the plan.
+- `may_send_urgent` (Boolean) Whether the sender's tasks may be urgent (`urgent: true`, in version 2 of AutoPilot's task API). An urgent task jumps the queue: while AutoPilot is running as many tasks as it allows, it starts before every queued task that isn't urgent, as soon as a running task finishes, oldest first among the urgent ones. A running task is never stopped to make room. It also starts without waiting for the day's spend under AutoPilot's daily cap on Bedrock spend, however much today's other tasks have cost or may cost. What it may cost still counts toward the cap, so the tasks behind it may wait for the cap sooner, and a task whose own `limits.max_usd` is over the whole cap still can't run on Bedrock. Everything else still holds for it: its kind, its branch, the apps' consent, its app's credential policy and AutoPilot's other limits, and it still waits while another task runs on its same repository and branch. Grant it only to a sender whose urgent tasks are few and can't wait, such as fixes for a production incident: each one goes ahead of every other sender's work. Off unless set: leaving it out is the same as `false`. Without it, AutoPilot refuses a task from this sender that sets `urgent: true` (`urgent_not_allowed`). Turning it off refuses the sender's urgent tasks still queued, when AutoPilot gets to them; one already running runs on. Turning it on needs an AutoPilot that knows the field; an older one refuses it with a 422. Off, left out or `false`, it is never sent, except as `false` to turn it off. An AutoPilot rolled back past the field ignores it: it takes an urgent task from any sender and starts it in its turn, like any other. It also refuses every write that sends the field, but keeps the value. Meanwhile the provider reads the sender as off, so a configuration that turns it on plans a change on every run and its applies fail: take it out of the configuration until AutoPilot is rolled forward.
 - `secrets_wo_version` (Number) A number you change to send both secrets again, whatever their fingerprints say. Rarely needed, since a changed secret already shows as a changed fingerprint.
 
 ### Read-Only
