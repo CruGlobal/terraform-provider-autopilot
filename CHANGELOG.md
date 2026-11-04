@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.8.0...v0.9.0) (2026-11-04)
+
+
+### Added
+
+* **sender:** add may_send_urgent, whether a sender's tasks may be urgent ([#26](https://github.com/CruGlobal/terraform-provider-autopilot/issues/26)) ([f78fd68](https://github.com/CruGlobal/terraform-provider-autopilot/commit/f78fd68bbd1f7b9558c801c8f16149c53336e267))
+
 ## [0.8.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.7.0...v0.8.0) (2026-10-30)
 
 
