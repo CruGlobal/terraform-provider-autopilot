@@ -1356,6 +1356,11 @@ func TestAppFields_ReadInOrder(t *testing.T) {
 		// approve_as_user comes after accepts and before auto_review.
 		{map[string]any{"accepts": "x", "approve_as_user": 1}, "/accepts"},
 		{map[string]any{"approve_as_user": 1, "auto_review": "x"}, "/approve_as_user"},
+		// propose_review_rules comes after max_reviews_per_day and before
+		// review_also_reads, and before the rules that span fields.
+		{map[string]any{"max_reviews_per_day": 0, "propose_review_rules": 1}, "/max_reviews_per_day"},
+		{map[string]any{"propose_review_rules": 1, "review_also_reads": "x"}, "/propose_review_rules"},
+		{map[string]any{"github_logins": unpaired, "propose_review_rules": 1}, "/propose_review_rules"},
 	}
 	for _, c := range cases {
 		body := map[string]any{"name": "billing"}
@@ -1635,6 +1640,75 @@ func TestApproveAsUser(t *testing.T) {
 	s.SeedApp(AppView{Name: "seeded", ApproveAsUser: true})
 	if v, _ := s.App("seeded"); !v.ApproveAsUser {
 		t.Error("seeded approve_as_user is off")
+	}
+}
+
+// propose_review_rules is true or false, refused at /propose_review_rules
+// otherwise, null included; false unless sent; a write that leaves it out
+// keeps it. A create with it is a retry only with the same.
+func TestProposeReviewRules(t *testing.T) {
+	s := New(t)
+	for _, raw := range []string{`null`, `"true"`, `1`, `0`, `[]`, `{}`} {
+		st, answer := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "propose_review_rules": json.RawMessage(raw)})
+		expect(t, raw, st, http.StatusUnprocessableEntity, answer)
+		if answer["field"] != "/propose_review_rules" {
+			t.Errorf("%s: field = %v, want /propose_review_rules", raw, answer["field"])
+		}
+	}
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "plain"})
+	expect(t, "none", st, http.StatusCreated, body)
+	if body["propose_review_rules"] != false {
+		t.Errorf("propose_review_rules = %v, want false", body["propose_review_rules"])
+	}
+	// false sent on a create is the default, so a create without it is a
+	// retry of it.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "plain", "propose_review_rules": false})
+	expect(t, "false, a retry", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "propose_review_rules": true})
+	expect(t, "create", st, http.StatusCreated, body)
+	if body["propose_review_rules"] != true {
+		t.Errorf("propose_review_rules = %v, want true", body["propose_review_rules"])
+	}
+	if body["approve_as_user"] != false {
+		t.Errorf("approve_as_user = %v, want it apart", body["approve_as_user"])
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "propose_review_rules": true})
+	expect(t, "the same create again", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing"})
+	expect(t, "a create without it", st, http.StatusConflict, body)
+
+	// A change that leaves it out keeps it.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"developers": []string{"alice@example.org"}})
+	expect(t, "left out", st, http.StatusOK, body)
+	if body["propose_review_rules"] != true {
+		t.Errorf("propose_review_rules = %v, want it kept", body["propose_review_rules"])
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"propose_review_rules": false})
+	expect(t, "off", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.LockVersion != 3 || v.ProposeReviewRules {
+		t.Errorf("propose_review_rules = %v, lock_version %d", v.ProposeReviewRules, v.LockVersion)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"propose_review_rules": false})
+	expect(t, "off again", st, http.StatusOK, body)
+	if body["lock_version"] != float64(3) {
+		t.Errorf("lock_version = %v, want nothing changed", body["lock_version"])
+	}
+	// A repeat one version behind of the change the record holds is that
+	// change; another is stale. A value it can't take is refused first.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"propose_review_rules": false})
+	expect(t, "a repeat one version behind", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"propose_review_rules": true})
+	expect(t, "another change one version behind", st, http.StatusConflict, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"propose_review_rules": nil})
+	expect(t, "a value it can't take, one version behind", st, http.StatusUnprocessableEntity, body)
+
+	s.SeedApp(AppView{Name: "seeded", ProposeReviewRules: true})
+	if v, _ := s.App("seeded"); !v.ProposeReviewRules || v.ApproveAsUser {
+		t.Errorf("seeded propose_review_rules = %v, approve_as_user = %v", v.ProposeReviewRules, v.ApproveAsUser)
+	}
+	s.ChangeAppOutOfBand("seeded", func(v *AppView) { v.ProposeReviewRules = false })
+	if v, _ := s.App("seeded"); v.ProposeReviewRules || v.LockVersion != 2 {
+		t.Errorf("changed out of band: propose_review_rules = %v, lock_version %d", v.ProposeReviewRules, v.LockVersion)
 	}
 }
 

@@ -90,6 +90,13 @@ resource "autopilot_app" "billing" {
   # label or the command, on each of this app's repositories, instead of
   # AutoPilot's default of 20. Automatic reviews don't count against it.
   max_reviews_per_day = 50
+
+  # Let AutoPilot learn from how people answer its review findings. Once a
+  # week, where people keep dismissing, or keep acting on, one kind of
+  # finding in one top folder, it opens a draft pull request that adds one
+  # rule to the repository's REVIEW.md, for a person to merge or close. It
+  # does nothing unless AutoPilot's own settings list the repository too.
+  propose_review_rules = true
 }
 
 resource "autopilot_app" "infrastructure" {

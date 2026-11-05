@@ -206,7 +206,8 @@ func (r *senderResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			},
 			"kinds": schema.SetAttribute{
 				MarkdownDescription: "The kinds of task the sender may send, such as `implement-work-item`, `fix-error`, " +
-					"`review-pr` or `research`. Each must be one AutoPilot knows. At least one. Defaults to " +
+					"`review-pr` or `research`. Each must be one AutoPilot knows, and never `propose-review-rules`, which " +
+					"only AutoPilot's service sends. At least one. Defaults to " +
 					"`[\"implement-work-item\"]`, AutoPilot's own default, so removing it from the configuration puts " +
 					"that back, and a change made outside Terraform shows in the plan.",
 				ElementType: types.StringType,

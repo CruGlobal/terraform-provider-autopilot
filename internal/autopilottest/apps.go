@@ -25,7 +25,7 @@ var (
 	maxAccepts         = 20
 	maxDevelopers      = 100
 	maxGitHubLogins    = 100
-	appWritable        = []string{"repos", "accepts", "developers", "github_logins", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory", "auto_review", "review_also_reads", "work_item_projects", "max_reviews_per_day", "approve_as_user"}
+	appWritable        = []string{"repos", "accepts", "developers", "github_logins", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory", "auto_review", "review_also_reads", "work_item_projects", "max_reviews_per_day", "approve_as_user", "propose_review_rules"}
 	appReadOnly        = []string{"lock_version", "created_at", "updated_at"}
 	acceptWritable     = []string{"sender", "kinds", "can_decide", "can_auto_merge", "can_decide_own_pr", "approve_up_to"}
 	appCreateFields    = append([]string{"name"}, appWritable...)
@@ -562,7 +562,8 @@ type Accept struct {
 // whenSeatsFull is null: the app has no credential policy of its own. An
 // empty workerImage is null (node), a zero workerCPU and workerMemory are
 // null (the worker's own size), and a zero maxReviewsPerDay is null
-// (AutoPilot's default). approveAsUser is false unless set.
+// (AutoPilot's default). approveAsUser and proposeReviewRules are false
+// unless set.
 type appRecord struct {
 	name                      string
 	repos                     []string
@@ -577,6 +578,7 @@ type appRecord struct {
 	workItemProjects          []string
 	maxReviewsPerDay          int64
 	approveAsUser             bool
+	proposeReviewRules        bool
 	lockVersion               int64
 	createdAt, updatedAt      time.Time
 }
@@ -609,7 +611,10 @@ type AppView struct {
 	// ApproveAsUser lets the app's reviews approve as the code owner user
 	// where AutoPilot otherwise only comments.
 	ApproveAsUser bool
-	LockVersion   int64
+	// ProposeReviewRules lets AutoPilot propose rules for the REVIEW.md of
+	// the app's repositories.
+	ProposeReviewRules bool
+	LockVersion        int64
 }
 
 func (rec *appRecord) view() AppView {
@@ -618,12 +623,13 @@ func (rec *appRecord) view() AppView {
 		Developers: slices.Clone(rec.developers), GitHubLogins: slices.Clone(rec.githubLogins),
 		Credential: rec.credential, WhenSeatsFull: rec.whenSeatsFull,
 		WorkerImage: rec.workerImage, WorkerCPU: rec.workerCPU, WorkerMemory: rec.workerMemory,
-		AutoReview:       cloneAutoReview(rec.autoReview),
-		ReviewAlsoReads:  orEmpty(slices.Clone(rec.alsoReads)),
-		WorkItemProjects: orEmpty(slices.Clone(rec.workItemProjects)),
-		MaxReviewsPerDay: rec.maxReviewsPerDay,
-		ApproveAsUser:    rec.approveAsUser,
-		LockVersion:      rec.lockVersion,
+		AutoReview:         cloneAutoReview(rec.autoReview),
+		ReviewAlsoReads:    orEmpty(slices.Clone(rec.alsoReads)),
+		WorkItemProjects:   orEmpty(slices.Clone(rec.workItemProjects)),
+		MaxReviewsPerDay:   rec.maxReviewsPerDay,
+		ApproveAsUser:      rec.approveAsUser,
+		ProposeReviewRules: rec.proposeReviewRules,
+		LockVersion:        rec.lockVersion,
 	}
 }
 
@@ -673,24 +679,25 @@ func (rec *appRecord) json() map[string]any {
 		logins = append(logins, map[string]any{"login": l.Login, "developer": l.Developer})
 	}
 	return map[string]any{
-		"name":                rec.name,
-		"repos":               sortedUnique(rec.repos),
-		"accepts":             accepts,
-		"developers":          sortedUnique(rec.developers),
-		"github_logins":       logins,
-		"credential":          nullable(rec.credential),
-		"when_seats_full":     nullable(rec.whenSeatsFull),
-		"worker_image":        nullable(rec.workerImage),
-		"worker_cpu":          nullableInt(rec.workerCPU),
-		"worker_memory":       nullableInt(rec.workerMemory),
-		"auto_review":         autoReviewJSON(rec.autoReview),
-		"review_also_reads":   orEmpty(slices.Clone(rec.alsoReads)),
-		"work_item_projects":  orEmpty(slices.Clone(rec.workItemProjects)),
-		"max_reviews_per_day": nullableInt(rec.maxReviewsPerDay),
-		"approve_as_user":     rec.approveAsUser,
-		"lock_version":        rec.lockVersion,
-		"created_at":          timestamp(rec.createdAt),
-		"updated_at":          timestamp(rec.updatedAt),
+		"name":                 rec.name,
+		"repos":                sortedUnique(rec.repos),
+		"accepts":              accepts,
+		"developers":           sortedUnique(rec.developers),
+		"github_logins":        logins,
+		"credential":           nullable(rec.credential),
+		"when_seats_full":      nullable(rec.whenSeatsFull),
+		"worker_image":         nullable(rec.workerImage),
+		"worker_cpu":           nullableInt(rec.workerCPU),
+		"worker_memory":        nullableInt(rec.workerMemory),
+		"auto_review":          autoReviewJSON(rec.autoReview),
+		"review_also_reads":    orEmpty(slices.Clone(rec.alsoReads)),
+		"work_item_projects":   orEmpty(slices.Clone(rec.workItemProjects)),
+		"max_reviews_per_day":  nullableInt(rec.maxReviewsPerDay),
+		"approve_as_user":      rec.approveAsUser,
+		"propose_review_rules": rec.proposeReviewRules,
+		"lock_version":         rec.lockVersion,
+		"created_at":           timestamp(rec.createdAt),
+		"updated_at":           timestamp(rec.updatedAt),
 	}
 }
 
@@ -724,7 +731,8 @@ func (s *Server) SeedApp(v AppView) {
 		workerImage: v.WorkerImage, workerCPU: v.WorkerCPU, workerMemory: v.WorkerMemory,
 		autoReview: storedAutoReview(v.AutoReview), alsoReads: storedAlsoReads(v.ReviewAlsoReads),
 		workItemProjects: storedWorkItemProjects(v.WorkItemProjects), maxReviewsPerDay: storedReviewsPerDay(v.MaxReviewsPerDay),
-		approveAsUser: v.ApproveAsUser, lockVersion: 1, createdAt: now, updatedAt: now,
+		approveAsUser: v.ApproveAsUser, proposeReviewRules: v.ProposeReviewRules,
+		lockVersion: 1, createdAt: now, updatedAt: now,
 	}
 }
 
@@ -759,6 +767,7 @@ func (s *Server) ChangeAppOutOfBand(name string, change func(v *AppView)) {
 	rec.workItemProjects = storedWorkItemProjects(v.WorkItemProjects)
 	rec.maxReviewsPerDay = storedReviewsPerDay(v.MaxReviewsPerDay)
 	rec.approveAsUser = v.ApproveAsUser
+	rec.proposeReviewRules = v.ProposeReviewRules
 	rec.lockVersion++
 	rec.updatedAt = time.Now()
 }
@@ -844,8 +853,8 @@ func (s *Server) appRoutes(mux *http.ServeMux) {
 // both credential and whenSeatsFull ("" for null). imageSent says it sent
 // worker_image ("" for null), sizeSent that it sent worker_cpu or
 // worker_memory, which sets both (0 for null), perDaySent that it sent
-// max_reviews_per_day (0 for null), and asUserSent that it sent
-// approve_as_user.
+// max_reviews_per_day (0 for null), asUserSent that it sent
+// approve_as_user, and rulesSent that it sent propose_review_rules.
 type appFields struct {
 	repos      []string
 	accepts    []Accept
@@ -868,11 +877,13 @@ type appFields struct {
 	// is the list as sent, for a refusal to point into.
 	alsoReads, alsoReadsSent []string
 	// workItemProjects is nil when work_item_projects was not sent.
-	workItemProjects []string
-	perDaySent       bool
-	maxReviewsPerDay int64
-	asUserSent       bool
-	approveAsUser    bool
+	workItemProjects   []string
+	perDaySent         bool
+	maxReviewsPerDay   int64
+	asUserSent         bool
+	approveAsUser      bool
+	rulesSent          bool
+	proposeReviewRules bool
 }
 
 // readAppFields reads an app's writable fields from a body, each in its
@@ -1066,6 +1077,12 @@ func readAppFields(obj map[string]json.RawMessage, creating bool) (appFields, *r
 			return f, ref
 		}
 		f.perDaySent = true
+	}
+	if raw, ok := obj["propose_review_rules"]; ok {
+		if f.proposeReviewRules, ref = boolValue(raw, "/propose_review_rules"); ref != nil {
+			return f, ref
+		}
+		f.rulesSent = true
 	}
 	if raw, ok := obj["review_also_reads"]; ok {
 		if f.alsoReads, f.alsoReadsSent, ref = readAlsoReads(raw); ref != nil {
@@ -1261,7 +1278,8 @@ func (rec *appRecord) holds(f appFields) bool {
 		(f.alsoReads == nil || slices.Equal(f.alsoReads, rec.alsoReads)) &&
 		(f.workItemProjects == nil || slices.Equal(f.workItemProjects, rec.workItemProjects)) &&
 		(!f.perDaySent || f.maxReviewsPerDay == rec.maxReviewsPerDay) &&
-		(!f.asUserSent || f.approveAsUser == rec.approveAsUser)
+		(!f.asUserSent || f.approveAsUser == rec.approveAsUser) &&
+		(!f.rulesSent || f.proposeReviewRules == rec.proposeReviewRules)
 }
 
 // repoOwner names the app other than except that owns repo, matched without
@@ -1334,7 +1352,7 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 			existing.workerImage == f.workerImage && existing.workerCPU == f.workerCPU && existing.workerMemory == f.workerMemory &&
 			sameAutoReview(existing.autoReview, f.autoReview) && slices.Equal(existing.alsoReads, alsoReads) &&
 			slices.Equal(existing.workItemProjects, projects) && existing.maxReviewsPerDay == f.maxReviewsPerDay &&
-			existing.approveAsUser == f.approveAsUser
+			existing.approveAsUser == f.approveAsUser && existing.proposeReviewRules == f.proposeReviewRules
 		if !same {
 			return 0, nil, &refusal{http.StatusConflict, "name_taken", "an app with this name exists with other fields", "/name"}
 		}
@@ -1348,7 +1366,7 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 		workerImage: f.workerImage, workerCPU: f.workerCPU, workerMemory: f.workerMemory,
 		autoReview: f.autoReview, alsoReads: alsoReads,
 		workItemProjects: projects, maxReviewsPerDay: f.maxReviewsPerDay, approveAsUser: f.approveAsUser,
-		lockVersion: 1, createdAt: now, updatedAt: now}
+		proposeReviewRules: f.proposeReviewRules, lockVersion: 1, createdAt: now, updatedAt: now}
 	s.apps[name] = rec
 	return http.StatusCreated, rec.json(), nil
 }
@@ -1473,6 +1491,9 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 	}
 	if f.asUserSent && f.approveAsUser != rec.approveAsUser {
 		rec.approveAsUser, changed = f.approveAsUser, true
+	}
+	if f.rulesSent && f.proposeReviewRules != rec.proposeReviewRules {
+		rec.proposeReviewRules, changed = f.proposeReviewRules, true
 	}
 	if changed {
 		rec.lockVersion++

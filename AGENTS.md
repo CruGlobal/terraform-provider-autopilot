@@ -204,6 +204,22 @@ the examples, and the generated docs. Things worth knowing:
   create only when `true`, and on a change as `true` or as `false` to turn
   it off, never from off to off (null and `false` alike), so an older
   AutoPilot still takes an app that leaves it off.
+- An app's `propose_review_rules` lets AutoPilot open draft pull requests
+  that add a rule to the root `REVIEW.md` of the app's repositories, from
+  how people answered its review findings, as the app's service identity.
+  It works only for a repository AutoPilot's own settings list too. It is
+  handled exactly as `approve_as_user` is: AutoPilot takes `true` or
+  `false` (`null` is refused) and answers `false` when it was never set;
+  optional with no default, off reads back as null unless the
+  configuration says `false` (`optionalFlag`); sent on a create only when
+  `true`, and on a change as `true` or as `false` to turn it off, never
+  from off to off (null and `false` alike). The two flags are sent apart:
+  a change to one never sends the other. The fake reads it where
+  AutoPilot's sorted order puts it, after `max_reviews_per_day` and before
+  `review_also_reads`, except that the fake still reads `repos` first, as
+  it does for every field. Its proposals' kind, `propose-review-rules`, is
+  one only AutoPilot's service sends: no sender's `kinds` and no `accepts`
+  entry may name it.
 - A sender's `may_send_urgent` lets its tasks be urgent: while AutoPilot's
   limit on running tasks is reached, they start before every queued task
   that isn't, and they don't wait for the day's spend under the daily cap

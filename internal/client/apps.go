@@ -11,8 +11,9 @@ import (
 // work for it themselves, and their GitHub logins. It also holds the app's
 // credential policy, the worker its tasks run in, its automatic reviews, the
 // other repositories and the work tracker projects its reviews also read,
-// its repositories' daily cap on the reviews people ask for from GitHub, and
-// whether its reviews' approvals may go as a code owner user.
+// its repositories' daily cap on the reviews people ask for from GitHub,
+// whether its reviews' approvals may go as a code owner user, and whether
+// AutoPilot may propose rules for its repositories' REVIEW.md.
 type App struct {
 	Name       string   `json:"name"`
 	Repos      []string `json:"repos"`
@@ -55,10 +56,15 @@ type App struct {
 	// AutoPilot otherwise only comments, by an approval AutoPilot's service
 	// posts as a separate code owner user. False when the AutoPilot predates
 	// the field.
-	ApproveAsUser bool   `json:"approve_as_user"`
-	LockVersion   int64  `json:"lock_version"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
+	ApproveAsUser bool `json:"approve_as_user"`
+	// ProposeReviewRules lets AutoPilot open draft pull requests that add a
+	// rule to the REVIEW.md of the app's repositories, from how people
+	// answered its review findings. False when the AutoPilot predates the
+	// field.
+	ProposeReviewRules bool   `json:"propose_review_rules"`
+	LockVersion        int64  `json:"lock_version"`
+	CreatedAt          string `json:"created_at"`
+	UpdatedAt          string `json:"updated_at"`
 }
 
 // AutoEvents are the pull_request actions an app's automatic reviews may
@@ -171,7 +177,7 @@ type WorkerSize struct {
 
 // AppSpec is what a create or a change sends. A nil list is not sent at all;
 // an empty, non-nil list is sent as []. A nil Policy, WorkerImage, Size,
-// MaxReviewsPerDay or ApproveAsUser is not sent either.
+// MaxReviewsPerDay, ApproveAsUser or ProposeReviewRules is not sent either.
 type AppSpec struct {
 	Repos        []string
 	Accepts      []Accept
@@ -204,6 +210,11 @@ type AppSpec struct {
 	// owner user on, false to turn them off. Nil is not sent, so an
 	// AutoPilot that predates the field still takes the app.
 	ApproveAsUser *bool
+	// ProposeReviewRules is sent as it is: true to let AutoPilot propose
+	// rules for the REVIEW.md of the app's repositories, false to stop it.
+	// Nil is not sent, so an AutoPilot that predates the field still takes
+	// the app.
+	ProposeReviewRules *bool
 }
 
 func (s AppSpec) fields() Fields {
@@ -266,6 +277,9 @@ func (s AppSpec) fields() Fields {
 	}
 	if s.ApproveAsUser != nil {
 		f["approve_as_user"] = *s.ApproveAsUser
+	}
+	if s.ProposeReviewRules != nil {
+		f["propose_review_rules"] = *s.ProposeReviewRules
 	}
 	return f
 }
@@ -436,6 +450,9 @@ func (s AppSpec) reflectedIn(app *App) bool {
 		return false
 	}
 	if s.ApproveAsUser != nil && app.ApproveAsUser != *s.ApproveAsUser {
+		return false
+	}
+	if s.ProposeReviewRules != nil && app.ProposeReviewRules != *s.ProposeReviewRules {
 		return false
 	}
 	return true

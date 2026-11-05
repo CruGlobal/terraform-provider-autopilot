@@ -40,22 +40,23 @@ type appResource struct {
 }
 
 type appModel struct {
-	Name             types.String `tfsdk:"name"`
-	Repos            types.Set    `tfsdk:"repos"`
-	Accepts          types.Set    `tfsdk:"accepts"`
-	Developers       types.Set    `tfsdk:"developers"`
-	GitHubLogins     types.Set    `tfsdk:"github_logins"`
-	Credential       types.String `tfsdk:"credential"`
-	WhenSeatsFull    types.String `tfsdk:"when_seats_full"`
-	WorkerImage      types.String `tfsdk:"worker_image"`
-	WorkerCPU        types.Int64  `tfsdk:"worker_cpu"`
-	WorkerMemory     types.Int64  `tfsdk:"worker_memory"`
-	AutoReview       types.Object `tfsdk:"auto_review"`
-	ReviewAlsoReads  types.Set    `tfsdk:"review_also_reads"`
-	WorkItemProjects types.Set    `tfsdk:"work_item_projects"`
-	MaxReviewsPerDay types.Int64  `tfsdk:"max_reviews_per_day"`
-	ApproveAsUser    types.Bool   `tfsdk:"approve_as_user"`
-	LockVersion      types.Int64  `tfsdk:"lock_version"`
+	Name               types.String `tfsdk:"name"`
+	Repos              types.Set    `tfsdk:"repos"`
+	Accepts            types.Set    `tfsdk:"accepts"`
+	Developers         types.Set    `tfsdk:"developers"`
+	GitHubLogins       types.Set    `tfsdk:"github_logins"`
+	Credential         types.String `tfsdk:"credential"`
+	WhenSeatsFull      types.String `tfsdk:"when_seats_full"`
+	WorkerImage        types.String `tfsdk:"worker_image"`
+	WorkerCPU          types.Int64  `tfsdk:"worker_cpu"`
+	WorkerMemory       types.Int64  `tfsdk:"worker_memory"`
+	AutoReview         types.Object `tfsdk:"auto_review"`
+	ReviewAlsoReads    types.Set    `tfsdk:"review_also_reads"`
+	WorkItemProjects   types.Set    `tfsdk:"work_item_projects"`
+	MaxReviewsPerDay   types.Int64  `tfsdk:"max_reviews_per_day"`
+	ApproveAsUser      types.Bool   `tfsdk:"approve_as_user"`
+	ProposeReviewRules types.Bool   `tfsdk:"propose_review_rules"`
+	LockVersion        types.Int64  `tfsdk:"lock_version"`
 }
 
 type autoReviewModel struct {
@@ -120,21 +121,22 @@ var gitHubLoginObjectType = types.ObjectType{AttrTypes: gitHubLoginAttrTypes}
 
 // appAPIFields maps the API's field names to this resource's attributes.
 var appAPIFields = map[string]string{
-	"name":                "name",
-	"repos":               "repos",
-	"accepts":             "accepts",
-	"developers":          "developers",
-	"github_logins":       "github_logins",
-	"credential":          "credential",
-	"when_seats_full":     "when_seats_full",
-	"worker_image":        "worker_image",
-	"worker_cpu":          "worker_cpu",
-	"worker_memory":       "worker_memory",
-	"auto_review":         "auto_review",
-	"review_also_reads":   "review_also_reads",
-	"work_item_projects":  "work_item_projects",
-	"max_reviews_per_day": "max_reviews_per_day",
-	"approve_as_user":     "approve_as_user",
+	"name":                 "name",
+	"repos":                "repos",
+	"accepts":              "accepts",
+	"developers":           "developers",
+	"github_logins":        "github_logins",
+	"credential":           "credential",
+	"when_seats_full":      "when_seats_full",
+	"worker_image":         "worker_image",
+	"worker_cpu":           "worker_cpu",
+	"worker_memory":        "worker_memory",
+	"auto_review":          "auto_review",
+	"review_also_reads":    "review_also_reads",
+	"work_item_projects":   "work_item_projects",
+	"max_reviews_per_day":  "max_reviews_per_day",
+	"approve_as_user":      "approve_as_user",
+	"propose_review_rules": "propose_review_rules",
 }
 
 // appToModel maps an app. Every list is optional and left out of the
@@ -142,26 +144,27 @@ var appAPIFields = map[string]string{
 // answer stays null where prior (the plan, or the state) was null. The
 // credential policy, the worker image, the worker size and the repositories'
 // daily cap are null when AutoPilot answers null, as it does for an app
-// without them. approve_as_user is optional with no default, so off is null
-// unless prior set it to false.
+// without them. approve_as_user and propose_review_rules are optional with
+// no default, so off is null unless prior set it to false.
 func appToModel(a *client.App, prior appModel) appModel {
 	return appModel{
-		Name:             types.StringValue(a.Name),
-		Repos:            setOrNull(a.Repos, prior.Repos),
-		Accepts:          acceptsToSet(a.Accepts, prior.Accepts),
-		Developers:       setOrNull(a.Developers, prior.Developers),
-		GitHubLogins:     gitHubLoginsToSet(a.GitHubLogins, prior.GitHubLogins),
-		Credential:       types.StringPointerValue(a.Credential),
-		WhenSeatsFull:    types.StringPointerValue(a.WhenSeatsFull),
-		WorkerImage:      types.StringPointerValue(a.WorkerImage),
-		WorkerCPU:        types.Int64PointerValue(a.WorkerCPU),
-		WorkerMemory:     types.Int64PointerValue(a.WorkerMemory),
-		AutoReview:       autoReviewToObject(a.AutoReview),
-		ReviewAlsoReads:  newerListToSet(a.ReviewAlsoReads, prior.ReviewAlsoReads),
-		WorkItemProjects: newerListToSet(a.WorkItemProjects, prior.WorkItemProjects),
-		MaxReviewsPerDay: types.Int64PointerValue(a.MaxReviewsPerDay),
-		ApproveAsUser:    optionalFlag(a.ApproveAsUser, isFalse(prior.ApproveAsUser)),
-		LockVersion:      types.Int64Value(a.LockVersion),
+		Name:               types.StringValue(a.Name),
+		Repos:              setOrNull(a.Repos, prior.Repos),
+		Accepts:            acceptsToSet(a.Accepts, prior.Accepts),
+		Developers:         setOrNull(a.Developers, prior.Developers),
+		GitHubLogins:       gitHubLoginsToSet(a.GitHubLogins, prior.GitHubLogins),
+		Credential:         types.StringPointerValue(a.Credential),
+		WhenSeatsFull:      types.StringPointerValue(a.WhenSeatsFull),
+		WorkerImage:        types.StringPointerValue(a.WorkerImage),
+		WorkerCPU:          types.Int64PointerValue(a.WorkerCPU),
+		WorkerMemory:       types.Int64PointerValue(a.WorkerMemory),
+		AutoReview:         autoReviewToObject(a.AutoReview),
+		ReviewAlsoReads:    newerListToSet(a.ReviewAlsoReads, prior.ReviewAlsoReads),
+		WorkItemProjects:   newerListToSet(a.WorkItemProjects, prior.WorkItemProjects),
+		MaxReviewsPerDay:   types.Int64PointerValue(a.MaxReviewsPerDay),
+		ApproveAsUser:      optionalFlag(a.ApproveAsUser, isFalse(prior.ApproveAsUser)),
+		ProposeReviewRules: optionalFlag(a.ProposeReviewRules, isFalse(prior.ProposeReviewRules)),
+		LockVersion:        types.Int64Value(a.LockVersion),
 	}
 }
 
@@ -286,6 +289,19 @@ func approveAsUserFromModel(m appModel, diags *diag.Diagnostics) *bool {
 		return nil
 	}
 	on := m.ApproveAsUser.ValueBool()
+	return &on
+}
+
+// proposeReviewRulesFromModel is whether the plan lets AutoPilot propose
+// rules for the REVIEW.md of the app's repositories, as the client sends
+// it: false for off, null included. A value still unknown at apply is an
+// error, never read as off.
+func proposeReviewRulesFromModel(m appModel, diags *diag.Diagnostics) *bool {
+	if m.ProposeReviewRules.IsUnknown() {
+		unknownAtApply(diags, "propose_review_rules")
+		return nil
+	}
+	on := m.ProposeReviewRules.ValueBool()
 	return &on
 }
 
@@ -484,6 +500,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"repositories.\n\n" +
 			"`approve_as_user` lets the app's reviews approve, as a separate GitHub user that is a code owner, on a " +
 			"repository where AutoPilot otherwise only comments.\n\n" +
+			"`propose_review_rules` lets AutoPilot open draft pull requests that add a rule to the `REVIEW.md` of " +
+			"the app's repositories, from how people answered its review findings, for a person to merge or " +
+			"close.\n\n" +
 			"An app with this name that already exists is not taken over, even when its values match: the create " +
 			"fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a " +
 			"gateway's 502, say) before an identical app answered: that attempt may have made the app, and the " +
@@ -528,7 +547,8 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 						},
 						"kinds": schema.SetAttribute{
 							MarkdownDescription: "The kinds of task accepted from that sender, such as `implement-work-item` " +
-								"or `review-pr`. At least one.",
+								"or `review-pr`. At least one. Never `propose-review-rules`, which only AutoPilot's service sends " +
+								"and which needs no acceptance (see `propose_review_rules`).",
 							ElementType: types.StringType,
 							Required:    true,
 							Validators: []validator.Set{
@@ -946,6 +966,29 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					"configuration until AutoPilot is rolled forward.",
 				Optional: true,
 			},
+			"propose_review_rules": schema.BoolAttribute{
+				MarkdownDescription: "Whether AutoPilot may propose rules for the `REVIEW.md` of this app's " +
+					"repositories, from how people answered its review findings. Once a week, where people dismissed, " +
+					"or acted on, 75% or more of 3 or more findings of one kind in one top folder of a repository, from " +
+					"2 or more pull requests, AutoPilot opens a draft pull request that adds one rule to that " +
+					"repository's root `REVIEW.md`, for a person to merge or close. AutoPilot never merges it, and never " +
+					"applies a rule itself. Security and correctness findings are never proposed as a \"Don't flag\" " +
+					"rule, and a rule that was merged, or closed unmerged, is never proposed again. It does nothing " +
+					"alone: it works only for a repository that AutoPilot's own service settings list too, and never on " +
+					"a repository where AutoPilot otherwise only comments, since a proposal pushes a branch. The proposals " +
+					"run as the app's own service identity, `review-rules:<name>`, never a person; they need no " +
+					"`accepts` entry and no developer, and are billed to the app. They run only on one of the " +
+					"organization's Claude seats, whatever `credential` says, and a proposal waits at most a day for " +
+					"one, so while AutoPilot uses no seats it proposes nothing. Off unless set: leaving it out is the " +
+					"same as `false`. Turning it off refuses or stops a proposal still queued " +
+					"or running; a draft already open stays open for a person to close. Turning it on needs an " +
+					"AutoPilot that knows the field; an older one refuses it with a 422. Off, left out or `false`, it is " +
+					"never sent, except as `false` to turn it off. An AutoPilot rolled back past the field ignores it, so " +
+					"it proposes nothing, and refuses every write that sends it, but keeps it. Meanwhile the provider " +
+					"reads the app as off, so a configuration that turns it on plans a change on every run and its " +
+					"applies fail: take it out of the configuration until AutoPilot is rolled forward.",
+				Optional: true,
+			},
 			"lock_version": schema.Int64Attribute{
 				MarkdownDescription: "The record's version, which AutoPilot raises on every change. Sent as `If-Match` " +
 					"on updates and deletes.",
@@ -1230,6 +1273,10 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 	if plan.ApproveAsUser.IsUnknown() || isTrue(plan.ApproveAsUser) {
 		spec.ApproveAsUser = approveAsUserFromModel(plan, &resp.Diagnostics)
 	}
+	// The same goes for proposals of review rules.
+	if plan.ProposeReviewRules.IsUnknown() || isTrue(plan.ProposeReviewRules) {
+		spec.ProposeReviewRules = proposeReviewRulesFromModel(plan, &resp.Diagnostics)
+	}
 	if !plan.Credential.IsNull() {
 		spec.Policy = policyFromModel(plan, &resp.Diagnostics)
 	}
@@ -1306,7 +1353,8 @@ func (r *appResource) Read(ctx context.Context, req resource.ReadRequest, resp *
 // sent as [], so AutoPilot empties it as the plan says; a credential policy
 // removed is sent as credential null, which takes it away, and so are a
 // worker image, a worker size, automatic reviews and the repositories' daily
-// cap removed. approve_as_user removed is sent as false.
+// cap removed. approve_as_user and propose_review_rules removed are sent as
+// false.
 func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, state appModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -1380,6 +1428,10 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 	// that predates the field.
 	if plan.ApproveAsUser.IsUnknown() || isTrue(plan.ApproveAsUser) != isTrue(state.ApproveAsUser) {
 		spec.ApproveAsUser = approveAsUserFromModel(plan, &resp.Diagnostics)
+	}
+	// The same goes for proposals of review rules.
+	if plan.ProposeReviewRules.IsUnknown() || isTrue(plan.ProposeReviewRules) != isTrue(state.ProposeReviewRules) {
+		spec.ProposeReviewRules = proposeReviewRulesFromModel(plan, &resp.Diagnostics)
 	}
 	if resp.Diagnostics.HasError() {
 		return
@@ -1460,13 +1512,14 @@ func (r *appResource) ImportState(ctx context.Context, req resource.ImportStateR
 		return
 	}
 	state := appToModel(a, appModel{
-		Repos:            types.SetNull(types.StringType),
-		Accepts:          types.SetNull(acceptObjectType),
-		Developers:       types.SetNull(types.StringType),
-		GitHubLogins:     types.SetNull(gitHubLoginObjectType),
-		ReviewAlsoReads:  types.SetNull(types.StringType),
-		WorkItemProjects: types.SetNull(types.StringType),
-		ApproveAsUser:    types.BoolNull(),
+		Repos:              types.SetNull(types.StringType),
+		Accepts:            types.SetNull(acceptObjectType),
+		Developers:         types.SetNull(types.StringType),
+		GitHubLogins:       types.SetNull(gitHubLoginObjectType),
+		ReviewAlsoReads:    types.SetNull(types.StringType),
+		WorkItemProjects:   types.SetNull(types.StringType),
+		ApproveAsUser:      types.BoolNull(),
+		ProposeReviewRules: types.BoolNull(),
 	})
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
