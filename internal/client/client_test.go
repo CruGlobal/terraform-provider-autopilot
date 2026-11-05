@@ -1509,6 +1509,92 @@ func TestGetApp_ApproveAsUser(t *testing.T) {
 	}
 }
 
+// Proposals of review rules are sent as set, false included, and not at all
+// when nil, so an AutoPilot that predates the field still takes the app.
+func TestUpdateApp_SendsProposeReviewRules(t *testing.T) {
+	var bodies []string
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 2})
+	}))
+	ctx := context.Background()
+	flag := func(b bool) *bool { return &b }
+	for _, spec := range []AppSpec{
+		{},
+		{ProposeReviewRules: flag(true)},
+		{ProposeReviewRules: flag(false)},
+	} {
+		if _, err := c.UpdateApp(ctx, "billing", spec, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := c.CreateApp(ctx, "billing", AppSpec{ProposeReviewRules: flag(true)}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		`{}`,
+		`{"propose_review_rules":true}`,
+		`{"propose_review_rules":false}`,
+		`{"name":"billing","propose_review_rules":true}`,
+	}
+	for i := range want {
+		if bodies[i] != want[i] {
+			t.Errorf("body %d = %s\nwant      %s", i, bodies[i], want[i])
+		}
+	}
+}
+
+// An app read back holds a change's proposals of review rules only when it
+// matches.
+func TestAppSpec_ProposeReviewRulesReflectedIn(t *testing.T) {
+	flag := func(b bool) *bool { return &b }
+	on := &App{ProposeReviewRules: true}
+	cases := []struct {
+		spec AppSpec
+		app  *App
+		want bool
+	}{
+		{AppSpec{ProposeReviewRules: flag(true)}, on, true},
+		{AppSpec{ProposeReviewRules: flag(false)}, on, false},
+		{AppSpec{ProposeReviewRules: flag(false)}, &App{}, true},
+		{AppSpec{ProposeReviewRules: flag(true)}, &App{}, false},
+		// The two flags are told apart.
+		{AppSpec{ProposeReviewRules: flag(true)}, &App{ApproveAsUser: true}, false},
+		{AppSpec{ApproveAsUser: flag(true)}, on, false},
+		{AppSpec{}, on, true},
+	}
+	for i, c := range cases {
+		if got := c.spec.reflectedIn(c.app); got != c.want {
+			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// An answer without propose_review_rules, from an AutoPilot that predates
+// it, reads as off; one with it reads as it is.
+func TestGetApp_ProposeReviewRules(t *testing.T) {
+	for i, a := range []struct {
+		answer map[string]any
+		want   bool
+	}{
+		{map[string]any{"name": "billing", "lock_version": 1}, false},
+		{map[string]any{"name": "billing", "lock_version": 1, "propose_review_rules": false}, false},
+		{map[string]any{"name": "billing", "lock_version": 1, "propose_review_rules": true}, true},
+	} {
+		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRecord(w, http.StatusOK, a.answer)
+		}))
+		app, err := c.GetApp(context.Background(), "billing")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if app.ProposeReviewRules != a.want {
+			t.Errorf("answer %d: propose_review_rules = %v, want %v", i, app.ProposeReviewRules, a.want)
+		}
+	}
+}
+
 // A sender's right to send urgent tasks is sent as set, false included, and
 // not at all when nil, so an AutoPilot that predates the field still takes
 // the sender.

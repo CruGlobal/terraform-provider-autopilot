@@ -5322,3 +5322,509 @@ func TestUnknownApproveAsUserIsAnError(t *testing.T) {
 		t.Errorf("null approve_as_user gave %v, %v; it is off", got, diags)
 	}
 }
+
+// Proposals of review rules are turned on, off and taken out: sent as true
+// to turn them on and as false to turn them off, and never from off to off,
+// false and left out alike. The plan after each shows nothing.
+func TestApp_proposeReviewRules(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	empty := resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}
+	update := resource.ConfigPlanChecks{
+		PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+	}
+	holds := func(want bool) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			a, err := env.apiClient(t).GetApp(context.Background(), name)
+			if err != nil {
+				return err
+			}
+			if a.ProposeReviewRules != want {
+				return fmt.Errorf("AutoPilot holds propose_review_rules %v, want %v", a.ProposeReviewRules, want)
+			}
+			return nil
+		}
+	}
+	// patches checks, on the fake, how many changes were sent so far.
+	patches := func(want int) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			if env.live() {
+				return nil
+			}
+			if got := appPatches(env, name); got != want {
+				return fmt.Errorf("%d changes were sent, want %d", got, want)
+			}
+			return nil
+		}
+	}
+	on, off := appConfig(env, name, "  propose_review_rules = true"), appConfig(env, name, "  propose_review_rules = false")
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, ""),
+				Check:  resource.ComposeAggregateTestCheckFunc(resource.TestCheckNoResourceAttr(appRes, "propose_review_rules"), holds(false)),
+			},
+			{
+				Config:           on,
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "propose_review_rules", "true"),
+					lastAppPatch(t, env, name, map[string]any{"propose_review_rules": true}),
+					holds(true),
+				),
+			},
+			{Config: on, ConfigPlanChecks: empty},
+			{
+				Config:           off,
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "propose_review_rules", "false"),
+					lastAppPatch(t, env, name, map[string]any{"propose_review_rules": false}),
+					patches(2),
+					holds(false),
+				),
+			},
+			{Config: off, ConfigPlanChecks: empty},
+			{
+				// From false to left out is off to off: only the state changes.
+				Config: appConfig(env, name, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "propose_review_rules"),
+					patches(2),
+					holds(false),
+				),
+			},
+			{Config: on, Check: resource.ComposeAggregateTestCheckFunc(patches(3), holds(true))},
+			{
+				// Taken out, it is sent as false.
+				Config: appConfig(env, name, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "propose_review_rules"),
+					lastAppPatch(t, env, name, map[string]any{"propose_review_rules": false}),
+					patches(4),
+					holds(false),
+				),
+			},
+			{Config: appConfig(env, name, ""), ConfigPlanChecks: empty},
+		},
+	})
+}
+
+// propose_review_rules and approve_as_user are two flags: turning one on or
+// off sends only that one, and leaves the other as it is.
+func TestApp_proposeReviewRulesApartFromApproveAsUser(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	config := func(asUser, rules bool) string {
+		return appConfig(env, name, fmt.Sprintf("  approve_as_user      = %t\n  propose_review_rules = %t", asUser, rules))
+	}
+	holds := func(asUser, rules bool) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			if v, _ := env.fake.App(name); v.ApproveAsUser != asUser || v.ProposeReviewRules != rules {
+				return fmt.Errorf("AutoPilot holds approve_as_user %v and propose_review_rules %v, want %v and %v",
+					v.ApproveAsUser, v.ProposeReviewRules, asUser, rules)
+			}
+			return nil
+		}
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config(true, false), Check: holds(true, false)},
+			{
+				Config: config(true, true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, name, map[string]any{"propose_review_rules": true}),
+					holds(true, true),
+				),
+			},
+			{
+				Config: config(false, true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, name, map[string]any{"approve_as_user": false}),
+					holds(false, true),
+				),
+			},
+			{
+				Config: config(true, false),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, name, map[string]any{"approve_as_user": true, "propose_review_rules": false}),
+					holds(true, false),
+				),
+			},
+			{
+				Config: config(true, false),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A create sends propose_review_rules only when it is true, and a change to
+// another argument leaves it out, so the app keeps it.
+func TestApp_proposeReviewRulesSentOnlyWhenOn(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	off, on := randName(), randName()
+	created := func(app string) map[string]any {
+		for _, r := range env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps") {
+			if body := requestBody(t, r); body["name"] == app {
+				return body
+			}
+		}
+		return nil
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, off, "  propose_review_rules = false"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "propose_review_rules", "false"),
+					func(*terraform.State) error {
+						if body := created(off); body == nil || body["propose_review_rules"] != nil {
+							return fmt.Errorf("the create sent %v", body)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: appConfig(env, off, "  propose_review_rules = false"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, on, "  propose_review_rules = true"),
+				Check: func(*terraform.State) error {
+					if body := created(on); body == nil || body["propose_review_rules"] != true {
+						return fmt.Errorf("the create sent %v", body)
+					}
+					return nil
+				},
+			},
+			{
+				Config: appConfig(env, on, "  propose_review_rules = true\n  developers = [\"someone@example.com\"]"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, on, map[string]any{"developers": []any{"someone@example.com"}}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(on); !v.ProposeReviewRules {
+							return fmt.Errorf("AutoPilot turned it off")
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// propose_review_rules changed outside Terraform shows as a change, and the
+// apply puts it back as the configuration says: off, left out or false, is
+// sent as false.
+func TestApp_proposeReviewRulesChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	for _, c := range []struct {
+		body    string
+		outside bool
+	}{
+		{"  propose_review_rules = true", false},
+		{"  propose_review_rules = false", true},
+		{"", true},
+	} {
+		name := randName()
+		config := appConfig(env, name, c.body)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() {
+						env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) { v.ProposeReviewRules = c.outside })
+					},
+					Config: config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: resource.ComposeAggregateTestCheckFunc(
+						lastAppPatch(t, env, name, map[string]any{"propose_review_rules": !c.outside}),
+						func(*terraform.State) error {
+							if v, _ := env.fake.App(name); v.ProposeReviewRules == c.outside {
+								return fmt.Errorf("propose_review_rules = %v, not put back", v.ProposeReviewRules)
+							}
+							return nil
+						},
+					),
+				},
+			},
+		})
+	}
+}
+
+// An imported app's propose_review_rules is read into state, so a
+// configuration that sets the same plans nothing.
+func TestApp_importWithProposeReviewRules(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{Name: name, ProposeReviewRules: true})
+	config := appConfig(env, name, "  propose_review_rules = true")
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config, ResourceName: appRes, ImportState: true, ImportStateId: name, ImportStatePersist: true},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+
+	// An import can't tell false from left out, so a configuration that says
+	// false plans one update after it, which only records the false: it
+	// sends nothing, and the plan after is empty.
+	off := randName()
+	env.fake.SeedApp(autopilottest.AppView{Name: off})
+	offConfig := appConfig(env, off, "  propose_review_rules = false")
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: offConfig, ResourceName: appRes, ImportState: true, ImportStateId: off, ImportStatePersist: true},
+			{
+				Config: offConfig,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "propose_review_rules", "false"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "1"),
+					func(*terraform.State) error {
+						if n := appPatches(env, off); n != 0 {
+							return fmt.Errorf("%d changes were sent, want none", n)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: offConfig,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A create for a name AutoPilot already holds is told apart by
+// propose_review_rules too, since AutoPilot compares it with the other
+// fields: an app that has it on differs from a configuration that leaves it
+// out, and is the same as one that turns it on (which is still not taken
+// over, as no app is).
+func TestApp_proposeReviewRulesDecidesWhetherARecordIsTheSame(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{Name: name, ProposeReviewRules: true})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:      appConfig(env, name, ""),
+				ExpectError: expectErr("An app with this name already exists ... values that differ from this configuration"),
+			},
+			{
+				Config:      appConfig(env, name, "  propose_review_rules = true"),
+				ExpectError: expectErr("An app with this name already exists ... exactly these values"),
+			},
+		},
+	})
+	if v, _ := env.fake.App(name); v.LockVersion != 1 || !v.ProposeReviewRules {
+		t.Errorf("the existing app was changed: lock_version %d, propose_review_rules %v", v.LockVersion, v.ProposeReviewRules)
+	}
+}
+
+// A create and a change whose answers are lost are sent again, with
+// propose_review_rules: AutoPilot answers the repeat of the create with the
+// app it made, and the repeat one version behind of the change with 200, so
+// neither is taken for someone else's.
+func TestApp_proposeReviewRulesLostAnswers(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	path := "/v1/admin/apps/" + name
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPost, "/v1/admin/apps") },
+				Config:    appConfig(env, name, "  propose_review_rules = true"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "propose_review_rules", "true"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "1"),
+					func(*terraform.State) error {
+						posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")
+						if len(posts) != 2 || posts[0].Status != http.StatusCreated || posts[1].Status != http.StatusOK {
+							return fmt.Errorf("want a 201 whose answer was lost, then a 200 for the same create; got %d creates", len(posts))
+						}
+						for _, p := range posts {
+							if requestBody(t, p)["propose_review_rules"] != true {
+								return fmt.Errorf("a create left out propose_review_rules")
+							}
+						}
+						return nil
+					},
+				),
+			},
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPatch, path) },
+				Config:    appConfig(env, name, "  propose_review_rules = false"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "propose_review_rules", "false"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					lastAppPatch(t, env, name, map[string]any{"propose_review_rules": false}),
+					func(*terraform.State) error {
+						patches := env.fake.RequestsMatching(http.MethodPatch, path)
+						if len(patches) != 2 || patches[1].Status != http.StatusOK || patches[1].Header.Get("If-Match") != `"1"` {
+							return fmt.Errorf("want a change whose answer was lost, then the same change answered 200; got %d changes", len(patches))
+						}
+						if v, _ := env.fake.App(name); v.ProposeReviewRules {
+							return fmt.Errorf("AutoPilot still holds propose_review_rules")
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// propose_review_rules takes only true or false.
+func TestApp_proposeReviewRulesPlanTimeValidation(t *testing.T) {
+	env := newTestEnv(t)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			Config:      appConfig(env, randName(), `  propose_review_rules = "sometimes"`),
+			PlanOnly:    true,
+			ExpectError: expectErr("Inappropriate value for attribute \"propose_review_rules\""),
+		}},
+	})
+}
+
+// propose_review_rules somehow still unknown at apply is an error, never
+// sent as off; null is off.
+func TestUnknownProposeReviewRulesIsAnError(t *testing.T) {
+	var diags diag.Diagnostics
+	if got := proposeReviewRulesFromModel(appModel{ProposeReviewRules: types.BoolUnknown()}, &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown propose_review_rules gave %v, %v", got, diags)
+	}
+	diags = nil
+	if got := proposeReviewRulesFromModel(appModel{ProposeReviewRules: types.BoolNull()}, &diags); got == nil || *got || diags.HasError() {
+		t.Errorf("null propose_review_rules gave %v, %v; it is off", got, diags)
+	}
+	if got := proposeReviewRulesFromModel(appModel{ProposeReviewRules: types.BoolValue(true)}, &diags); got == nil || !*got || diags.HasError() {
+		t.Errorf("true propose_review_rules gave %v, %v", got, diags)
+	}
+}
+
+// An AutoPilot that predates propose_review_rules takes an app that leaves
+// it out or sets it to false, and plans nothing after. Rolled back past it,
+// AutoPilot reads as the app having it off: a configuration that still
+// turns it on is refused, one that takes it out applies other changes and
+// plans nothing, and once AutoPilot is rolled forward what it kept shows as
+// a change and is taken away.
+func TestApp_proposeReviewRulesWithAnOlderAutoPilot(t *testing.T) {
+	base := newTestEnv(t)
+	base.requireFake(t)
+	env, older := olderAutoPilot(t, base, "propose_review_rules")
+
+	older.Store(true)
+	for _, body := range []string{"", "  propose_review_rules = false"} {
+		config := appConfig(env, randName(), body)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{Config: config, PlanOnly: true},
+			},
+		})
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			// A create that turns it on is refused before anything is made.
+			Config:      appConfig(env, randName(), "  propose_review_rules = true"),
+			ExpectError: expectErr("propose_review_rules ... doesn't know this field"),
+		}},
+	})
+
+	older.Store(false)
+	name := randName()
+	config := func(extra, dev string) string {
+		return appConfig(env, name, fmt.Sprintf("  developers = %s\n%s", hcl(dev), extra))
+	}
+	alice, bob := randLogin(), randLogin()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config("  propose_review_rules = true", alice)},
+			{
+				// Rolled back, a configuration that turns it on is refused.
+				PreConfig:   func() { older.Store(true) },
+				Config:      config("  propose_review_rules = true", alice),
+				ExpectError: expectErr("propose_review_rules ... doesn't know this field"),
+			},
+			{
+				// Taken out, the app reads as having it off, so nothing shows
+				// as a change.
+				Config: config("", alice),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Other changes apply, and nothing is sent for it.
+				Config: config("", bob),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "propose_review_rules"),
+					lastAppPatch(t, env, name, map[string]any{"developers": []any{bob}}),
+				),
+			},
+			{Config: config("", bob), PlanOnly: true},
+			{
+				// Rolled forward, what AutoPilot kept is taken away.
+				PreConfig: func() { older.Store(false) },
+				Config:    config("", bob),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "propose_review_rules"),
+					lastAppPatch(t, env, name, map[string]any{"propose_review_rules": false}),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(name); v.ProposeReviewRules {
+							return fmt.Errorf("AutoPilot still holds propose_review_rules")
+						}
+						return nil
+					},
+				),
+			},
+			{Config: config("", bob), PlanOnly: true},
+		},
+	})
+}
+
+// A refusal AutoPilot names either of the app's flags in points at its
+// attribute.
+func TestAttributeFor_AppFlags(t *testing.T) {
+	for pointer, want := range map[string]string{
+		"/approve_as_user":      "approve_as_user",
+		"/propose_review_rules": "propose_review_rules",
+	} {
+		if got := attributeFor(pointer, appAPIFields); got != want {
+			t.Errorf("%s: attribute %q, want %q", pointer, got, want)
+		}
+	}
+}
