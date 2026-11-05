@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.9.0...v0.10.0) (2026-11-05)
+
+
+### Added
+
+* **app:** add propose_review_rules ([#28](https://github.com/CruGlobal/terraform-provider-autopilot/issues/28)) ([dc5c86a](https://github.com/CruGlobal/terraform-provider-autopilot/commit/dc5c86ad6cd72fa8f572948c6879a3ad4affda8d))
+
 ## [0.9.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.8.0...v0.9.0) (2026-11-04)
 
 
