@@ -919,6 +919,24 @@ func TestAutoReview_Refused(t *testing.T) {
 		{map[string]any{"max_per_day": 0, "events": "opened"}, "/auto_review/events"},
 		// No event is a wrong field only once every field is read.
 		{map[string]any{"max_per_day": 0, "events": []string{}}, "/auto_review/max_per_day"},
+		{map[string]any{"gate": "yes"}, "/auto_review/gate"},
+		{map[string]any{"gate": nil}, "/auto_review/gate"},
+		{map[string]any{"gate": 1}, "/auto_review/gate"},
+		// The gate needs can_decide, and every event or a workflow.
+		{map[string]any{"gate": true}, "/auto_review/gate"},
+		{map[string]any{"gate": true, "can_decide": false, "events": []string{"opened", "ready_for_review", "synchronize"}}, "/auto_review/gate"},
+		{map[string]any{"gate": true, "can_decide": true}, "/auto_review/gate"},
+		{map[string]any{"gate": true, "can_decide": true, "events": []string{"opened", "synchronize"}}, "/auto_review/gate"},
+		{map[string]any{"gate": true, "can_decide": true, "events": []string{"synchronize"}}, "/auto_review/gate"},
+		// Read in its place, after events and before max_per_day.
+		{map[string]any{"gate": "yes", "max_per_day": 0}, "/auto_review/gate"},
+		{map[string]any{"gate": "yes", "events": "opened"}, "/auto_review/events"},
+		// Checked once every field is read, after the knobs that need
+		// can_decide and before no event.
+		{map[string]any{"gate": true, "max_per_day": 0}, "/auto_review/max_per_day"},
+		{map[string]any{"gate": true, "can_decide_own_pr": true}, "/auto_review/can_decide_own_pr"},
+		{map[string]any{"gate": true, "approve_up_to": "low"}, "/auto_review/approve_up_to"},
+		{map[string]any{"gate": true, "can_decide": true, "events": []string{}}, "/auto_review/gate"},
 	}
 	for _, c := range cases {
 		st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": c.auto})
@@ -944,7 +962,7 @@ func TestAutoReview_Kept(t *testing.T) {
 	expect(t, "every default", st, http.StatusOK, body)
 	want := map[string]any{
 		"events": []any{"opened", "ready_for_review"}, "workflows": []any{}, "max_per_day": float64(50),
-		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil,
+		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil, "gate": false,
 	}
 	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
 		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
@@ -987,6 +1005,81 @@ func TestAutoReview_Kept(t *testing.T) {
 	} {
 		st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", other)
 		expect(t, fmt.Sprintf("create %v", other), st, http.StatusConflict, body)
+	}
+}
+
+// auto_review.gate is false unless sent true, and shown either way; a field
+// of the one setting, a write that leaves it out turns it off; it is on only
+// with can_decide and every event, or a workflow; and a create with it is a
+// retry only with the same. A gate kept from outside a write is on only with
+// can_decide, as AutoPilot reads a stored one.
+func TestAutoReview_Gate(t *testing.T) {
+	s := New(t)
+	every := []string{"synchronize", "ready_for_review", "opened"}
+	const main = "example-org/billing-api/.github/workflows/autopilot-review.yml@refs/heads/main"
+	made := map[string]any{"name": "billing", "auto_review": map[string]any{"can_decide": true, "events": every, "gate": true}}
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", made)
+	expect(t, "create with the gate", st, http.StatusCreated, body)
+	want := map[string]any{
+		"events": []any{"opened", "ready_for_review", "synchronize"}, "workflows": []any{}, "max_per_day": float64(50),
+		"can_decide": true, "can_decide_own_pr": false, "approve_up_to": nil, "gate": true,
+	}
+	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
+		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
+	}
+	if v, _ := s.App("billing"); v.AutoReview == nil || !v.AutoReview.Gate {
+		t.Errorf("auto_review = %+v, want the gate on", v.AutoReview)
+	}
+	// The same create again is a retry; one without the gate isn't.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", made)
+	expect(t, "the same create again", st, http.StatusOK, body)
+	for _, gate := range []any{false, nil} {
+		auto := map[string]any{"can_decide": true, "events": every}
+		if gate != nil {
+			auto["gate"] = gate
+		}
+		st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": auto})
+		expect(t, fmt.Sprintf("a create with gate %v", gate), st, http.StatusConflict, body)
+	}
+	// A change that leaves auto_review out keeps it (and, changing nothing,
+	// keeps lock_version 1).
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"developers": []string{}})
+	expect(t, "a change without it", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.AutoReview == nil || !v.AutoReview.Gate {
+		t.Errorf("a change that leaves auto_review out turned the gate off: %+v", v.AutoReview)
+	}
+	// One that sends auto_review without the gate turns it off.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"auto_review": map[string]any{
+		"can_decide": true, "events": every,
+	}})
+	expect(t, "the gate left out", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.AutoReview == nil || v.AutoReview.Gate || v.LockVersion != 2 {
+		t.Errorf("auto_review = %+v, lock_version %d, want the gate off", v.AutoReview, v.LockVersion)
+	}
+	if auto, _ := body["auto_review"].(map[string]any); auto["gate"] != false {
+		t.Errorf("auto_review = %v, want gate false shown", body["auto_review"])
+	}
+	// With a workflow, any events will do, none included.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"auto_review": map[string]any{
+		"can_decide": true, "events": []string{}, "workflows": []string{main}, "gate": true,
+	}})
+	expect(t, "the gate beside a workflow", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.AutoReview == nil || !v.AutoReview.Gate || len(v.AutoReview.Events) != 0 {
+		t.Errorf("auto_review = %+v, want the gate on beside the workflow", v.AutoReview)
+	}
+	// A workflow still needs events sent, gate or not.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"auto_review": map[string]any{
+		"can_decide": true, "workflows": []string{main}, "gate": true,
+	}})
+	expect(t, "a workflow without events", st, http.StatusUnprocessableEntity, body)
+	if body["field"] != "/auto_review/events" {
+		t.Errorf("field = %v, want /auto_review/events", body["field"])
+	}
+
+	// Kept from outside a write, the gate is on only with can_decide.
+	s.SeedApp(AppView{Name: "ledger", AutoReview: &AutoReview{Events: every, MaxPerDay: 50, Gate: true}})
+	if v, _ := s.App("ledger"); v.AutoReview == nil || v.AutoReview.Gate {
+		t.Errorf("auto_review = %+v, want the gate off without can_decide", v.AutoReview)
 	}
 }
 
@@ -1083,7 +1176,7 @@ func TestAutoReview_WorkflowsKept(t *testing.T) {
 	expect(t, "workflows alone", st, http.StatusCreated, body)
 	want := map[string]any{
 		"events": []any{}, "workflows": []any{shared, other, main}, "max_per_day": float64(50),
-		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil,
+		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil, "gate": false,
 	}
 	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
 		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))

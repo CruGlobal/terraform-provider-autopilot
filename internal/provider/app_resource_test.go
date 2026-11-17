@@ -2777,6 +2777,7 @@ func TestApp_autoReviewLifecycle(t *testing.T) {
 					resource.TestCheckResourceAttr(appRes, "auto_review.can_decide", "false"),
 					resource.TestCheckResourceAttr(appRes, "auto_review.can_decide_own_pr", "false"),
 					resource.TestCheckNoResourceAttr(appRes, "auto_review.approve_up_to"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.gate", "false"),
 					func(*terraform.State) error {
 						return env.checkAutoReview(t, name, &client.AutoReview{
 							Events: []string{"opened", "ready_for_review"}, MaxPerDay: 50,
@@ -2854,7 +2855,7 @@ func (env *testEnv) checkAutoReview(t *testing.T, name string, want *client.Auto
 	}
 	if !slices.Equal(got.Events, want.Events) || !slices.Equal(got.Workflows, want.Workflows) ||
 		got.MaxPerDay != want.MaxPerDay || got.CanDecide != want.CanDecide ||
-		got.CanDecideOwnPR != want.CanDecideOwnPR || got.ApproveUpTo != want.ApproveUpTo {
+		got.CanDecideOwnPR != want.CanDecideOwnPR || got.ApproveUpTo != want.ApproveUpTo || got.Gate != want.Gate {
 		return fmt.Errorf("auto_review = %+v at AutoPilot, want %+v", *got, *want)
 	}
 	return nil
@@ -3339,7 +3340,7 @@ func TestWorkflowRefValidator(t *testing.T) {
 func autoReviewConfig(events, workflows types.Set) autoReviewModel {
 	return autoReviewModel{
 		Events: events, Workflows: workflows, MaxPerDay: types.Int64Null(), CanDecide: types.BoolNull(),
-		CanDecideOwnPR: types.BoolNull(), ApproveUpTo: types.StringNull(),
+		CanDecideOwnPR: types.BoolNull(), ApproveUpTo: types.StringNull(), Gate: types.BoolNull(),
 	}
 }
 
@@ -3734,6 +3735,528 @@ func TestApp_importWithAutoReviewWorkflows(t *testing.T) {
 					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
 				},
 			},
+		},
+	})
+}
+
+// everyEvent is auto_review's events with every event, as the gate needs
+// without a workflow.
+const everyEvent = `events = ["opened", "ready_for_review", "synchronize"]`
+
+// The gate is off unless set: on, it reads back on and plans nothing; a
+// change to another field keeps it on; false, or left out, turns it off and
+// plans nothing after; beside a workflow it needs no event; and removing
+// auto_review turns everything off.
+func TestApp_autoReviewGateLifecycle(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	main := workflowFile + "@refs/heads/main"
+	every := []string{"opened", "ready_for_review", "synchronize"}
+	config := func(auto string) string { return appConfig(env, name, auto) }
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(`  auto_review = { can_decide = true, ` + everyEvent + ` }`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.gate", "false"),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{Events: every, MaxPerDay: 50, CanDecide: true})
+					},
+				),
+			},
+			{
+				Config: config(`  auto_review = { can_decide = true, gate = true, ` + everyEvent + ` }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.gate", "true"),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{Events: every, MaxPerDay: 50, CanDecide: true, Gate: true})
+					},
+				),
+			},
+			{
+				Config: config(`  auto_review = { can_decide = true, gate = true, ` + everyEvent + ` }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// A change to another field sends the gate too.
+				Config: config(`  auto_review = { can_decide = true, gate = true, max_per_day = 10, ` + everyEvent + ` }`),
+				Check: func(*terraform.State) error {
+					return env.checkAutoReview(t, name, &client.AutoReview{Events: every, MaxPerDay: 10, CanDecide: true, Gate: true})
+				},
+			},
+			{
+				Config: config(`  auto_review = { can_decide = true, gate = false, max_per_day = 10, ` + everyEvent + ` }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.gate", "false"),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{Events: every, MaxPerDay: 10, CanDecide: true})
+					},
+				),
+			},
+			{
+				// Left out is false, its default.
+				Config: config(`  auto_review = { can_decide = true, max_per_day = 10, ` + everyEvent + ` }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Beside a workflow, no event is needed.
+				Config: config(fmt.Sprintf(`  auto_review = { can_decide = true, gate = true, events = [], workflows = %s }`, hcl(main))),
+				Check: func(*terraform.State) error {
+					return env.checkAutoReview(t, name, &client.AutoReview{
+						Events: []string{}, Workflows: []string{main}, MaxPerDay: 50, CanDecide: true, Gate: true,
+					})
+				},
+			},
+			{
+				Config: config(""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "auto_review"),
+					func(*terraform.State) error { return env.checkAutoReview(t, name, nil) },
+				),
+			},
+		},
+	})
+}
+
+// The gate is sent only when on, as true: a create and a change that turn it
+// on send it, a change to another field while it is on sends it again, and
+// one that turns it off leaves it out, never sending false, so an AutoPilot
+// that predates the field still takes an app without it.
+func TestApp_autoReviewGateSent(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	lastBody := func() string {
+		patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)
+		return mustJSON(t, requestBody(t, patches[len(patches)-1]))
+	}
+	const all = `"events":["opened","ready_for_review","synchronize"]`
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, `  auto_review = { can_decide = true, gate = true, `+everyEvent+` }`),
+				Check: func(*terraform.State) error {
+					post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0]
+					want := `{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,` + all + `,"gate":true,"max_per_day":50}`
+					if got := mustJSON(t, requestBody(t, post)["auto_review"]); got != want {
+						return fmt.Errorf("auto_review = %s, want %s", got, want)
+					}
+					return nil
+				},
+			},
+			{
+				Config: appConfig(env, name, `  auto_review = { can_decide = true, gate = true, max_per_day = 5, `+everyEvent+` }`),
+				Check: func(*terraform.State) error {
+					want := `{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,` + all + `,"gate":true,"max_per_day":5}}`
+					if got := lastBody(); got != want {
+						return fmt.Errorf("body = %s, want %s", got, want)
+					}
+					return nil
+				},
+			},
+			{
+				Config: appConfig(env, name, `  auto_review = { can_decide = true, gate = false, max_per_day = 5, `+everyEvent+` }`),
+				Check: func(*terraform.State) error {
+					want := `{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,` + all + `,"max_per_day":5}}`
+					if got := lastBody(); got != want {
+						return fmt.Errorf("body = %s, want %s", got, want)
+					}
+					return nil
+				},
+			},
+			{
+				// With the gate off, a change to another field never sends it.
+				Config: appConfig(env, name, `  auto_review = { can_decide = true, gate = false, max_per_day = 6, `+everyEvent+` }`),
+				Check: func(*terraform.State) error {
+					want := `{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,` + all + `,"max_per_day":6}}`
+					if got := lastBody(); got != want {
+						return fmt.Errorf("body = %s, want %s", got, want)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// The plan refuses a gate AutoPilot refuses, before anything is sent:
+// without can_decide, and without every event or a workflow (events left
+// out are opened and ready_for_review).
+func TestApp_autoReviewGateRefusedAtPlan(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	main := workflowFile + "@refs/heads/main"
+	cases := []struct{ auto, err string }{
+		{`{ gate = true, ` + everyEvent + ` }`, "gate without can_decide"},
+		{`{ gate = true, can_decide = false, ` + everyEvent + ` }`, "gate without can_decide"},
+		{`{ gate = true }`, "gate without can_decide ... gate needs every event"},
+		{`{ gate = true, can_decide = true }`, "gate needs every event"},
+		{`{ gate = true, can_decide = true, events = ["opened", "synchronize"] }`, "gate needs every event"},
+		{`{ gate = true, can_decide = true, events = ["synchronize"] }`, "gate needs every event"},
+		{`{ gate = true, can_decide = true, events = [] }`, "gate needs every event"},
+		{fmt.Sprintf(`{ gate = true, can_decide = true, workflows = %s }`, hcl(main)), "events is required with workflows"},
+		{fmt.Sprintf(`{ gate = true, events = [], workflows = %s }`, hcl(main)), "gate without can_decide"},
+	}
+	for _, c := range cases {
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{
+					Config:      appConfig(env, randName(), "  auto_review = "+c.auto),
+					ExpectError: expectErr(c.err),
+				},
+			},
+		})
+	}
+	if posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps"); len(posts) != 0 {
+		t.Errorf("%d creates were sent", len(posts))
+	}
+}
+
+// The gate's rule waits for a value not known yet, which Terraform checks
+// again at apply: can_decide, the events, one of the events, or the
+// workflows. A workflow not known yet is still a workflow, and a gate off,
+// left out or not known yet needs nothing.
+func TestValidateAutoReviewGate(t *testing.T) {
+	main := workflowFile + "@refs/heads/main"
+	oneUnknown := types.SetValueMust(types.StringType, []attr.Value{types.StringUnknown()})
+	someUnknown := types.SetValueMust(types.StringType, []attr.Value{types.StringValue("opened"), types.StringUnknown()})
+	null := types.SetNull(types.StringType)
+	every := strs("opened", "ready_for_review", "synchronize")
+	cases := []struct {
+		name              string
+		gate, decide      types.Bool
+		events, workflows types.Set
+		refused           []string
+	}{
+		{"on, every event", types.BoolValue(true), types.BoolValue(true), every, null, nil},
+		{"on, a workflow", types.BoolValue(true), types.BoolValue(true), strs(), strs(main), nil},
+		{"on, a workflow and some events", types.BoolValue(true), types.BoolValue(true), strs("opened"), strs(main), nil},
+		{"on, a workflow not known yet", types.BoolValue(true), types.BoolValue(true), strs(), oneUnknown, nil},
+		{"on, workflows not known yet", types.BoolValue(true), types.BoolValue(true), strs(), types.SetUnknown(types.StringType), nil},
+		{"on, events not known yet", types.BoolValue(true), types.BoolValue(true), types.SetUnknown(types.StringType), null, nil},
+		{"on, an event not known yet", types.BoolValue(true), types.BoolValue(true), someUnknown, null, nil},
+		{"on, can_decide not known yet", types.BoolValue(true), types.BoolUnknown(), every, null, nil},
+		{"on, events left out", types.BoolValue(true), types.BoolValue(true), null, null, []string{"gate needs every event"}},
+		{"on, events left out, no workflow", types.BoolValue(true), types.BoolValue(true), null, strs(), []string{"gate needs every event"}},
+		{"on, two events", types.BoolValue(true), types.BoolValue(true), strs("opened", "synchronize"), null, []string{"gate needs every event"}},
+		{"on, no event", types.BoolValue(true), types.BoolValue(true), strs(), null, []string{"gate needs every event"}},
+		{"on, can_decide left out", types.BoolValue(true), types.BoolNull(), every, null, []string{"gate without can_decide"}},
+		{"on, can_decide false", types.BoolValue(true), types.BoolValue(false), every, null, []string{"gate without can_decide"}},
+		{"on, neither", types.BoolValue(true), types.BoolNull(), null, null, []string{"gate without can_decide", "gate needs every event"}},
+		{"off", types.BoolValue(false), types.BoolNull(), null, null, nil},
+		{"left out", types.BoolNull(), types.BoolNull(), null, null, nil},
+		{"not known yet", types.BoolUnknown(), types.BoolNull(), null, null, nil},
+	}
+	for _, c := range cases {
+		m := autoReviewConfig(c.events, c.workflows)
+		m.Gate, m.CanDecide = c.gate, c.decide
+		var resp fwresource.ValidateConfigResponse
+		validateAutoReviewGate(m, &resp)
+		var got []string
+		for _, d := range resp.Diagnostics.Errors() {
+			got = append(got, d.Summary())
+		}
+		if !slices.Equal(got, c.refused) {
+			t.Errorf("%s: refused with %q, want %q", c.name, got, c.refused)
+		}
+	}
+}
+
+// can_decide not known until apply: the plan waits, and the apply checks the
+// gate then, before anything is sent.
+func TestApp_autoReviewGateWithCanDecideNotKnownYet(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	config := func(decide bool) string {
+		return env.providerConfig() + fmt.Sprintf(`
+resource "terraform_data" "decide" {
+  input = %t
+}
+
+resource "autopilot_app" "test" {
+  name        = %q
+  auto_review = { can_decide = terraform_data.decide.output, gate = true, %s }
+}
+`, decide, name, everyEvent)
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.can_decide", "true"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.gate", "true"),
+				),
+			},
+			{
+				Config:      config(false),
+				ExpectError: expectErr("gate without can_decide"),
+			},
+		},
+	})
+	if env.fake != nil {
+		if patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name); len(patches) != 0 {
+			t.Errorf("%d changes were sent", len(patches))
+		}
+	}
+}
+
+// The gate turned on or off outside Terraform shows as a change, and the
+// apply puts it back as the configuration says.
+func TestApp_autoReviewGateChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	cases := []struct {
+		config  string
+		outside bool
+	}{
+		{`  auto_review = { can_decide = true, gate = true, ` + everyEvent + ` }`, false},
+		{`  auto_review = { can_decide = true, ` + everyEvent + ` }`, true},
+	}
+	for _, c := range cases {
+		name := randName()
+		config := appConfig(env, name, c.config)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() {
+						env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) { v.AutoReview.Gate = c.outside })
+					},
+					Config: config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: func(*terraform.State) error {
+						if v, _ := env.fake.App(name); v.AutoReview == nil || v.AutoReview.Gate == c.outside {
+							return fmt.Errorf("auto_review = %+v, not put back", v.AutoReview)
+						}
+						return nil
+					},
+				},
+			},
+		})
+	}
+}
+
+// An imported app's gate is read into state, so a configuration that turns
+// it on plans nothing, and one that leaves it out plans turning it off.
+func TestApp_importWithAutoReviewGate(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{
+		Name: name,
+		AutoReview: &autopilottest.AutoReview{
+			Events: []string{"opened", "ready_for_review", "synchronize"}, MaxPerDay: 50, CanDecide: true, Gate: true,
+		},
+	})
+	same := appConfig(env, name, `  auto_review = { can_decide = true, gate = true, `+everyEvent+` }`)
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             same,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: same,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: appConfig(env, name, `  auto_review = { can_decide = true, `+everyEvent+` }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					if v, _ := env.fake.App(name); v.AutoReview == nil || v.AutoReview.Gate {
+						return fmt.Errorf("auto_review = %+v, want the gate off", v.AutoReview)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// A create for a name AutoPilot already holds is told apart by the gate too,
+// since AutoPilot compares it with the other fields: an app that has it on
+// differs from a configuration that leaves it out, and is the same as one
+// that turns it on (which is still not taken over, as no app is).
+func TestApp_autoReviewGateDecidesWhetherARecordIsTheSame(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{
+		Name: name,
+		AutoReview: &autopilottest.AutoReview{
+			Events: []string{"opened", "ready_for_review", "synchronize"}, MaxPerDay: 50, CanDecide: true, Gate: true,
+		},
+	})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:      appConfig(env, name, `  auto_review = { can_decide = true, `+everyEvent+` }`),
+				ExpectError: expectErr("An app with this name already exists ... values that differ from this configuration"),
+			},
+			{
+				Config:      appConfig(env, name, `  auto_review = { can_decide = true, gate = true, `+everyEvent+` }`),
+				ExpectError: expectErr("An app with this name already exists ... exactly these values"),
+			},
+		},
+	})
+	if v, _ := env.fake.App(name); v.LockVersion != 1 || v.AutoReview == nil || !v.AutoReview.Gate {
+		t.Errorf("the existing app was changed: lock_version %d, auto_review %+v", v.LockVersion, v.AutoReview)
+	}
+}
+
+// A create that turns the gate on, and a change that turns it off, whose
+// answers are lost are sent again and taken as the provider's own.
+func TestApp_autoReviewGateLostAnswers(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	path := "/v1/admin/apps/" + name
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPost, "/v1/admin/apps") },
+				Config:    appConfig(env, name, `  auto_review = { can_decide = true, gate = true, `+everyEvent+` }`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.gate", "true"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "1"),
+					func(*terraform.State) error {
+						posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")
+						if len(posts) != 2 || posts[0].Status != http.StatusCreated || posts[1].Status != http.StatusOK {
+							return fmt.Errorf("want a 201 whose answer was lost, then a 200 for the same create; got %d creates", len(posts))
+						}
+						return nil
+					},
+				),
+			},
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPatch, path) },
+				Config:    appConfig(env, name, `  auto_review = { can_decide = true, `+everyEvent+` }`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.gate", "false"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					func(*terraform.State) error {
+						patches := env.fake.RequestsMatching(http.MethodPatch, path)
+						if len(patches) != 2 || patches[1].Status != http.StatusOK || patches[1].Header.Get("If-Match") != `"1"` {
+							return fmt.Errorf("want a change whose answer was lost, then the same change answered 200; got %d changes", len(patches))
+						}
+						if v, _ := env.fake.App(name); v.AutoReview == nil || v.AutoReview.Gate {
+							return fmt.Errorf("auto_review = %+v, want the gate off", v.AutoReview)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// An AutoPilot that predates the gate takes auto_review that leaves it out
+// or sets it to false, and plans nothing after, since its answer without the
+// field reads as off. Rolled back past it, AutoPilot reads as the gate off:
+// a configuration that still turns it on is refused, one that takes it out
+// applies other changes and plans nothing, and once AutoPilot is rolled
+// forward what it kept shows as a change and is taken away.
+func TestApp_autoReviewGateWithAnOlderAutoPilot(t *testing.T) {
+	base := newTestEnv(t)
+	base.requireFake(t)
+	env, older := olderAutoPilot(t, base, "auto_review/gate")
+
+	older.Store(true)
+	for _, auto := range []string{
+		`  auto_review = { can_decide = true, ` + everyEvent + ` }`,
+		`  auto_review = { can_decide = true, gate = false, ` + everyEvent + ` }`,
+	} {
+		config := appConfig(env, randName(), auto)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{Config: config, PlanOnly: true},
+			},
+		})
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			// A create that turns it on is refused before anything is made.
+			Config:      appConfig(env, randName(), `  auto_review = { can_decide = true, gate = true, `+everyEvent+` }`),
+			ExpectError: expectErr("auto_review ... doesn't know this field"),
+		}},
+	})
+
+	older.Store(false)
+	name := randName()
+	config := func(gate, dev string) string {
+		return appConfig(env, name, fmt.Sprintf("  developers = %s\n  auto_review = { can_decide = true, %s%s }", hcl(dev), gate, everyEvent))
+	}
+	alice, bob := randLogin(), randLogin()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config("gate = true, ", alice)},
+			{
+				// Rolled back, a configuration that turns it on is refused.
+				PreConfig:   func() { older.Store(true) },
+				Config:      config("gate = true, ", alice),
+				ExpectError: expectErr("auto_review ... doesn't know this field"),
+			},
+			{
+				// Taken out, the app reads as having it off, so nothing shows
+				// as a change.
+				Config: config("", alice),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Other changes apply, and nothing is sent for it.
+				Config: config("", bob),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.gate", "false"),
+					lastAppPatch(t, env, name, map[string]any{"developers": []any{bob}}),
+				),
+			},
+			{Config: config("", bob), PlanOnly: true},
+			{
+				// Rolled forward, what AutoPilot kept is taken away.
+				PreConfig: func() { older.Store(false) },
+				Config:    config("", bob),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.gate", "false"),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(name); v.AutoReview == nil || v.AutoReview.Gate {
+							return fmt.Errorf("auto_review = %+v, want the gate off", v.AutoReview)
+						}
+						return nil
+					},
+				),
+			},
+			{Config: config("", bob), PlanOnly: true},
 		},
 	})
 }
@@ -4315,7 +4838,8 @@ func TestApp_reviewAlsoReadsRefusedByAutoPilot(t *testing.T) {
 // is set, plays an AutoPilot that predates fields or was rolled back past
 // them: its answers leave them out, and it refuses a write that sends one as
 // a field it doesn't know. What the fake holds is kept, as such an AutoPilot
-// keeps a stored value.
+// keeps a stored value. A field inside an object is named by its path, as
+// "auto_review/gate".
 func olderAutoPilot(t *testing.T, env *testEnv, fields ...string) (*testEnv, *atomic.Bool) {
 	t.Helper()
 	var older atomic.Bool
@@ -4335,6 +4859,12 @@ func olderAutoPilot(t *testing.T, env *testEnv, fields ...string) (*testEnv, *at
 		var record map[string]any
 		if json.Unmarshal(b, &record) == nil {
 			for _, f := range fields {
+				if parent, child, nested := strings.Cut(f, "/"); nested {
+					if obj, ok := record[parent].(map[string]any); ok {
+						delete(obj, child)
+					}
+					continue
+				}
 				delete(record, f)
 			}
 			if b, err = json.Marshal(record); err != nil {
@@ -4352,7 +4882,13 @@ func olderAutoPilot(t *testing.T, env *testEnv, fields ...string) (*testEnv, *at
 			var body map[string]any
 			if json.Unmarshal(b, &body) == nil {
 				for _, f := range fields {
-					if _, sent := body[f]; sent {
+					held := body
+					key := f
+					if parent, child, nested := strings.Cut(f, "/"); nested {
+						held, _ = body[parent].(map[string]any)
+						key = child
+					}
+					if _, sent := held[key]; sent {
 						w.Header().Set("Content-Type", "application/json")
 						w.WriteHeader(http.StatusUnprocessableEntity)
 						_, _ = w.Write([]byte(`{"error":"invalid_attribute","code":"invalid_attribute",` +

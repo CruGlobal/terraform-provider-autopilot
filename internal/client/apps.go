@@ -75,8 +75,9 @@ var AutoEvents = []string{"opened", "ready_for_review", "synchronize"}
 // requests into the default branch of the app's repositories on its own,
 // with no label, as the app's own service identity, and a GitHub Actions
 // workflow it lists may ask for one. AutoPilot takes it as one setting: a
-// write sends every field (the workflows only when there are some), and a
-// field it leaves out is AutoPilot's default, not what was kept.
+// write sends every field (the workflows only when there are some, and the
+// gate only when it is on), and a field it leaves out is AutoPilot's
+// default, not what was kept.
 type AutoReview struct {
 	// Events are the actions that start one: some of AutoEvents. Empty only
 	// with Workflows.
@@ -99,6 +100,12 @@ type AutoReview struct {
 	// for them to approve it: low, medium or high. Empty means no ceiling,
 	// which is also what AutoPilot's null reads as.
 	ApproveUpTo string `json:"approve_up_to"`
+	// Gate, with CanDecide, gives each head they take a check run of its own,
+	// "AutoPilot review gate", that a ruleset can require: it passes where
+	// the review approves, fails where it asks for changes, and otherwise
+	// waits for a person with write access to approve that head. False when
+	// the AutoPilot predates the field.
+	Gate bool `json:"gate"`
 }
 
 // AutoReviewSetting is a write of an app's automatic reviews: On to turn
@@ -289,11 +296,12 @@ func (s AppSpec) fields() Fields {
 // an accepts entry's flags, the knobs are sent even when off: every
 // AutoPilot that takes auto_review knows those five fields, and the body
 // then says exactly what the plan does, not what AutoPilot's defaults would.
-// The workflows are the one exception: sent sorted and each once, and only
-// when there are some, never as [] or null. AutoPilot's default for them is
-// none, which a write that leaves them out gets, and an AutoPilot that
-// predates them refuses the field, so an app that lists none still works
-// with it.
+// The workflows and the gate are the exceptions: the workflows sent sorted
+// and each once, and only when there are some, never as [] or null, and the
+// gate only when it is on, never as false. AutoPilot's default for each is
+// none or off, which a write that leaves it out gets, and an AutoPilot that
+// predates one refuses the field, so an app that lists no workflow and has
+// no gate still works with it.
 func autoReviewBody(a AutoReview) map[string]any {
 	body := map[string]any{
 		"events":            normalizeEvents(a.Events),
@@ -304,6 +312,9 @@ func autoReviewBody(a AutoReview) map[string]any {
 	}
 	if workflows := sortedUnique(a.Workflows); len(workflows) > 0 {
 		body["workflows"] = workflows
+	}
+	if a.Gate {
+		body["gate"] = true
 	}
 	return body
 }
@@ -342,7 +353,8 @@ func sameAutoReview(x, y *AutoReview) bool {
 	}
 	return slices.Equal(normalizeEvents(x.Events), normalizeEvents(y.Events)) &&
 		slices.Equal(sortedUnique(x.Workflows), sortedUnique(y.Workflows)) && x.MaxPerDay == y.MaxPerDay &&
-		x.CanDecide == y.CanDecide && x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo
+		x.CanDecide == y.CanDecide && x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo &&
+		x.Gate == y.Gate
 }
 
 // Empty reports whether the spec would send nothing.

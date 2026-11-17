@@ -139,10 +139,11 @@ the examples, and the generated docs. Things worth knowing:
   it is a single nested attribute whose fields all have AutoPilot's
   defaults in the schema (`events` `opened` and `ready_for_review`,
   `workflows` none, `max_per_day` 50, the flags false), a change to any
-  field sends every one, and removing it sends `null`. The one exception
-  is `workflows`, sent sorted and each once, and only when it lists some:
-  none is AutoPilot's default, and an AutoPilot that predates the field
-  refuses it, so an app that lists none still works there. `events` is
+  field sends every one, and removing it sends `null`. The exceptions are
+  `gate` (below) and `workflows`, sent sorted and each once, and only when
+  it lists some: none is AutoPilot's default, and an AutoPilot that
+  predates the field refuses it, so an app that lists none still works
+  there. `events` is
   some of `opened`, `ready_for_review` and `synchronize`, kept in that
   order: at least one, unless `workflows` lists one, and set in the
   configuration whenever `workflows` lists one (AutoPilot refuses
@@ -156,6 +157,31 @@ the examples, and the generated docs. Things worth knowing:
   `validateAutoReview` checks the rules that span fields. An app that
   leaves it out sends nothing for it, so an older AutoPilot still takes
   the app.
+- An app's `auto_review.gate` gives each pull request head its automatic
+  reviews take a check run of its own, `AutoPilot review gate`, one a
+  ruleset can require: it passes where the review approves, fails where it
+  asks for changes or its outcome is `fail`, and otherwise waits until
+  someone with write access approves that head. The review's own check
+  run, `AutoPilot review (automatic)`, still ends `neutral`, so the docs
+  say to require only the gate's. The gate fails closed: where a ruleset
+  requires its check, a head without one can't merge, as with the gate off
+  or before it was on. So the docs say to turn the gate on only once
+  AutoPilot has it, then require the check, and to take the check out of
+  the ruleset before turning the gate off.
+  AutoPilot takes `true` or `false` (`null` is refused), shows it in every
+  `auto_review` (`false` when off), keeps it only when on, and takes `true`
+  only with `can_decide` and every event in `events` or a workflow in
+  `workflows`, refused at `/auto_review/gate` after the checks of
+  `can_decide_own_pr` and `approve_up_to` and before the events'. In the
+  schema it is a flag with the default `false`, as `can_decide` is, so an
+  answer of `false`, or one without the field, plans nothing. It is sent
+  only when `true`, never as `false`: a field left out is AutoPilot's
+  default, and an AutoPilot that predates the field refuses it, so an app
+  that leaves it off still works there. `validateAutoReviewGate` checks its
+  rules at plan time, `can_decide` and `events` left out at their
+  defaults. The fake reads it in AutoPilot's sorted order, after `events`
+  and before `max_per_day`, and keeps one set from outside a write only
+  with `can_decide`, as AutoPilot reads a stored one.
 - An app's `review_also_reads` lists other repositories, `owner/name`, that
   the reviews of the app's own repositories also read, read-only. Each is
   checked step for step with AutoPilot's own rule (`validRepo`, in the

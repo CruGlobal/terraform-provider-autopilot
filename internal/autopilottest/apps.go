@@ -266,7 +266,8 @@ func workflowKey(text string) (key string, ok bool) {
 }
 
 // AutoReview is an app's automatic reviews. An empty ApproveUpTo is no
-// ceiling (null), and no Workflows (nil or empty) is none.
+// ceiling (null), and no Workflows (nil or empty) is none. Gate adds a check
+// run of their own that decides, so a ruleset can require it.
 type AutoReview struct {
 	Events         []string
 	Workflows      []string
@@ -274,6 +275,7 @@ type AutoReview struct {
 	CanDecide      bool
 	CanDecideOwnPR bool
 	ApproveUpTo    string
+	Gate           bool
 }
 
 func cloneAutoReview(a *AutoReview) *AutoReview {
@@ -291,7 +293,8 @@ func cloneAutoReview(a *AutoReview) *AutoReview {
 // each once, in its order; the workflows it reads (AutoPilot only leaves out
 // those it can't read; they are also sorted and kept once each here, as any
 // write AutoPilot takes keeps them); none at all with no event and no
-// workflow; and the own pull request's toggle only with can_decide.
+// workflow; and the own pull request's toggle and the gate only with
+// can_decide.
 func storedAutoReview(a *AutoReview) *AutoReview {
 	if a == nil {
 		return nil
@@ -313,6 +316,7 @@ func storedAutoReview(a *AutoReview) *AutoReview {
 		return nil
 	}
 	out.CanDecideOwnPR = a.CanDecide && a.CanDecideOwnPR
+	out.Gate = a.CanDecide && a.Gate
 	return out
 }
 
@@ -326,11 +330,12 @@ func sameAutoReview(x, y *AutoReview) bool {
 		return x == y
 	}
 	return slices.Equal(x.Events, y.Events) && slices.Equal(x.Workflows, y.Workflows) && x.MaxPerDay == y.MaxPerDay &&
-		x.CanDecide == y.CanDecide && x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo
+		x.CanDecide == y.CanDecide && x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo &&
+		x.Gate == y.Gate
 }
 
 // autoReviewJSON is automatic reviews as AutoPilot shows them: every field,
-// or null for none.
+// the gate included when off, or null for none.
 func autoReviewJSON(a *AutoReview) any {
 	if a == nil {
 		return nil
@@ -338,6 +343,7 @@ func autoReviewJSON(a *AutoReview) any {
 	return map[string]any{
 		"events": slices.Clone(a.Events), "workflows": orEmpty(slices.Clone(a.Workflows)), "max_per_day": a.MaxPerDay,
 		"can_decide": a.CanDecide, "can_decide_own_pr": a.CanDecideOwnPR, "approve_up_to": nullable(a.ApproveUpTo),
+		"gate": a.Gate,
 	}
 }
 
@@ -345,15 +351,16 @@ func autoReviewJSON(a *AutoReview) any {
 // object whose fields are read in sorted order, each left out at its
 // default; the events kept once each, in autoEvents' order, and none only
 // beside a workflow, which needs them sent; the workflows as
-// readAutoWorkflows reads them; and can_decide_own_pr and approve_up_to only
-// with can_decide.
+// readAutoWorkflows reads them; can_decide_own_pr and approve_up_to only
+// with can_decide; and the gate only with can_decide and every event, or a
+// workflow, checked in that order before the events.
 func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
 	if string(raw) == "null" {
 		return nil, nil
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
-		return nil, invalid("/auto_review", "is an object with events, workflows, max_per_day, can_decide, can_decide_own_pr and approve_up_to, or null")
+		return nil, invalid("/auto_review", "is an object with events, workflows, max_per_day, can_decide, can_decide_own_pr, approve_up_to and gate, or null")
 	}
 	out := AutoReview{Events: slices.Clone(defaultAutoEvents), Workflows: []string{}, MaxPerDay: defaultAutoPerDay}
 	_, eventsSent := obj["events"]
@@ -410,6 +417,10 @@ func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
 			if out.ApproveUpTo, ref = oneOrNull(obj[k], at, riskLevels); ref != nil {
 				return nil, ref
 			}
+		case "gate":
+			if out.Gate, ref = boolValue(obj[k], at); ref != nil {
+				return nil, ref
+			}
 		default:
 			if !plainKey.MatchString(k) {
 				at = "/auto_review"
@@ -424,6 +435,16 @@ func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
 	}
 	if out.ApproveUpTo != "" && !out.CanDecide {
 		return nil, invalid("/auto_review/approve_up_to", "is set only with can_decide true")
+	}
+	// The gate's check passes only where the review approves, so it needs
+	// reviews that may; and each head needs its check, so it needs a review
+	// of each, at every event, or a workflow that asks.
+	if out.Gate && !out.CanDecide {
+		return nil, invalid("/auto_review/gate", "is true only with can_decide true: its check passes only where the review approves")
+	}
+	if out.Gate && len(out.Workflows) == 0 && !slices.Equal(out.Events, autoEvents) {
+		return nil, invalid("/auto_review/gate",
+			"is true only with every event (opened, ready_for_review and synchronize), or a workflow that asks, so each head gets its check")
 	}
 	if len(out.Events) == 0 && len(out.Workflows) == 0 {
 		return nil, invalid("/auto_review/events", "names at least one event, unless workflows lists a workflow that may ask")
