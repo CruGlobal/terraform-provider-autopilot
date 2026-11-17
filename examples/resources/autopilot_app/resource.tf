@@ -129,3 +129,25 @@ resource "autopilot_app" "infrastructure" {
   # nothing unless the service has that user's token.
   approve_as_user = true
 }
+
+resource "autopilot_app" "payments" {
+  name  = "payments"
+  repos = ["example-org/payments-api"]
+
+  # Make the automatic review a check the repository's ruleset can require:
+  # "AutoPilot review (automatic)", from AutoPilot's GitHub App. It passes
+  # where the review approves, fails where the review's outcome is fail,
+  # and otherwise waits until someone with write access approves the pull
+  # request at that commit. The gate needs can_decide and every event, so
+  # each push gets its own review and its own check. Require the check only
+  # once a pull request shows it, and take it out of the ruleset before
+  # turning the gate off: with the gate off, the check ends neutral, which
+  # a ruleset counts as passing.
+  auto_review = {
+    events     = ["opened", "ready_for_review", "synchronize"]
+    can_decide = true
+    # A pull request rated above low risk waits for a person.
+    approve_up_to = "low"
+    gate          = true
+  }
+}
