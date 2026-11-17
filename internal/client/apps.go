@@ -100,10 +100,11 @@ type AutoReview struct {
 	// for them to approve it: low, medium or high. Empty means no ceiling,
 	// which is also what AutoPilot's null reads as.
 	ApproveUpTo string `json:"approve_up_to"`
-	// Gate, with CanDecide, makes their check run one a ruleset can require:
-	// it passes where the review approves, fails where it asks for changes,
-	// and otherwise waits for a person with write access to approve that
-	// head. False when the AutoPilot predates the field.
+	// Gate, with CanDecide, gives each head they take a check run of its own,
+	// "AutoPilot review gate", that a ruleset can require: it passes where
+	// the review approves, fails where it asks for changes, and otherwise
+	// waits for a person with write access to approve that head. False when
+	// the AutoPilot predates the field.
 	Gate bool `json:"gate"`
 }
 

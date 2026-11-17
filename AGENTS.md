@@ -157,12 +157,17 @@ the examples, and the generated docs. Things worth knowing:
   `validateAutoReview` checks the rules that span fields. An app that
   leaves it out sends nothing for it, so an older AutoPilot still takes
   the app.
-- An app's `auto_review.gate` makes its automatic review's check run,
-  `AutoPilot review (automatic)`, one a ruleset can require: it passes
-  where the review approves, fails where its outcome is `fail`, and
-  otherwise waits until someone with write access approves that head. Off,
-  the check ends `neutral`, which a ruleset counts as passing, so the docs
-  say to take the check out of the ruleset before turning the gate off.
+- An app's `auto_review.gate` gives each pull request head its automatic
+  reviews take a check run of its own, `AutoPilot review gate`, one a
+  ruleset can require: it passes where the review approves, fails where it
+  asks for changes or its outcome is `fail`, and otherwise waits until
+  someone with write access approves that head. The review's own check
+  run, `AutoPilot review (automatic)`, still ends `neutral`, so the docs
+  say to require only the gate's. The gate fails closed: where a ruleset
+  requires its check, a head without one can't merge, as with the gate off
+  or before it was on. So the docs say to turn the gate on only once
+  AutoPilot has it, then require the check, and to take the check out of
+  the ruleset before turning the gate off.
   AutoPilot takes `true` or `false` (`null` is refused), shows it in every
   `auto_review` (`false` when off), keeps it only when on, and takes `true`
   only with `can_decide` and every event in `events` or a workflow in

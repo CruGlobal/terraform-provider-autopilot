@@ -134,15 +134,19 @@ resource "autopilot_app" "payments" {
   name  = "payments"
   repos = ["example-org/payments-api"]
 
-  # Make the automatic review a check the repository's ruleset can require:
-  # "AutoPilot review (automatic)", from AutoPilot's GitHub App. It passes
-  # where the review approves, fails where the review's outcome is fail,
-  # and otherwise waits until someone with write access approves the pull
-  # request at that commit. The gate needs can_decide and every event, so
-  # each push gets its own review and its own check. Require the check only
-  # once a pull request shows it, and take it out of the ruleset before
-  # turning the gate off: with the gate off, the check ends neutral, which
-  # a ruleset counts as passing.
+  # Give each pull request head the automatic review takes a check that
+  # decides, "AutoPilot review gate", from AutoPilot's GitHub App, for the
+  # repository's ruleset to require. It passes where the review approves,
+  # fails where the review asks for changes, and otherwise waits until
+  # someone with write access approves the pull request at that commit.
+  # Require "AutoPilot review gate", never the review's own check,
+  # "AutoPilot review (automatic)", which always ends neutral. The gate
+  # needs can_decide and every event, so each push gets its own review and
+  # its own check. It fails closed: where the ruleset requires the check, a
+  # head without one can't merge. So turn the gate on only once AutoPilot
+  # runs a release that has it, then require the check; and take the check
+  # out of the ruleset before turning the gate off, or later pull requests
+  # can't merge.
   auto_review = {
     events     = ["opened", "ready_for_review", "synchronize"]
     can_decide = true

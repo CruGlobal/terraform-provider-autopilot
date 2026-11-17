@@ -493,9 +493,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"its image, and the size of the AWS Fargate task it runs as. `worker_cpu` and `worker_memory` are one " +
 			"size, set together, and a change to either sends both.\n\n" +
 			"`auto_review` has AutoPilot review the app's pull requests on its own, with no label, as the app's own " +
-			"service identity, and lets the GitHub Actions workflows it lists ask for those reviews. Its `gate` makes " +
-			"that review a check a ruleset can require. It is one setting, and a change to any of its fields sends " +
-			"all of them.\n\n" +
+			"service identity, and lets the GitHub Actions workflows it lists ask for those reviews. Its `gate` adds " +
+			"a check that decides, `AutoPilot review gate`, which a ruleset can require. It is one setting, and a " +
+			"change to any of its fields sends all of them.\n\n" +
 			"`review_also_reads` lets the reviews of the app's repositories read other repositories of the same " +
 			"owner, read-only. Anyone who can push a branch to one of the app's repositories, and anyone who can read " +
 			"its reviews, can see what those repositories hold.\n\n" +
@@ -856,26 +856,31 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 						Validators: []validator.String{stringvalidator.OneOf("low", "medium", "high")},
 					},
 					"gate": schema.BoolAttribute{
-						MarkdownDescription: "Whether the automatic review is a check that a ruleset can require. On, each " +
-							"pull request head the automatic reviews take gets one check run, `AutoPilot review (automatic)`, " +
-							"from AutoPilot's GitHub App, and it decides: it passes where the review approves, by every rule " +
-							"an approval meets, `approve_up_to` included; it fails where the review's outcome is `fail`, as " +
-							"when it asks for changes; and otherwise it waits, completed as `action_required`, until someone " +
-							"with write access approves the pull request at that head. A head that gets no review, such as one past " +
-							"`max_per_day`, waits too. A Dependabot pull request's check passes with no review, and any other " +
-							"bot's waits. Off, the check run always ends `neutral`, which a ruleset counts as passing. " +
+						MarkdownDescription: "Whether the automatic review also makes a check that decides, which a ruleset " +
+							"can require. On, each commit at the head of a pull request the automatic reviews take gets a check " +
+							"run of its own, `AutoPilot review gate`, from AutoPilot's GitHub App: it passes where the review " +
+							"approves, by every rule an approval meets, `approve_up_to` included; it fails where the review asks " +
+							"for changes or its outcome is `fail`; and otherwise it waits, completed as `action_required`, " +
+							"until someone with write access approves the pull request at that head. A head that gets no " +
+							"review, such as one past `max_per_day`, waits too. A Dependabot pull request's check passes with " +
+							"no review, and any other bot's waits. A commit at the head of more than one pull request shows the " +
+							"strictest of theirs. Require `AutoPilot review gate`, never the review's own check run, " +
+							"`AutoPilot review (automatic)`, which still always ends `neutral`. Off, there is no gate check. " +
 							"Defaults to `false`. `true` needs `can_decide = true`, and every event in `events` (`opened`, " +
 							"`ready_for_review` and `synchronize`) or a workflow in `workflows`, so each head gets its check; " +
-							"with only workflows, a head gets its check only when a workflow asks. Require the check in the " +
-							"repository's ruleset only once this is on and a pull request shows the check. **Before turning " +
-							"this off, take the check out of the ruleset:** with the gate off, the check ends `neutral`, so " +
-							"every pull request would pass it. Turning it on or off reaches only the heads reviewed after; a " +
-							"check already made stays as it was, and a waiting one still passes on a writer's approval. " +
-							"`true` needs an AutoPilot that knows the field; an older one refuses it with a 422. Off is never " +
-							"sent, so an app that leaves it off works with any AutoPilot that takes `auto_review`. An AutoPilot " +
-							"rolled back past the field ignores it, so its checks end `neutral` again, refuses every write " +
-							"that sends it, and drops it on any write it takes to the app: take the check out of the ruleset " +
-							"before such a rollback.",
+							"with only workflows, a head gets its check only when a workflow asks. **It fails closed:** where " +
+							"a ruleset requires the check, a head with no gate check can't merge until its next push gets one, " +
+							"such as a pull request open before the gate was turned on. So turn this on only once every " +
+							"AutoPilot instance runs a release that has the gate, then require the check in the repository's " +
+							"ruleset once a pull request shows it. **Before turning this off, take the check out of the " +
+							"ruleset:** with the gate off, later heads get no gate check, so their pull requests can't merge. " +
+							"Turning it on or off reaches only the heads reviewed after; a check already made stays as it " +
+							"was, and a waiting one still passes on a writer's approval. `true` needs an AutoPilot that knows " +
+							"the field; an older one refuses it with a 422. Off is never sent, so an app that leaves it off " +
+							"works with any AutoPilot that takes `auto_review`. An AutoPilot rolled back past the field " +
+							"ignores it and makes no gate check, so a ruleset that requires it blocks every pull request opened " +
+							"or pushed to meanwhile; it also refuses every write that sends it, and drops it on any write it " +
+							"takes to the app: take the check out of the ruleset before such a rollback.",
 						Optional: true,
 						Computed: true,
 						Default:  booldefault.StaticBool(false),

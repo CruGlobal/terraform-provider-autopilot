@@ -266,8 +266,8 @@ func workflowKey(text string) (key string, ok bool) {
 }
 
 // AutoReview is an app's automatic reviews. An empty ApproveUpTo is no
-// ceiling (null), and no Workflows (nil or empty) is none. Gate makes their
-// check run decide, so a ruleset can require it.
+// ceiling (null), and no Workflows (nil or empty) is none. Gate adds a check
+// run of their own that decides, so a ruleset can require it.
 type AutoReview struct {
 	Events         []string
 	Workflows      []string
