@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.10.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.9.0...v0.10.0) (2026-11-17)
+
+
+### Added
+
+* **app:** add auto_review.gate, which turns on AutoPilot's review gate check ([#30](https://github.com/CruGlobal/terraform-provider-autopilot/issues/30)) ([65cea4b](https://github.com/CruGlobal/terraform-provider-autopilot/commit/65cea4b9f9f52e186a4110c19169bb380db745aa))
+* **app:** add propose_review_rules ([#28](https://github.com/CruGlobal/terraform-provider-autopilot/issues/28)) ([dc5c86a](https://github.com/CruGlobal/terraform-provider-autopilot/commit/dc5c86ad6cd72fa8f572948c6879a3ad4affda8d))
+
+
+### Changed
+
+* build with Go 1.26.11 ([#31](https://github.com/CruGlobal/terraform-provider-autopilot/issues/31)) ([9cc9c14](https://github.com/CruGlobal/terraform-provider-autopilot/commit/9cc9c14ae33065fc676672849db9e4bc9b2832e6))
+
 ## [0.9.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.8.0...v0.9.0) (2026-11-04)
 
 
