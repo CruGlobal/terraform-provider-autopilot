@@ -153,5 +153,11 @@ resource "autopilot_app" "payments" {
     # A pull request rated above low risk waits for a person.
     approve_up_to = "low"
     gate          = true
+    # Pass the pull requests AutoPilot opens itself with no review, as
+    # Dependabot's are. A commit someone with write access pushes onto one
+    # of them passes unreviewed too. "review" has the automatic review
+    # review them instead, and "wait", the default, waits for a writer's
+    # approval. Needs an AutoPilot release that knows own_prs.
+    own_prs = "pass"
   }
 }

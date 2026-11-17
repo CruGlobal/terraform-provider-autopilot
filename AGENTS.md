@@ -140,10 +140,10 @@ the examples, and the generated docs. Things worth knowing:
   defaults in the schema (`events` `opened` and `ready_for_review`,
   `workflows` none, `max_per_day` 50, the flags false), a change to any
   field sends every one, and removing it sends `null`. The exceptions are
-  `gate` (below) and `workflows`, sent sorted and each once, and only when
-  it lists some: none is AutoPilot's default, and an AutoPilot that
-  predates the field refuses it, so an app that lists none still works
-  there. `events` is
+  `gate` and `own_prs` (below), and `workflows`, sent sorted and each
+  once, and only when it lists some: none is AutoPilot's default, and an
+  AutoPilot that predates the field refuses it, so an app that lists none
+  still works there. `events` is
   some of `opened`, `ready_for_review` and `synchronize`, kept in that
   order: at least one, unless `workflows` lists one, and set in the
   configuration whenever `workflows` lists one (AutoPilot refuses
@@ -182,6 +182,29 @@ the examples, and the generated docs. Things worth knowing:
   defaults. The fake reads it in AutoPilot's sorted order, after `events`
   and before `max_per_day`, and keeps one set from outside a write only
   with `can_decide`, as AutoPilot reads a stored one.
+- An app's `auto_review.own_prs` says how the gate's check treats
+  AutoPilot's own pull requests, the ones its GitHub App opens for its
+  tasks: `wait`, the default, waits for a writer's approval, as for any
+  bot's; `pass` passes them with no review, as Dependabot's, so a writer's
+  commit pushed onto one passes unreviewed too; and `review` has the
+  automatic review review them, and the check goes by that review. GitHub
+  refuses a pull request's author an approval, so under `review` AutoPilot
+  posts its decision as a comment. AutoPilot takes `wait`, `pass` or
+  `review` (anything else, `null` included, is refused at
+  `/auto_review/own_prs`), shows it in every `auto_review` (`wait` when
+  unset), keeps it only when it isn't `wait`, and takes anything but `wait`
+  only with `gate` true, refused at `/auto_review/own_prs` after the gate's
+  checks and before the events'. In the schema it is a string with the
+  default `wait`, as `gate` is a flag with the default `false`, so an
+  answer of `wait`, or one without the field, plans nothing. It is sent
+  only as `pass` or `review`, never as `wait`: a field left out is
+  AutoPilot's default, and an AutoPilot that predates the field refuses
+  it, so an app that leaves it at `wait` still works there.
+  `validateAutoReviewOwnPRs` checks its rule at plan time, `gate` left out
+  at its default; a `gate` not known yet waits. The fake reads it in
+  AutoPilot's sorted order, after `max_per_day` and before `workflows`, and
+  keeps one set from outside a write as `pass` or `review` only with the
+  gate, and as `wait` otherwise, as AutoPilot reads a stored one.
 - An app's `review_also_reads` lists other repositories, `owner/name`, that
   the reviews of the app's own repositories also read, read-only. Each is
   checked step for step with AutoPilot's own rule (`validRepo`, in the
