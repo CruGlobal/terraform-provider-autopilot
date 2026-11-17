@@ -910,7 +910,7 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 							"request waits under `pass` or `review` too. `pass` and `review` need `gate = true`. A change " +
 							"reaches only the heads reviewed after it, and moving off `review` stops an automatic review of " +
 							"AutoPilot's own pull request still queued or running, so its head waits. **Setting `pass` or " +
-							"`review` needs an AutoPilot release with CruGlobal/autopilot#200;** an older one refuses the " +
+							"`review` needs an AutoPilot that knows the field;** an older one refuses the " +
 							"field with a 422. `wait` is never sent, so an app that leaves it at `wait` works with any " +
 							"AutoPilot that takes `auto_review`. An AutoPilot rolled back past the field treats AutoPilot's " +
 							"own pull requests as any other bot's, so their checks wait; it also refuses every write that " +
