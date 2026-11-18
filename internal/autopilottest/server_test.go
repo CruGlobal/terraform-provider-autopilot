@@ -937,6 +937,27 @@ func TestAutoReview_Refused(t *testing.T) {
 		{map[string]any{"gate": true, "can_decide_own_pr": true}, "/auto_review/can_decide_own_pr"},
 		{map[string]any{"gate": true, "approve_up_to": "low"}, "/auto_review/approve_up_to"},
 		{map[string]any{"gate": true, "can_decide": true, "events": []string{}}, "/auto_review/gate"},
+		{map[string]any{"own_prs": "approve"}, "/auto_review/own_prs"},
+		{map[string]any{"own_prs": "Pass"}, "/auto_review/own_prs"},
+		{map[string]any{"own_prs": "PASS"}, "/auto_review/own_prs"},
+		{map[string]any{"own_prs": ""}, "/auto_review/own_prs"},
+		{map[string]any{"own_prs": nil}, "/auto_review/own_prs"},
+		{map[string]any{"own_prs": true}, "/auto_review/own_prs"},
+		{map[string]any{"own_prs": []string{"pass"}}, "/auto_review/own_prs"},
+		// Anything but wait needs the gate.
+		{map[string]any{"own_prs": "pass"}, "/auto_review/own_prs"},
+		{map[string]any{"own_prs": "review", "can_decide": true, "events": []string{"opened", "ready_for_review", "synchronize"}}, "/auto_review/own_prs"},
+		{map[string]any{"own_prs": "pass", "gate": false, "can_decide": true, "events": []string{"opened", "ready_for_review", "synchronize"}}, "/auto_review/own_prs"},
+		// Read in its place, after max_per_day and before workflows.
+		{map[string]any{"own_prs": "approve", "max_per_day": 0}, "/auto_review/max_per_day"},
+		{map[string]any{"own_prs": "approve", "gate": "yes"}, "/auto_review/gate"},
+		{map[string]any{"own_prs": "approve", "workflows": "nope"}, "/auto_review/own_prs"},
+		// Checked once every field is read, after the gate's rules and
+		// before no event.
+		{map[string]any{"own_prs": "pass", "can_decide_own_pr": true}, "/auto_review/can_decide_own_pr"},
+		{map[string]any{"own_prs": "pass", "gate": true}, "/auto_review/gate"},
+		{map[string]any{"own_prs": "review", "gate": true, "can_decide": true}, "/auto_review/gate"},
+		{map[string]any{"own_prs": "pass", "can_decide": true, "events": []string{}}, "/auto_review/own_prs"},
 	}
 	for _, c := range cases {
 		st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": c.auto})
@@ -962,7 +983,7 @@ func TestAutoReview_Kept(t *testing.T) {
 	expect(t, "every default", st, http.StatusOK, body)
 	want := map[string]any{
 		"events": []any{"opened", "ready_for_review"}, "workflows": []any{}, "max_per_day": float64(50),
-		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil, "gate": false,
+		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil, "gate": false, "own_prs": "wait",
 	}
 	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
 		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
@@ -1022,7 +1043,7 @@ func TestAutoReview_Gate(t *testing.T) {
 	expect(t, "create with the gate", st, http.StatusCreated, body)
 	want := map[string]any{
 		"events": []any{"opened", "ready_for_review", "synchronize"}, "workflows": []any{}, "max_per_day": float64(50),
-		"can_decide": true, "can_decide_own_pr": false, "approve_up_to": nil, "gate": true,
+		"can_decide": true, "can_decide_own_pr": false, "approve_up_to": nil, "gate": true, "own_prs": "wait",
 	}
 	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
 		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
@@ -1080,6 +1101,110 @@ func TestAutoReview_Gate(t *testing.T) {
 	s.SeedApp(AppView{Name: "ledger", AutoReview: &AutoReview{Events: every, MaxPerDay: 50, Gate: true}})
 	if v, _ := s.App("ledger"); v.AutoReview == nil || v.AutoReview.Gate {
 		t.Errorf("auto_review = %+v, want the gate off without can_decide", v.AutoReview)
+	}
+}
+
+// auto_review.own_prs is wait unless sent, and shown either way; a field of
+// the one setting, a write that leaves it out puts it back to wait; wait sent
+// is the same as wait left out; and a create with it is a retry only with
+// the same. One kept from outside a write is pass or review only with the
+// gate, and wait for a value AutoPilot doesn't know, as AutoPilot reads a
+// stored one.
+func TestAutoReview_OwnPRs(t *testing.T) {
+	s := New(t)
+	every := []string{"synchronize", "ready_for_review", "opened"}
+	gated := func(own any) map[string]any {
+		auto := map[string]any{"can_decide": true, "events": every, "gate": true}
+		if own != nil {
+			auto["own_prs"] = own
+		}
+		return auto
+	}
+	shown := func(body map[string]any) any {
+		auto, _ := body["auto_review"].(map[string]any)
+		return auto["own_prs"]
+	}
+	made := map[string]any{"name": "billing", "auto_review": gated("pass")}
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", made)
+	expect(t, "create with own_prs pass", st, http.StatusCreated, body)
+	want := map[string]any{
+		"events": []any{"opened", "ready_for_review", "synchronize"}, "workflows": []any{}, "max_per_day": float64(50),
+		"can_decide": true, "can_decide_own_pr": false, "approve_up_to": nil, "gate": true, "own_prs": "pass",
+	}
+	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
+		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
+	}
+	if v, _ := s.App("billing"); v.AutoReview == nil || v.AutoReview.OwnPRs != "pass" {
+		t.Errorf("auto_review = %+v, want own_prs pass", v.AutoReview)
+	}
+	// The same create again is a retry; one with another value, or without
+	// it, isn't.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", made)
+	expect(t, "the same create again", st, http.StatusOK, body)
+	for _, own := range []any{"wait", "review", nil} {
+		st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": gated(own)})
+		expect(t, fmt.Sprintf("a create with own_prs %v", own), st, http.StatusConflict, body)
+	}
+	// A change that leaves auto_review out keeps it (and, changing nothing,
+	// keeps lock_version 1).
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"developers": []string{}})
+	expect(t, "a change without it", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.AutoReview == nil || v.AutoReview.OwnPRs != "pass" {
+		t.Errorf("a change that leaves auto_review out changed own_prs: %+v", v.AutoReview)
+	}
+	// One that sends auto_review without it puts it back to wait, shown.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"auto_review": gated(nil)})
+	expect(t, "own_prs left out", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.AutoReview == nil || v.AutoReview.OwnPRs != "wait" || v.LockVersion != 2 {
+		t.Errorf("auto_review = %+v, lock_version %d, want own_prs wait", v.AutoReview, v.LockVersion)
+	}
+	if shown(body) != "wait" {
+		t.Errorf("auto_review = %v, want own_prs wait shown", body["auto_review"])
+	}
+	// wait sent is wait left out: nothing changes.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"auto_review": gated("wait")})
+	expect(t, "own_prs wait", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.LockVersion != 2 {
+		t.Errorf("lock_version = %d, want 2: wait is what it held", v.LockVersion)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"auto_review": gated("review")})
+	expect(t, "own_prs review", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.AutoReview == nil || v.AutoReview.OwnPRs != "review" || shown(body) != "review" {
+		t.Errorf("auto_review = %+v, want own_prs review", v.AutoReview)
+	}
+	// wait needs no gate.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"auto_review": map[string]any{
+		"can_decide": true, "own_prs": "wait",
+	}})
+	expect(t, "own_prs wait without the gate", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.AutoReview == nil || v.AutoReview.Gate || v.AutoReview.OwnPRs != "wait" || shown(body) != "wait" {
+		t.Errorf("auto_review = %+v, want the gate off and own_prs wait", v.AutoReview)
+	}
+
+	// Kept from outside a write, it is pass or review only with the gate,
+	// which is on only with can_decide, and wait for anything else.
+	for i, c := range []struct {
+		auto AutoReview
+		want string
+	}{
+		{AutoReview{Events: every, MaxPerDay: 50, CanDecide: true, Gate: true, OwnPRs: "review"}, "review"},
+		{AutoReview{Events: every, MaxPerDay: 50, CanDecide: true, Gate: true, OwnPRs: "pass"}, "pass"},
+		{AutoReview{Events: every, MaxPerDay: 50, CanDecide: true, Gate: true}, "wait"},
+		{AutoReview{Events: every, MaxPerDay: 50, CanDecide: true, Gate: true, OwnPRs: "approve"}, "wait"},
+		{AutoReview{Events: every, MaxPerDay: 50, CanDecide: true, Gate: true, OwnPRs: "PASS"}, "wait"},
+		{AutoReview{Events: every, MaxPerDay: 50, CanDecide: true, OwnPRs: "pass"}, "wait"},
+		{AutoReview{Events: every, MaxPerDay: 50, Gate: true, OwnPRs: "review"}, "wait"},
+	} {
+		name := fmt.Sprintf("seeded-%d", i)
+		s.SeedApp(AppView{Name: name, AutoReview: &c.auto})
+		if v, _ := s.App(name); v.AutoReview == nil || v.AutoReview.OwnPRs != c.want {
+			t.Errorf("seeded %+v: auto_review = %+v, want own_prs %s", c.auto, v.AutoReview, c.want)
+		}
+		st, body := call(t, s, http.MethodGet, "/v1/admin/apps/"+name, "", nil)
+		expect(t, "read "+name, st, http.StatusOK, body)
+		if shown(body) != c.want {
+			t.Errorf("seeded %+v: own_prs shown %v, want %s", c.auto, shown(body), c.want)
+		}
 	}
 }
 
@@ -1176,7 +1301,7 @@ func TestAutoReview_WorkflowsKept(t *testing.T) {
 	expect(t, "workflows alone", st, http.StatusCreated, body)
 	want := map[string]any{
 		"events": []any{}, "workflows": []any{shared, other, main}, "max_per_day": float64(50),
-		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil, "gate": false,
+		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil, "gate": false, "own_prs": "wait",
 	}
 	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
 		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))

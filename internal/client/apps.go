@@ -75,9 +75,9 @@ var AutoEvents = []string{"opened", "ready_for_review", "synchronize"}
 // requests into the default branch of the app's repositories on its own,
 // with no label, as the app's own service identity, and a GitHub Actions
 // workflow it lists may ask for one. AutoPilot takes it as one setting: a
-// write sends every field (the workflows only when there are some, and the
-// gate only when it is on), and a field it leaves out is AutoPilot's
-// default, not what was kept.
+// write sends every field (the workflows only when there are some, the gate
+// only when it is on, and own_prs only when it isn't wait), and a field it
+// leaves out is AutoPilot's default, not what was kept.
 type AutoReview struct {
 	// Events are the actions that start one: some of AutoEvents. Empty only
 	// with Workflows.
@@ -106,6 +106,33 @@ type AutoReview struct {
 	// waits for a person with write access to approve that head. False when
 	// the AutoPilot predates the field.
 	Gate bool `json:"gate"`
+	// OwnPRs is, with Gate, how the gate's check treats AutoPilot's own pull
+	// requests: OwnPRsWait, OwnPRsPass or OwnPRsReview. Empty when the
+	// AutoPilot predates the field, which is the same as OwnPRsWait.
+	OwnPRs string `json:"own_prs"`
+}
+
+// How the gate's check treats AutoPilot's own pull requests: OwnPRsWait, the
+// default, waits for a person with write access to approve, as for any
+// bot's; OwnPRsPass passes them with no review, as Dependabot's; and
+// OwnPRsReview has the automatic review review them, and the check goes by
+// that review.
+const (
+	OwnPRsWait   = "wait"
+	OwnPRsPass   = "pass"
+	OwnPRsReview = "review"
+)
+
+// OwnPRsValues are the values of own_prs, in this order.
+var OwnPRsValues = []string{OwnPRsWait, OwnPRsPass, OwnPRsReview}
+
+// OwnPRsOrWait is how the gate treats AutoPilot's own pull requests, with
+// none (an AutoPilot that predates the field) read as OwnPRsWait.
+func (a AutoReview) OwnPRsOrWait() string {
+	if a.OwnPRs == "" {
+		return OwnPRsWait
+	}
+	return a.OwnPRs
 }
 
 // AutoReviewSetting is a write of an app's automatic reviews: On to turn
@@ -296,12 +323,13 @@ func (s AppSpec) fields() Fields {
 // an accepts entry's flags, the knobs are sent even when off: every
 // AutoPilot that takes auto_review knows those five fields, and the body
 // then says exactly what the plan does, not what AutoPilot's defaults would.
-// The workflows and the gate are the exceptions: the workflows sent sorted
-// and each once, and only when there are some, never as [] or null, and the
-// gate only when it is on, never as false. AutoPilot's default for each is
-// none or off, which a write that leaves it out gets, and an AutoPilot that
-// predates one refuses the field, so an app that lists no workflow and has
-// no gate still works with it.
+// The workflows, the gate and own_prs are the exceptions: the workflows sent
+// sorted and each once, and only when there are some, never as [] or null;
+// the gate only when it is on, never as false; and own_prs only when it is
+// pass or review, never as wait. AutoPilot's default for each is none, off
+// or wait, which a write that leaves it out gets, and an AutoPilot that
+// predates one refuses the field, so an app that lists no workflow, has no
+// gate and leaves own_prs at wait still works with it.
 func autoReviewBody(a AutoReview) map[string]any {
 	body := map[string]any{
 		"events":            normalizeEvents(a.Events),
@@ -315,6 +343,9 @@ func autoReviewBody(a AutoReview) map[string]any {
 	}
 	if a.Gate {
 		body["gate"] = true
+	}
+	if own := a.OwnPRsOrWait(); own != OwnPRsWait {
+		body["own_prs"] = own
 	}
 	return body
 }
@@ -346,7 +377,8 @@ func normalizeEvents(events []string) []string {
 }
 
 // sameAutoReview reports whether two settings of automatic reviews are the
-// same, nil being none. No workflows, nil or empty, is the same either way.
+// same, nil being none. No workflows, nil or empty, is the same either way,
+// and so is own_prs wait, sent or answered, or left out.
 func sameAutoReview(x, y *AutoReview) bool {
 	if x == nil || y == nil {
 		return x == y
@@ -354,7 +386,7 @@ func sameAutoReview(x, y *AutoReview) bool {
 	return slices.Equal(normalizeEvents(x.Events), normalizeEvents(y.Events)) &&
 		slices.Equal(sortedUnique(x.Workflows), sortedUnique(y.Workflows)) && x.MaxPerDay == y.MaxPerDay &&
 		x.CanDecide == y.CanDecide && x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo &&
-		x.Gate == y.Gate
+		x.Gate == y.Gate && x.OwnPRsOrWait() == y.OwnPRsOrWait()
 }
 
 // Empty reports whether the spec would send nothing.

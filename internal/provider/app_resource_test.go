@@ -2778,6 +2778,7 @@ func TestApp_autoReviewLifecycle(t *testing.T) {
 					resource.TestCheckResourceAttr(appRes, "auto_review.can_decide_own_pr", "false"),
 					resource.TestCheckNoResourceAttr(appRes, "auto_review.approve_up_to"),
 					resource.TestCheckResourceAttr(appRes, "auto_review.gate", "false"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.own_prs", "wait"),
 					func(*terraform.State) error {
 						return env.checkAutoReview(t, name, &client.AutoReview{
 							Events: []string{"opened", "ready_for_review"}, MaxPerDay: 50,
@@ -2840,7 +2841,8 @@ func TestApp_autoReviewLifecycle(t *testing.T) {
 }
 
 // checkAutoReview reads the app from AutoPilot, the fake or a live one, and
-// checks its automatic reviews there (nil for none).
+// checks its automatic reviews there (nil for none). own_prs left out of want
+// is wait.
 func (env *testEnv) checkAutoReview(t *testing.T, name string, want *client.AutoReview) error {
 	app, err := env.apiClient(t).GetApp(context.Background(), name)
 	if err != nil {
@@ -2855,7 +2857,8 @@ func (env *testEnv) checkAutoReview(t *testing.T, name string, want *client.Auto
 	}
 	if !slices.Equal(got.Events, want.Events) || !slices.Equal(got.Workflows, want.Workflows) ||
 		got.MaxPerDay != want.MaxPerDay || got.CanDecide != want.CanDecide ||
-		got.CanDecideOwnPR != want.CanDecideOwnPR || got.ApproveUpTo != want.ApproveUpTo || got.Gate != want.Gate {
+		got.CanDecideOwnPR != want.CanDecideOwnPR || got.ApproveUpTo != want.ApproveUpTo || got.Gate != want.Gate ||
+		got.OwnPRsOrWait() != want.OwnPRsOrWait() {
 		return fmt.Errorf("auto_review = %+v at AutoPilot, want %+v", *got, *want)
 	}
 	return nil
@@ -3341,6 +3344,7 @@ func autoReviewConfig(events, workflows types.Set) autoReviewModel {
 	return autoReviewModel{
 		Events: events, Workflows: workflows, MaxPerDay: types.Int64Null(), CanDecide: types.BoolNull(),
 		CanDecideOwnPR: types.BoolNull(), ApproveUpTo: types.StringNull(), Gate: types.BoolNull(),
+		OwnPRs: types.StringNull(),
 	}
 }
 
@@ -4251,6 +4255,534 @@ func TestApp_autoReviewGateWithAnOlderAutoPilot(t *testing.T) {
 					func(*terraform.State) error {
 						if v, _ := env.fake.App(name); v.AutoReview == nil || v.AutoReview.Gate {
 							return fmt.Errorf("auto_review = %+v, want the gate off", v.AutoReview)
+						}
+						return nil
+					},
+				),
+			},
+			{Config: config("", bob), PlanOnly: true},
+		},
+	})
+}
+
+// gatedAutoReview is auto_review with the gate on, as own_prs needs, and the
+// fields given before the events.
+func gatedAutoReview(more string) string {
+	return "  auto_review = { can_decide = true, gate = true, " + more + everyEvent + " }"
+}
+
+// own_prs is wait unless set: pass and review read back and plan nothing; a
+// change to another field keeps it; wait, or left out, puts it back and
+// plans nothing after; beside a workflow it works as beside every event; wait
+// needs no gate; and removing auto_review turns everything off.
+func TestApp_autoReviewOwnPRsLifecycle(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	main := workflowFile + "@refs/heads/main"
+	every := []string{"opened", "ready_for_review", "synchronize"}
+	config := func(auto string) string { return appConfig(env, name, auto) }
+	gated := func(maxPerDay int64, own string) *client.AutoReview {
+		return &client.AutoReview{Events: every, MaxPerDay: maxPerDay, CanDecide: true, Gate: true, OwnPRs: own}
+	}
+	update := resource.ConfigPlanChecks{
+		PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+	}
+	empty := resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(gatedAutoReview("")),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.own_prs", "wait"),
+					func(*terraform.State) error { return env.checkAutoReview(t, name, gated(50, "wait")) },
+				),
+			},
+			{
+				Config:           config(gatedAutoReview(`own_prs = "pass", `)),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.own_prs", "pass"),
+					func(*terraform.State) error { return env.checkAutoReview(t, name, gated(50, "pass")) },
+				),
+			},
+			{
+				Config:           config(gatedAutoReview(`own_prs = "pass", `)),
+				ConfigPlanChecks: empty,
+			},
+			{
+				Config:           config(gatedAutoReview(`own_prs = "review", `)),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.own_prs", "review"),
+					func(*terraform.State) error { return env.checkAutoReview(t, name, gated(50, "review")) },
+				),
+			},
+			{
+				// A change to another field sends own_prs too.
+				Config: config(gatedAutoReview(`own_prs = "review", max_per_day = 10, `)),
+				Check: func(*terraform.State) error {
+					return env.checkAutoReview(t, name, gated(10, "review"))
+				},
+			},
+			{
+				Config:           config(gatedAutoReview(`own_prs = "wait", max_per_day = 10, `)),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.own_prs", "wait"),
+					func(*terraform.State) error { return env.checkAutoReview(t, name, gated(10, "wait")) },
+				),
+			},
+			{
+				// Left out is wait, its default.
+				Config:           config(gatedAutoReview(`max_per_day = 10, `)),
+				ConfigPlanChecks: empty,
+			},
+			{
+				// Beside a workflow, as beside every event.
+				Config: config(fmt.Sprintf(`  auto_review = { can_decide = true, gate = true, own_prs = "pass", events = [], workflows = %s }`,
+					hcl(main))),
+				Check: func(*terraform.State) error {
+					return env.checkAutoReview(t, name, &client.AutoReview{
+						Events: []string{}, Workflows: []string{main}, MaxPerDay: 50, CanDecide: true, Gate: true, OwnPRs: "pass",
+					})
+				},
+			},
+			{
+				// wait needs no gate.
+				Config: config(`  auto_review = { can_decide = true, own_prs = "wait" }`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.gate", "false"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.own_prs", "wait"),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{
+							Events: []string{"opened", "ready_for_review"}, MaxPerDay: 50, CanDecide: true,
+						})
+					},
+				),
+			},
+			{
+				Config:           config(`  auto_review = { can_decide = true, own_prs = "wait" }`),
+				ConfigPlanChecks: empty,
+			},
+			{
+				Config:           config(""),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "auto_review"),
+					func(*terraform.State) error { return env.checkAutoReview(t, name, nil) },
+				),
+			},
+		},
+	})
+}
+
+// own_prs is sent only as pass or review: a create and a change that set it
+// send it, a change to another field while it is set sends it again, and one
+// that puts it back to wait leaves it out, never sending wait, so an
+// AutoPilot that predates the field still takes an app without it.
+func TestApp_autoReviewOwnPRsSent(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	lastBody := func() string {
+		patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)
+		return mustJSON(t, requestBody(t, patches[len(patches)-1]))
+	}
+	const head = `{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,` +
+		`"events":["opened","ready_for_review","synchronize"],"gate":true,`
+	sends := func(want string) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			if got := lastBody(); got != want {
+				return fmt.Errorf("body = %s, want %s", got, want)
+			}
+			return nil
+		}
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, gatedAutoReview(`own_prs = "pass", `)),
+				Check: func(*terraform.State) error {
+					post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0]
+					want := `{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,` +
+						`"events":["opened","ready_for_review","synchronize"],"gate":true,"max_per_day":50,"own_prs":"pass"}`
+					if got := mustJSON(t, requestBody(t, post)["auto_review"]); got != want {
+						return fmt.Errorf("auto_review = %s, want %s", got, want)
+					}
+					return nil
+				},
+			},
+			{
+				Config: appConfig(env, name, gatedAutoReview(`own_prs = "review", max_per_day = 5, `)),
+				Check:  sends(head + `"max_per_day":5,"own_prs":"review"}}`),
+			},
+			{
+				// A change to another field sends it again.
+				Config: appConfig(env, name, gatedAutoReview(`own_prs = "review", max_per_day = 6, `)),
+				Check:  sends(head + `"max_per_day":6,"own_prs":"review"}}`),
+			},
+			{
+				Config: appConfig(env, name, gatedAutoReview(`own_prs = "wait", max_per_day = 6, `)),
+				Check:  sends(head + `"max_per_day":6}}`),
+			},
+			{
+				// At wait, a change to another field never sends it.
+				Config: appConfig(env, name, gatedAutoReview(`own_prs = "wait", max_per_day = 7, `)),
+				Check:  sends(head + `"max_per_day":7}}`),
+			},
+		},
+	})
+}
+
+// The plan refuses an own_prs AutoPilot refuses, before anything is sent:
+// pass or review without the gate (gate left out is false), and a value
+// that isn't wait, pass or review.
+func TestApp_autoReviewOwnPRsRefusedAtPlan(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	cases := []struct{ auto, err string }{
+		{`{ own_prs = "pass" }`, "own_prs without gate"},
+		{`{ can_decide = true, own_prs = "review", ` + everyEvent + ` }`, "own_prs without gate"},
+		{`{ can_decide = true, gate = false, own_prs = "pass", ` + everyEvent + ` }`, "own_prs without gate"},
+		{`{ can_decide = true, gate = true, own_prs = "approve", ` + everyEvent + ` }`, "value must be one of"},
+		{`{ can_decide = true, gate = true, own_prs = "Pass", ` + everyEvent + ` }`, "value must be one of"},
+		{`{ can_decide = true, gate = true, own_prs = "", ` + everyEvent + ` }`, "value must be one of"},
+		// The gate's own rules still hold beside it.
+		{`{ gate = true, own_prs = "pass", ` + everyEvent + ` }`, "gate without can_decide"},
+	}
+	for _, c := range cases {
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{
+					Config:      appConfig(env, randName(), "  auto_review = "+c.auto),
+					ExpectError: expectErr(c.err),
+				},
+			},
+		})
+	}
+	if posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps"); len(posts) != 0 {
+		t.Errorf("%d creates were sent", len(posts))
+	}
+}
+
+// own_prs' rule waits for a gate not known yet, which Terraform checks again
+// at apply; wait, left out, not known yet or a value its own validator
+// refuses needs nothing of the gate.
+func TestValidateAutoReviewOwnPRs(t *testing.T) {
+	cases := []struct {
+		name    string
+		own     types.String
+		gate    types.Bool
+		refused []string
+	}{
+		{"pass, gate on", types.StringValue("pass"), types.BoolValue(true), nil},
+		{"review, gate on", types.StringValue("review"), types.BoolValue(true), nil},
+		{"pass, gate not known yet", types.StringValue("pass"), types.BoolUnknown(), nil},
+		{"pass, gate left out", types.StringValue("pass"), types.BoolNull(), []string{"own_prs without gate"}},
+		{"review, gate left out", types.StringValue("review"), types.BoolNull(), []string{"own_prs without gate"}},
+		{"pass, gate off", types.StringValue("pass"), types.BoolValue(false), []string{"own_prs without gate"}},
+		{"review, gate off", types.StringValue("review"), types.BoolValue(false), []string{"own_prs without gate"}},
+		{"wait, gate left out", types.StringValue("wait"), types.BoolNull(), nil},
+		{"wait, gate off", types.StringValue("wait"), types.BoolValue(false), nil},
+		{"left out", types.StringNull(), types.BoolNull(), nil},
+		{"not known yet", types.StringUnknown(), types.BoolNull(), nil},
+		{"a value its validator refuses", types.StringValue("approve"), types.BoolNull(), nil},
+	}
+	for _, c := range cases {
+		m := autoReviewConfig(types.SetNull(types.StringType), types.SetNull(types.StringType))
+		m.OwnPRs, m.Gate = c.own, c.gate
+		var resp fwresource.ValidateConfigResponse
+		validateAutoReviewOwnPRs(m, &resp)
+		var got []string
+		for _, d := range resp.Diagnostics.Errors() {
+			got = append(got, d.Summary())
+		}
+		if !slices.Equal(got, c.refused) {
+			t.Errorf("%s: refused with %q, want %q", c.name, got, c.refused)
+		}
+	}
+}
+
+// The gate not known until apply: the plan waits, and the apply checks
+// own_prs then, before anything is sent.
+func TestApp_autoReviewOwnPRsWithGateNotKnownYet(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	config := func(gate bool) string {
+		return env.providerConfig() + fmt.Sprintf(`
+resource "terraform_data" "gate" {
+  input = %t
+}
+
+resource "autopilot_app" "test" {
+  name        = %q
+  auto_review = { can_decide = true, gate = terraform_data.gate.output, own_prs = "pass", %s }
+}
+`, gate, name, everyEvent)
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.gate", "true"),
+					resource.TestCheckResourceAttr(appRes, "auto_review.own_prs", "pass"),
+				),
+			},
+			{
+				Config:      config(false),
+				ExpectError: expectErr("own_prs without gate"),
+			},
+		},
+	})
+	if env.fake != nil {
+		if patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name); len(patches) != 0 {
+			t.Errorf("%d changes were sent", len(patches))
+		}
+	}
+}
+
+// own_prs changed outside Terraform shows as a change, and the apply puts it
+// back as the configuration says.
+func TestApp_autoReviewOwnPRsChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	cases := []struct {
+		config, want, outside string
+	}{
+		{gatedAutoReview(`own_prs = "pass", `), "pass", "review"},
+		{gatedAutoReview(`own_prs = "review", `), "review", "wait"},
+		{gatedAutoReview(""), "wait", "pass"},
+	}
+	for _, c := range cases {
+		name := randName()
+		config := appConfig(env, name, c.config)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() {
+						env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) { v.AutoReview.OwnPRs = c.outside })
+					},
+					Config: config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: func(*terraform.State) error {
+						if v, _ := env.fake.App(name); v.AutoReview == nil || v.AutoReview.OwnPRs != c.want {
+							return fmt.Errorf("auto_review = %+v, not put back to own_prs %s", v.AutoReview, c.want)
+						}
+						return nil
+					},
+				},
+			},
+		})
+	}
+}
+
+// An imported app's own_prs is read into state, so a configuration that sets
+// the same plans nothing, and one that leaves it out plans putting it back
+// to wait.
+func TestApp_importWithAutoReviewOwnPRs(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{
+		Name: name,
+		AutoReview: &autopilottest.AutoReview{
+			Events: []string{"opened", "ready_for_review", "synchronize"}, MaxPerDay: 50, CanDecide: true, Gate: true,
+			OwnPRs: "review",
+		},
+	})
+	same := appConfig(env, name, gatedAutoReview(`own_prs = "review", `))
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             same,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: same,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: appConfig(env, name, gatedAutoReview("")),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					if v, _ := env.fake.App(name); v.AutoReview == nil || v.AutoReview.OwnPRs != "wait" {
+						return fmt.Errorf("auto_review = %+v, want own_prs wait", v.AutoReview)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// A create for a name AutoPilot already holds is told apart by own_prs too,
+// since AutoPilot compares it with the other fields: an app that has pass
+// differs from a configuration that leaves it out, and is the same as one
+// that sets pass (which is still not taken over, as no app is).
+func TestApp_autoReviewOwnPRsDecidesWhetherARecordIsTheSame(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{
+		Name: name,
+		AutoReview: &autopilottest.AutoReview{
+			Events: []string{"opened", "ready_for_review", "synchronize"}, MaxPerDay: 50, CanDecide: true, Gate: true,
+			OwnPRs: "pass",
+		},
+	})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:      appConfig(env, name, gatedAutoReview("")),
+				ExpectError: expectErr("An app with this name already exists ... values that differ from this configuration"),
+			},
+			{
+				Config:      appConfig(env, name, gatedAutoReview(`own_prs = "review", `)),
+				ExpectError: expectErr("An app with this name already exists ... values that differ from this configuration"),
+			},
+			{
+				Config:      appConfig(env, name, gatedAutoReview(`own_prs = "pass", `)),
+				ExpectError: expectErr("An app with this name already exists ... exactly these values"),
+			},
+		},
+	})
+	if v, _ := env.fake.App(name); v.LockVersion != 1 || v.AutoReview == nil || v.AutoReview.OwnPRs != "pass" {
+		t.Errorf("the existing app was changed: lock_version %d, auto_review %+v", v.LockVersion, v.AutoReview)
+	}
+}
+
+// A create that sets own_prs, and a change that puts it back to wait, whose
+// answers are lost are sent again and taken as the provider's own.
+func TestApp_autoReviewOwnPRsLostAnswers(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	path := "/v1/admin/apps/" + name
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPost, "/v1/admin/apps") },
+				Config:    appConfig(env, name, gatedAutoReview(`own_prs = "review", `)),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.own_prs", "review"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "1"),
+					func(*terraform.State) error {
+						posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")
+						if len(posts) != 2 || posts[0].Status != http.StatusCreated || posts[1].Status != http.StatusOK {
+							return fmt.Errorf("want a 201 whose answer was lost, then a 200 for the same create; got %d creates", len(posts))
+						}
+						return nil
+					},
+				),
+			},
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPatch, path) },
+				Config:    appConfig(env, name, gatedAutoReview("")),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.own_prs", "wait"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					func(*terraform.State) error {
+						patches := env.fake.RequestsMatching(http.MethodPatch, path)
+						if len(patches) != 2 || patches[1].Status != http.StatusOK || patches[1].Header.Get("If-Match") != `"1"` {
+							return fmt.Errorf("want a change whose answer was lost, then the same change answered 200; got %d changes", len(patches))
+						}
+						if v, _ := env.fake.App(name); v.AutoReview == nil || v.AutoReview.OwnPRs != "wait" {
+							return fmt.Errorf("auto_review = %+v, want own_prs wait", v.AutoReview)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// An AutoPilot that predates own_prs takes a gated auto_review that leaves
+// it out or sets wait, and plans nothing after, since its answer without the
+// field reads as wait. Rolled back past it, AutoPilot reads as wait: a
+// configuration that still sets pass is refused, one that takes it out
+// applies other changes and plans nothing, and once AutoPilot is rolled
+// forward what it kept shows as a change and is put back to wait.
+func TestApp_autoReviewOwnPRsWithAnOlderAutoPilot(t *testing.T) {
+	base := newTestEnv(t)
+	base.requireFake(t)
+	env, older := olderAutoPilot(t, base, "auto_review/own_prs")
+
+	older.Store(true)
+	for _, auto := range []string{gatedAutoReview(""), gatedAutoReview(`own_prs = "wait", `)} {
+		config := appConfig(env, randName(), auto)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{Config: config, PlanOnly: true},
+			},
+		})
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			// A create that sets it is refused before anything is made.
+			Config:      appConfig(env, randName(), gatedAutoReview(`own_prs = "pass", `)),
+			ExpectError: expectErr("auto_review ... doesn't know this field"),
+		}},
+	})
+
+	older.Store(false)
+	name := randName()
+	config := func(own, dev string) string {
+		return appConfig(env, name, fmt.Sprintf("  developers = %s\n%s", hcl(dev), gatedAutoReview(own)))
+	}
+	alice, bob := randLogin(), randLogin()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config(`own_prs = "pass", `, alice)},
+			{
+				// Rolled back, a configuration that sets it is refused.
+				PreConfig:   func() { older.Store(true) },
+				Config:      config(`own_prs = "pass", `, alice),
+				ExpectError: expectErr("auto_review ... doesn't know this field"),
+			},
+			{
+				// Taken out, the app reads as wait, so nothing shows as a
+				// change.
+				Config: config("", alice),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Other changes apply, and nothing is sent for it.
+				Config: config("", bob),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.own_prs", "wait"),
+					lastAppPatch(t, env, name, map[string]any{"developers": []any{bob}}),
+				),
+			},
+			{Config: config("", bob), PlanOnly: true},
+			{
+				// Rolled forward, what AutoPilot kept is put back to wait.
+				PreConfig: func() { older.Store(false) },
+				Config:    config("", bob),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.own_prs", "wait"),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(name); v.AutoReview == nil || v.AutoReview.OwnPRs != "wait" {
+							return fmt.Errorf("auto_review = %+v, want own_prs wait", v.AutoReview)
 						}
 						return nil
 					},

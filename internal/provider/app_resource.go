@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setdefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -67,6 +68,7 @@ type autoReviewModel struct {
 	CanDecideOwnPR types.Bool   `tfsdk:"can_decide_own_pr"`
 	ApproveUpTo    types.String `tfsdk:"approve_up_to"`
 	Gate           types.Bool   `tfsdk:"gate"`
+	OwnPRs         types.String `tfsdk:"own_prs"`
 }
 
 var autoReviewAttrTypes = map[string]attr.Type{
@@ -77,6 +79,7 @@ var autoReviewAttrTypes = map[string]attr.Type{
 	"can_decide_own_pr": types.BoolType,
 	"approve_up_to":     types.StringType,
 	"gate":              types.BoolType,
+	"own_prs":           types.StringType,
 }
 
 // The events and the cap an app's automatic reviews have unless it says,
@@ -194,10 +197,10 @@ func noneSet(s types.Set) bool { return s.IsNull() || emptySet(s) }
 
 // autoReviewToObject maps the automatic reviews AutoPilot answered with to
 // state: null for none (or an AutoPilot that predates the field), and every
-// field otherwise, the ceiling null for none, the workflows empty for none
-// and the gate false when off (or an AutoPilot that predates either). The
-// plan fills each field it leaves out with AutoPilot's default, so the two
-// agree.
+// field otherwise, the ceiling null for none, the workflows empty for none,
+// the gate false when off and own_prs wait when wait (or an AutoPilot that
+// predates any of them). The plan fills each field it leaves out with
+// AutoPilot's default, so the two agree.
 func autoReviewToObject(a *client.AutoReview) types.Object {
 	if a == nil {
 		return types.ObjectNull(autoReviewAttrTypes)
@@ -210,6 +213,7 @@ func autoReviewToObject(a *client.AutoReview) types.Object {
 		"can_decide_own_pr": types.BoolValue(a.CanDecideOwnPR),
 		"approve_up_to":     optionalString(a.ApproveUpTo),
 		"gate":              types.BoolValue(a.Gate),
+		"own_prs":           types.StringValue(a.OwnPRsOrWait()),
 	})
 }
 
@@ -232,7 +236,7 @@ func autoReviewFromModel(ctx context.Context, m appModel, diags *diag.Diagnostic
 	}
 	if auto.Events.IsUnknown() || auto.Workflows.IsUnknown() || auto.MaxPerDay.IsUnknown() ||
 		auto.CanDecide.IsUnknown() || auto.CanDecideOwnPR.IsUnknown() || auto.ApproveUpTo.IsUnknown() ||
-		auto.Gate.IsUnknown() {
+		auto.Gate.IsUnknown() || auto.OwnPRs.IsUnknown() {
 		unknownAtApply(diags, "auto_review")
 		return nil
 	}
@@ -244,6 +248,7 @@ func autoReviewFromModel(ctx context.Context, m appModel, diags *diag.Diagnostic
 		CanDecideOwnPR: auto.CanDecideOwnPR.ValueBool(),
 		ApproveUpTo:    auto.ApproveUpTo.ValueString(),
 		Gate:           auto.Gate.ValueBool(),
+		OwnPRs:         auto.OwnPRs.ValueString(),
 	}}
 }
 
@@ -494,8 +499,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"size, set together, and a change to either sends both.\n\n" +
 			"`auto_review` has AutoPilot review the app's pull requests on its own, with no label, as the app's own " +
 			"service identity, and lets the GitHub Actions workflows it lists ask for those reviews. Its `gate` adds " +
-			"a check that decides, `AutoPilot review gate`, which a ruleset can require. It is one setting, and a " +
-			"change to any of its fields sends all of them.\n\n" +
+			"a check that decides, `AutoPilot review gate`, which a ruleset can require, and its `own_prs` says how " +
+			"that check treats the pull requests AutoPilot opens itself. It is one setting, and a change to any of " +
+			"its fields sends all of them.\n\n" +
 			"`review_also_reads` lets the reviews of the app's repositories read other repositories of the same " +
 			"owner, read-only. Anyone who can push a branch to one of the app's repositories, and anyone who can read " +
 			"its reviews, can see what those repositories hold.\n\n" +
@@ -863,7 +869,8 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 							"for changes or its outcome is `fail`; and otherwise it waits, completed as `action_required`, " +
 							"until someone with write access approves the pull request at that head. A head that gets no " +
 							"review, such as one past `max_per_day`, waits too. A Dependabot pull request's check passes with " +
-							"no review, and any other bot's waits. A commit at the head of more than one pull request shows the " +
+							"no review, AutoPilot's own pull request's goes as `own_prs` says, and any other bot's waits. A " +
+							"commit at the head of more than one pull request shows the " +
 							"strictest of theirs. Require `AutoPilot review gate`, never the review's own check run, " +
 							"`AutoPilot review (automatic)`, which still always ends `neutral`. Off, there is no gate check. " +
 							"Defaults to `false`. `true` needs `can_decide = true`, and every event in `events` (`opened`, " +
@@ -884,6 +891,36 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 						Optional: true,
 						Computed: true,
 						Default:  booldefault.StaticBool(false),
+					},
+					"own_prs": schema.StringAttribute{
+						MarkdownDescription: "How the gate's check, `AutoPilot review gate`, treats AutoPilot's own pull " +
+							"requests: the ones AutoPilot's GitHub App opens for its own tasks, such as `implement-work-item`, " +
+							"`fix-error` and `resolve-conflicts`. `wait`, the default, has the check wait until someone with " +
+							"write access approves the pull request at that head, as for any other bot's. `pass` has it pass " +
+							"with no review, as a Dependabot pull request's does; **a commit that someone with write access " +
+							"pushes onto AutoPilot's own pull request then passes unreviewed too,** as on Dependabot's, so set " +
+							"it only where that is acceptable. `review` has the app's automatic review review AutoPilot's own " +
+							"pull request, by every rule it meets on a person's (`approve_up_to`, the risk rules, " +
+							"`max_per_day`), and the check passes, fails or waits on that review, as on a person's pull " +
+							"request. GitHub doesn't let a pull request's author approve it or request changes on it, and " +
+							"AutoPilot's GitHub App is the author, so under `review` AutoPilot posts its decision as a " +
+							"comment, which GitHub never counts as an approval. A bot's pull request is no developer's own, " +
+							"so `can_decide_own_pr` has no say here. AutoPilot's own pull request is one whose author GitHub " +
+							"names as AutoPilot's GitHub App's bot; until GitHub has named that bot to AutoPilot, such a pull " +
+							"request waits under `pass` or `review` too. `pass` and `review` need `gate = true`. A change " +
+							"reaches only the heads reviewed after it, and moving off `review` stops an automatic review of " +
+							"AutoPilot's own pull request still queued or running, so its head waits. **Setting `pass` or " +
+							"`review` needs an AutoPilot that knows the field;** an older one refuses the " +
+							"field with a 422. `wait` is never sent, so an app that leaves it at `wait` works with any " +
+							"AutoPilot that takes `auto_review`. An AutoPilot rolled back past the field treats AutoPilot's " +
+							"own pull requests as any other bot's, so their checks wait; it also refuses every write that " +
+							"sends the field, and drops it on any write it takes to the app. Meanwhile the provider reads it " +
+							"as `wait`, so a configuration that sets `pass` or `review` plans a change on every run and its " +
+							"applies fail until it is taken out or AutoPilot is rolled forward.",
+						Optional:   true,
+						Computed:   true,
+						Default:    stringdefault.StaticString(client.OwnPRsWait),
+						Validators: []validator.String{stringvalidator.OneOf(client.OwnPRsValues...)},
 					},
 				},
 			},
@@ -1037,9 +1074,10 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 
 // ValidateConfig checks the rules that span two arguments: the credential
 // policy's, the worker size's, that each GitHub login's developer is one of
-// the developers, automatic reviews' deciding knobs, gate, events and
-// workflows, and what reviews also read beside the app's own repositories. A
-// value not known yet waits: Terraform validates again at apply.
+// the developers, automatic reviews' deciding knobs, gate, own_prs, events
+// and workflows, and what reviews also read beside the app's own
+// repositories. A value not known yet waits: Terraform validates again at
+// apply.
 func (r *appResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	validatePolicy(ctx, req, resp)
 	validateSize(ctx, req, resp)
@@ -1088,8 +1126,9 @@ func validateReviewAlsoReads(ctx context.Context, req resource.ValidateConfigReq
 }
 
 // validateAutoReview checks automatic reviews' fields that depend on each
-// other as AutoPilot does: the deciding knobs, the gate, the events beside
-// the workflows, and the workflows' repositories' case.
+// other as AutoPilot does, in its order: the deciding knobs, the gate,
+// own_prs, the events beside the workflows, and the workflows' repositories'
+// case.
 func validateAutoReview(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	var auto types.Object
 	diags := req.Config.GetAttribute(ctx, path.Root("auto_review"), &auto)
@@ -1103,6 +1142,7 @@ func validateAutoReview(ctx context.Context, req resource.ValidateConfigRequest,
 	}
 	validateAutoReviewKnobs(m, resp)
 	validateAutoReviewGate(m, resp)
+	validateAutoReviewOwnPRs(m, resp)
 	validateAutoReviewEvents(m, resp)
 	validateAutoReviewWorkflows(m, resp)
 }
@@ -1145,6 +1185,21 @@ func validateAutoReviewGate(m autoReviewModel, resp *resource.ValidateConfigResp
 			return
 		}
 	}
+}
+
+// validateAutoReviewOwnPRs checks own_prs as AutoPilot does: pass or review
+// says how the gate's check treats AutoPilot's own pull requests, so it needs
+// the gate. gate left out is its default, false. A value not known yet waits,
+// and one that isn't pass or review is wait, or refused by its own validator.
+func validateAutoReviewOwnPRs(m autoReviewModel, resp *resource.ValidateConfigResponse) {
+	if !known(m.OwnPRs) || (m.OwnPRs.ValueString() != client.OwnPRsPass && m.OwnPRs.ValueString() != client.OwnPRsReview) ||
+		m.Gate.IsUnknown() || isTrue(m.Gate) {
+		return
+	}
+	resp.Diagnostics.AddAttributeError(path.Root("auto_review").AtName("own_prs"), "own_prs without gate",
+		fmt.Sprintf("auto_review sets own_prs = %q, which says how the gate's check treats AutoPilot's own pull "+
+			"requests, but gate isn't true, so there is no such check. Set gate = true too, or leave own_prs out.",
+			m.OwnPRs.ValueString()))
 }
 
 // validateAutoReviewEvents checks events beside workflows, as AutoPilot

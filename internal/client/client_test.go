@@ -1015,7 +1015,8 @@ func TestGetApp_WithoutGitHubLogins(t *testing.T) {
 // and as null to take them away. Left unset, they aren't sent. The workflows
 // are sent sorted and each once, and only when there are some: never as []
 // or null, which an AutoPilot that predates them would refuse. The gate is
-// sent only when on, never as false, for the same reason.
+// sent only when on, never as false, and own_prs only as pass or review,
+// never as wait or empty, for the same reason.
 func TestUpdateApp_SendsAutoReview(t *testing.T) {
 	var bodies []string
 	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1044,6 +1045,15 @@ func TestUpdateApp_SendsAutoReview(t *testing.T) {
 		{AutoReview: &AutoReviewSetting{On: &AutoReview{
 			Events: []string{"opened", "ready_for_review", "synchronize"}, MaxPerDay: 50, CanDecide: true, Gate: false,
 		}}},
+		{AutoReview: &AutoReviewSetting{On: &AutoReview{
+			Events: []string{"opened", "ready_for_review", "synchronize"}, MaxPerDay: 50, CanDecide: true, Gate: true, OwnPRs: "pass",
+		}}},
+		{AutoReview: &AutoReviewSetting{On: &AutoReview{
+			Events: []string{"opened", "ready_for_review", "synchronize"}, MaxPerDay: 50, CanDecide: true, Gate: true, OwnPRs: "review",
+		}}},
+		{AutoReview: &AutoReviewSetting{On: &AutoReview{
+			Events: []string{"opened", "ready_for_review", "synchronize"}, MaxPerDay: 50, CanDecide: true, Gate: true, OwnPRs: "wait",
+		}}},
 	} {
 		if _, err := c.UpdateApp(ctx, "billing", spec, 1); err != nil {
 			t.Fatal(err)
@@ -1058,6 +1068,12 @@ func TestUpdateApp_SendsAutoReview(t *testing.T) {
 		`{"auto_review":{"approve_up_to":null,"can_decide":false,"can_decide_own_pr":false,"events":["opened"],"max_per_day":50}}`,
 		`{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,"events":["opened","ready_for_review","synchronize"],"gate":true,"max_per_day":50}}`,
 		`{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,"events":["opened","ready_for_review","synchronize"],"max_per_day":50}}`,
+		`{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,"events":["opened","ready_for_review","synchronize"],"gate":true,"max_per_day":50,"own_prs":"pass"}}`,
+		`{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,"events":["opened","ready_for_review","synchronize"],"gate":true,"max_per_day":50,"own_prs":"review"}}`,
+		`{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,"events":["opened","ready_for_review","synchronize"],"gate":true,"max_per_day":50}}`,
+	}
+	if len(bodies) != len(want) {
+		t.Fatalf("%d bodies sent, want %d", len(bodies), len(want))
 	}
 	for i := range want {
 		if bodies[i] != want[i] {
@@ -1111,6 +1127,20 @@ func TestAppSpec_AutoReviewReflectedIn(t *testing.T) {
 			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide, a.Gate = true, true })}, false},
 		{set(on(func(a *AutoReview) { a.CanDecide, a.Gate = true, true })),
 			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide, a.Gate = true, true })}, true},
+		// own_prs is a change between its values, and wait is wait whether
+		// it is sent, answered or left out.
+		{set(on(func(a *AutoReview) { a.CanDecide, a.Gate, a.OwnPRs = true, true, "pass" })),
+			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide, a.Gate, a.OwnPRs = true, true, "wait" })}, false},
+		{set(on(func(a *AutoReview) { a.CanDecide, a.Gate, a.OwnPRs = true, true, "review" })),
+			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide, a.Gate, a.OwnPRs = true, true, "pass" })}, false},
+		{set(on(func(a *AutoReview) { a.CanDecide, a.Gate = true, true })),
+			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide, a.Gate, a.OwnPRs = true, true, "review" })}, false},
+		{set(on(func(a *AutoReview) { a.CanDecide, a.Gate, a.OwnPRs = true, true, "review" })),
+			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide, a.Gate, a.OwnPRs = true, true, "review" })}, true},
+		{set(on(func(a *AutoReview) { a.CanDecide, a.Gate, a.OwnPRs = true, true, "wait" })),
+			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide, a.Gate = true, true })}, true},
+		{set(on(func(a *AutoReview) { a.CanDecide, a.Gate = true, true })),
+			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide, a.Gate, a.OwnPRs = true, true, "wait" })}, true},
 		{set(nil), &App{AutoReview: on(same)}, false},
 		{set(nil), &App{}, true},
 		{AppSpec{}, &App{AutoReview: on(same)}, true},
@@ -1125,7 +1155,8 @@ func TestAppSpec_AutoReviewReflectedIn(t *testing.T) {
 // AutoPilot answers auto_review as null for an app without automatic
 // reviews, and an AutoPilot that predates it answers without it: both read
 // as none. A ceiling of null reads as none, and so do workflows left out, as
-// an AutoPilot that predates them answers; a gate left out reads as off.
+// an AutoPilot that predates them answers; a gate left out reads as off, and
+// own_prs left out as wait.
 func TestGetApp_AutoReview(t *testing.T) {
 	answers := []map[string]any{
 		{"name": "billing", "lock_version": 1},
@@ -1148,7 +1179,7 @@ func TestGetApp_AutoReview(t *testing.T) {
 		}
 		if i == 2 && (a.AutoReview == nil || !slices.Equal(a.AutoReview.Events, []string{"opened", "synchronize"}) ||
 			a.AutoReview.MaxPerDay != 10 || !a.AutoReview.CanDecide || a.AutoReview.CanDecideOwnPR || a.AutoReview.ApproveUpTo != "" ||
-			len(a.AutoReview.Workflows) != 0 || a.AutoReview.Gate) {
+			len(a.AutoReview.Workflows) != 0 || a.AutoReview.Gate || a.AutoReview.OwnPRsOrWait() != OwnPRsWait) {
 			t.Errorf("auto_review = %+v", a.AutoReview)
 		}
 	}
@@ -1179,6 +1210,21 @@ func TestGetApp_AutoReview(t *testing.T) {
 		}
 		if a.AutoReview == nil || a.AutoReview.Gate != gate {
 			t.Errorf("auto_review = %+v, want gate %v", a.AutoReview, gate)
+		}
+	}
+	for _, own := range OwnPRsValues {
+		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 1, "auto_review": map[string]any{
+				"events": []string{"opened", "ready_for_review", "synchronize"}, "workflows": []string{}, "max_per_day": 50,
+				"can_decide": true, "can_decide_own_pr": false, "approve_up_to": nil, "gate": true, "own_prs": own,
+			}})
+		}))
+		a, err := c.GetApp(context.Background(), "billing")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.AutoReview == nil || a.AutoReview.OwnPRs != own || a.AutoReview.OwnPRsOrWait() != own {
+			t.Errorf("auto_review = %+v, want own_prs %s", a.AutoReview, own)
 		}
 	}
 }

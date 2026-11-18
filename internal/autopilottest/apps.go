@@ -41,6 +41,9 @@ var (
 	// the order AutoPilot keeps them, and those they start on unless set.
 	autoEvents        = []string{"opened", "ready_for_review", "synchronize"}
 	defaultAutoEvents = []string{"opened", "ready_for_review"}
+	// How a gated app's check treats AutoPilot's own pull requests: wait,
+	// the default, pass or review.
+	ownPRsValues = []string{"wait", "pass", "review"}
 	// An app's cap on its automatic reviews in 24 hours: its default, and
 	// the most it may be.
 	defaultAutoPerDay int64 = 50
@@ -267,7 +270,9 @@ func workflowKey(text string) (key string, ok bool) {
 
 // AutoReview is an app's automatic reviews. An empty ApproveUpTo is no
 // ceiling (null), and no Workflows (nil or empty) is none. Gate adds a check
-// run of their own that decides, so a ruleset can require it.
+// run of their own that decides, so a ruleset can require it. OwnPRs is how
+// that check treats AutoPilot's own pull requests: wait, pass or review, and
+// empty is wait.
 type AutoReview struct {
 	Events         []string
 	Workflows      []string
@@ -276,6 +281,16 @@ type AutoReview struct {
 	CanDecideOwnPR bool
 	ApproveUpTo    string
 	Gate           bool
+	OwnPRs         string
+}
+
+// ownPRs is how the gate treats AutoPilot's own pull requests, as AutoPilot
+// reads it: pass or review only as set, with the gate, and wait otherwise.
+func (a *AutoReview) ownPRs() string {
+	if a.Gate && (a.OwnPRs == "pass" || a.OwnPRs == "review") {
+		return a.OwnPRs
+	}
+	return "wait"
 }
 
 func cloneAutoReview(a *AutoReview) *AutoReview {
@@ -293,8 +308,9 @@ func cloneAutoReview(a *AutoReview) *AutoReview {
 // each once, in its order; the workflows it reads (AutoPilot only leaves out
 // those it can't read; they are also sorted and kept once each here, as any
 // write AutoPilot takes keeps them); none at all with no event and no
-// workflow; and the own pull request's toggle and the gate only with
-// can_decide.
+// workflow; the own pull request's toggle and the gate only with
+// can_decide; and own_prs pass or review only with the gate, and otherwise
+// wait.
 func storedAutoReview(a *AutoReview) *AutoReview {
 	if a == nil {
 		return nil
@@ -317,6 +333,7 @@ func storedAutoReview(a *AutoReview) *AutoReview {
 	}
 	out.CanDecideOwnPR = a.CanDecide && a.CanDecideOwnPR
 	out.Gate = a.CanDecide && a.Gate
+	out.OwnPRs = out.ownPRs()
 	return out
 }
 
@@ -331,11 +348,11 @@ func sameAutoReview(x, y *AutoReview) bool {
 	}
 	return slices.Equal(x.Events, y.Events) && slices.Equal(x.Workflows, y.Workflows) && x.MaxPerDay == y.MaxPerDay &&
 		x.CanDecide == y.CanDecide && x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo &&
-		x.Gate == y.Gate
+		x.Gate == y.Gate && x.ownPRs() == y.ownPRs()
 }
 
 // autoReviewJSON is automatic reviews as AutoPilot shows them: every field,
-// the gate included when off, or null for none.
+// the gate included when off and own_prs when wait, or null for none.
 func autoReviewJSON(a *AutoReview) any {
 	if a == nil {
 		return nil
@@ -343,7 +360,7 @@ func autoReviewJSON(a *AutoReview) any {
 	return map[string]any{
 		"events": slices.Clone(a.Events), "workflows": orEmpty(slices.Clone(a.Workflows)), "max_per_day": a.MaxPerDay,
 		"can_decide": a.CanDecide, "can_decide_own_pr": a.CanDecideOwnPR, "approve_up_to": nullable(a.ApproveUpTo),
-		"gate": a.Gate,
+		"gate": a.Gate, "own_prs": a.ownPRs(),
 	}
 }
 
@@ -352,17 +369,18 @@ func autoReviewJSON(a *AutoReview) any {
 // default; the events kept once each, in autoEvents' order, and none only
 // beside a workflow, which needs them sent; the workflows as
 // readAutoWorkflows reads them; can_decide_own_pr and approve_up_to only
-// with can_decide; and the gate only with can_decide and every event, or a
-// workflow, checked in that order before the events.
+// with can_decide; the gate only with can_decide and every event, or a
+// workflow; and own_prs anything but wait only with the gate, checked in that
+// order before the events.
 func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
 	if string(raw) == "null" {
 		return nil, nil
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
-		return nil, invalid("/auto_review", "is an object with events, workflows, max_per_day, can_decide, can_decide_own_pr, approve_up_to and gate, or null")
+		return nil, invalid("/auto_review", "is an object with events, workflows, max_per_day, can_decide, can_decide_own_pr, approve_up_to, gate and own_prs, or null")
 	}
-	out := AutoReview{Events: slices.Clone(defaultAutoEvents), Workflows: []string{}, MaxPerDay: defaultAutoPerDay}
+	out := AutoReview{Events: slices.Clone(defaultAutoEvents), Workflows: []string{}, MaxPerDay: defaultAutoPerDay, OwnPRs: "wait"}
 	_, eventsSent := obj["events"]
 	keys := make([]string, 0, len(obj))
 	for k := range obj {
@@ -421,6 +439,12 @@ func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
 			if out.Gate, ref = boolValue(obj[k], at); ref != nil {
 				return nil, ref
 			}
+		case "own_prs":
+			var own *string
+			if err := json.Unmarshal(obj[k], &own); err != nil || own == nil || !slices.Contains(ownPRsValues, *own) {
+				return nil, invalid(at, "is wait, pass or review")
+			}
+			out.OwnPRs = *own
 		default:
 			if !plainKey.MatchString(k) {
 				at = "/auto_review"
@@ -445,6 +469,12 @@ func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
 	if out.Gate && len(out.Workflows) == 0 && !slices.Equal(out.Events, autoEvents) {
 		return nil, invalid("/auto_review/gate",
 			"is true only with every event (opened, ready_for_review and synchronize), or a workflow that asks, so each head gets its check")
+	}
+	// How the gate treats AutoPilot's own pull requests means nothing
+	// without it.
+	if out.OwnPRs != "wait" && !out.Gate {
+		return nil, invalid("/auto_review/own_prs",
+			"is pass or review only with gate true: it says how the gate's check treats AutoPilot's own pull requests")
 	}
 	if len(out.Events) == 0 && len(out.Workflows) == 0 {
 		return nil, invalid("/auto_review/events", "names at least one event, unless workflows lists a workflow that may ask")
