@@ -55,6 +55,9 @@ type Server struct {
 	// retiredOweWork leaves a deleted sender retired, still finishing its
 	// tasks, until FinishRetiredWork. Otherwise it becomes a tombstone at once.
 	retiredOweWork bool
+	// ownAppSlug is AutoPilot's own GitHub App's slug, as GitHub named it to
+	// the service, or "" while the service doesn't know it (SetOwnAppSlug).
+	ownAppSlug string
 
 	// Fault injection.
 	throttleNext    int

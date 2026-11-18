@@ -71,6 +71,7 @@ type autoReviewModel struct {
 	ApproveUpTo    types.String `tfsdk:"approve_up_to"`
 	Gate           types.Bool   `tfsdk:"gate"`
 	OwnPRs         types.String `tfsdk:"own_prs"`
+	Bots           types.Set    `tfsdk:"bots"`
 }
 
 var autoReviewAttrTypes = map[string]attr.Type{
@@ -82,16 +83,18 @@ var autoReviewAttrTypes = map[string]attr.Type{
 	"approve_up_to":     types.StringType,
 	"gate":              types.BoolType,
 	"own_prs":           types.StringType,
+	"bots":              types.SetType{ElemType: types.StringType},
 }
 
 // The events and the cap an app's automatic reviews have unless it says,
-// the most the cap may be, and the most workflows it may list, as AutoPilot
-// has them.
+// the most the cap may be, and the most workflows and bots it may list, as
+// AutoPilot has them.
 var (
 	defaultAutoEvents       = []string{"opened", "ready_for_review"}
 	defaultAutoPerDay int64 = 50
 	maxAutoPerDay     int64 = 200
 	maxAutoWorkflows        = 20
+	maxAutoBots             = 20
 )
 
 type acceptModel struct {
@@ -203,10 +206,10 @@ func noneSet(s types.Set) bool { return s.IsNull() || emptySet(s) }
 
 // autoReviewToObject maps the automatic reviews AutoPilot answered with to
 // state: null for none (or an AutoPilot that predates the field), and every
-// field otherwise, the ceiling null for none, the workflows empty for none,
-// the gate false when off and own_prs wait when wait (or an AutoPilot that
-// predates any of them). The plan fills each field it leaves out with
-// AutoPilot's default, so the two agree.
+// field otherwise, the ceiling null for none, the workflows and the bots
+// empty for none, the gate false when off and own_prs wait when wait (or an
+// AutoPilot that predates any of them). The plan fills each field it leaves
+// out with AutoPilot's default, so the two agree.
 func autoReviewToObject(a *client.AutoReview) types.Object {
 	if a == nil {
 		return types.ObjectNull(autoReviewAttrTypes)
@@ -220,6 +223,7 @@ func autoReviewToObject(a *client.AutoReview) types.Object {
 		"approve_up_to":     optionalString(a.ApproveUpTo),
 		"gate":              types.BoolValue(a.Gate),
 		"own_prs":           types.StringValue(a.OwnPRsOrWait()),
+		"bots":              setFromStrings(a.Bots),
 	})
 }
 
@@ -242,7 +246,7 @@ func autoReviewFromModel(ctx context.Context, m appModel, diags *diag.Diagnostic
 	}
 	if auto.Events.IsUnknown() || auto.Workflows.IsUnknown() || auto.MaxPerDay.IsUnknown() ||
 		auto.CanDecide.IsUnknown() || auto.CanDecideOwnPR.IsUnknown() || auto.ApproveUpTo.IsUnknown() ||
-		auto.Gate.IsUnknown() || auto.OwnPRs.IsUnknown() {
+		auto.Gate.IsUnknown() || auto.OwnPRs.IsUnknown() || auto.Bots.IsUnknown() {
 		unknownAtApply(diags, "auto_review")
 		return nil
 	}
@@ -255,6 +259,7 @@ func autoReviewFromModel(ctx context.Context, m appModel, diags *diag.Diagnostic
 		ApproveUpTo:    auto.ApproveUpTo.ValueString(),
 		Gate:           auto.Gate.ValueBool(),
 		OwnPRs:         auto.OwnPRs.ValueString(),
+		Bots:           stringsFromSet(ctx, auto.Bots, "auto_review", diags),
 	}}
 }
 
@@ -522,8 +527,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"`auto_review` has AutoPilot review the app's pull requests on its own, with no label, as the app's own " +
 			"service identity, and lets the GitHub Actions workflows it lists ask for those reviews. Its `gate` adds " +
 			"a check that decides, `AutoPilot review gate`, which a ruleset can require, and its `own_prs` says how " +
-			"that check treats the pull requests AutoPilot opens itself. It is one setting, and a change to any of " +
-			"its fields sends all of them.\n\n" +
+			"that check treats the pull requests AutoPilot opens itself. Its `bots` lists the bots whose pull requests " +
+			"it reviews as a person's, which trusts whoever can make those bots open one. It is one setting, and a " +
+			"change to any of its fields sends all of them.\n\n" +
 			"`review_also_reads` lets the reviews of the app's repositories read other repositories of the same " +
 			"owner, read-only. Anyone who can push a branch to one of the app's repositories, and anyone who can read " +
 			"its reviews, can see what those repositories hold.\n\n" +
@@ -769,7 +775,8 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				MarkdownDescription: "Automatic reviews: AutoPilot reviews each pull request into the default branch of " +
 					"this app's repositories on its own, with no label or comment, when it is opened, marked ready or " +
 					"pushed to, as `events` says, or when a GitHub Actions workflow listed in `workflows` asks. It reviews only a person's pull request, never a bot's (Dependabot's, or " +
-					"any account GitHub calls a bot), and never a draft until it is marked ready. It reviews only a pull " +
+					"any account GitHub calls a bot) unless `bots` lists that bot, or `own_prs` says so for AutoPilot's " +
+					"own, and never a draft until it is marked ready. It reviews only a pull " +
 					"request from a branch of the repository itself, never a fork's, so no one outside the repository " +
 					"can have code run with no person asking; a developer's `autopilot-review` label still reviews a " +
 					"fork's pull request, only as a comment. The review runs as the app's own service identity, " +
@@ -895,8 +902,9 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 							"approves, by every rule an approval meets, `approve_up_to` included; it fails where the review asks " +
 							"for changes or its outcome is `fail`; and otherwise it waits, completed as `action_required`, " +
 							"until someone with write access approves the pull request at that head. A head that gets no " +
-							"review, such as one past `max_per_day`, waits too. A Dependabot pull request's check passes with " +
-							"no review, AutoPilot's own pull request's goes as `own_prs` says, and any other bot's waits. A " +
+							"review, such as one past `max_per_day`, waits too. A pull request of a bot that `bots` lists gets " +
+							"its check from its review, as a person's does. Otherwise a Dependabot pull request's check passes " +
+							"with no review, AutoPilot's own pull request's goes as `own_prs` says, and any other bot's waits. A " +
 							"commit at the head of more than one pull request shows the " +
 							"strictest of theirs. Require `AutoPilot review gate`, never the review's own check run, " +
 							"`AutoPilot review (automatic)`, which still always ends `neutral`. Off, there is no gate check. " +
@@ -923,7 +931,7 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 						MarkdownDescription: "How the gate's check, `AutoPilot review gate`, treats AutoPilot's own pull " +
 							"requests: the ones AutoPilot's GitHub App opens for its own tasks, such as `implement-work-item`, " +
 							"`fix-error` and `resolve-conflicts`. `wait`, the default, has the check wait until someone with " +
-							"write access approves the pull request at that head, as for any other bot's. `pass` has it pass " +
+							"write access approves the pull request at that head, as for any bot's that `bots` doesn't list. `pass` has it pass " +
 							"with no review, as a Dependabot pull request's does; **a commit that someone with write access " +
 							"pushes onto AutoPilot's own pull request then passes unreviewed too,** as on Dependabot's, so set " +
 							"it only where that is acceptable. `review` has the app's automatic review review AutoPilot's own " +
@@ -932,7 +940,8 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 							"request. GitHub doesn't let a pull request's author approve it or request changes on it, and " +
 							"AutoPilot's GitHub App is the author, so under `review` AutoPilot posts its decision as a " +
 							"comment, which GitHub never counts as an approval. A bot's pull request is no developer's own, " +
-							"so `can_decide_own_pr` has no say here. AutoPilot's own pull request is one whose author GitHub " +
+							"so `can_decide_own_pr` has no say here. `bots` never changes how AutoPilot's own pull requests are " +
+							"treated: only this does. AutoPilot's own pull request is one whose author GitHub " +
 							"names as AutoPilot's GitHub App's bot; until GitHub has named that bot to AutoPilot, such a pull " +
 							"request waits under `pass` or `review` too. `pass` and `review` need `gate = true`. A change " +
 							"reaches only the heads reviewed after it, and moving off `review` stops an automatic review of " +
@@ -948,6 +957,55 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 						Computed:   true,
 						Default:    stringdefault.StaticString(client.OwnPRsWait),
 						Validators: []validator.String{stringvalidator.OneOf(client.OwnPRsValues...)},
+					},
+					"bots": schema.SetAttribute{
+						MarkdownDescription: "The bots whose pull requests this app's automatic reviews take, each by its " +
+							"exact login as GitHub names a pull request's author: an App's slug and `[bot]`, such as " +
+							"`renovate[bot]` or `dependabot[bot]`. Never a pattern and never a person's login. A pull request " +
+							"whose author GitHub reads as a bot with a listed login, compared without regard to case, is " +
+							"reviewed as a person's is, by the same rules (`can_decide`, `approve_up_to`, the risk rules, " +
+							"`max_per_day`), gated or not; with `gate`, its check passes, fails or waits on that review. A " +
+							"bot's pull request is no developer's own, so `can_decide_own_pr` has no say. A commit someone " +
+							"with write access pushes onto a listed bot's pull request is reviewed with it. Each review counts " +
+							"against `max_per_day` as a person's does, so where `events` has `synchronize`, a bot that rebases " +
+							"many pull requests at once, as Renovate and Dependabot do when the default branch moves, can use " +
+							"up the day's cap and leave the app's other pull requests, people's too, without an automatic " +
+							"review for up to a day. **Listing a bot trusts whoever can make it open a pull request.** Its " +
+							"code comes from outside the repository's writers, such as a package version the bot picked, and " +
+							"the review runs the repository's install and checks on it. So, as for a fork's pull request, that " +
+							"review gets neither the Sidekiq Pro key nor the repositories in `review_also_reads`, but the code " +
+							"still runs in AutoPilot's worker. Listing `github-actions[bot]` trusts every writer's GitHub " +
+							"Actions workflow, on any branch, to open a pull request that is reviewed and, with `can_decide`, " +
+							"may be approved. Listing a bot that opens pull requests for people who can't push, such as from an " +
+							"issue, a comment or a form, trusts those people the same way. On a gated app, Dependabot's pull " +
+							"requests pass the gate with no review unless Dependabot is listed; listed, they are reviewed " +
+							"instead, and their check goes by that review. **Never list an AutoPilot GitHub App, this " +
+							"environment's or another's.** AutoPilot's own pull requests go by `own_prs` alone, listed or not, " +
+							"but AutoPilot can't tell another environment's AutoPilot App from any other bot, so listing one " +
+							"would have AutoPilot approve AutoPilot's code. AutoPilot refuses its own App's login with a 422 " +
+							"once GitHub has named that App to it, but not while a copy of AutoPilot that just started doesn't " +
+							"know it yet, and never another environment's, so don't count on the refusal. Kept sorted, each " +
+							"once, as listed; no " +
+							"two may differ only in case. At most 20. Defaults to none. A change reaches the pull requests " +
+							"reviewed after it; taking a bot off the list stops its automatic reviews still queued or running " +
+							"that may decide, while one that only comments goes on. Listing some needs an AutoPilot that knows " +
+							"the field; an older one refuses it with a 422. None is never sent, so an app that lists none works " +
+							"with any AutoPilot that takes `auto_review`. An AutoPilot rolled back past the field skips every " +
+							"bot's pull request again (on a gated app, its check waits for a writer, and Dependabot's passes), " +
+							"refuses every write that sends it, and drops it on any write it takes to the app. Meanwhile the " +
+							"provider reads it as none, so a configuration that lists some plans a change on every run and its " +
+							"applies fail until they are taken out or AutoPilot is rolled forward.",
+						ElementType: types.StringType,
+						Optional:    true,
+						Computed:    true,
+						Default:     setdefault.StaticValue(setFromStrings(nil)),
+						Validators: []validator.Set{
+							setvalidator.SizeAtMost(maxAutoBots),
+							setvalidator.ValueStringsAre(stringvalidator.RegexMatches(botLoginPattern,
+								"must be a bot's exact login as GitHub names a pull request's author: an App's slug and [bot], "+
+									"such as renovate[bot]")),
+							noCaseRepeatsValidator{what: "bots"},
+						},
 					},
 				},
 			},
