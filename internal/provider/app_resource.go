@@ -57,6 +57,8 @@ type appModel struct {
 	MaxReviewsPerDay   types.Int64  `tfsdk:"max_reviews_per_day"`
 	ApproveAsUser      types.Bool   `tfsdk:"approve_as_user"`
 	ProposeReviewRules types.Bool   `tfsdk:"propose_review_rules"`
+	ReviewModel        types.String `tfsdk:"review_model"`
+	ReviewEffort       types.String `tfsdk:"review_effort"`
 	LockVersion        types.Int64  `tfsdk:"lock_version"`
 }
 
@@ -142,14 +144,16 @@ var appAPIFields = map[string]string{
 	"max_reviews_per_day":  "max_reviews_per_day",
 	"approve_as_user":      "approve_as_user",
 	"propose_review_rules": "propose_review_rules",
+	"review_model":         "review_model",
+	"review_effort":        "review_effort",
 }
 
 // appToModel maps an app. Every list is optional and left out of the
 // configuration is null, while AutoPilot answers [] for it, so an empty
 // answer stays null where prior (the plan, or the state) was null. The
-// credential policy, the worker image, the worker size and the repositories'
-// daily cap are null when AutoPilot answers null, as it does for an app
-// without them. approve_as_user and propose_review_rules are optional with
+// credential policy, the worker image, the worker size, the repositories'
+// daily cap and the reviews' model and effort are null when AutoPilot answers
+// null, as it does for an app without them. approve_as_user and propose_review_rules are optional with
 // no default, so off is null unless prior set it to false.
 func appToModel(a *client.App, prior appModel) appModel {
 	return appModel{
@@ -169,6 +173,8 @@ func appToModel(a *client.App, prior appModel) appModel {
 		MaxReviewsPerDay:   types.Int64PointerValue(a.MaxReviewsPerDay),
 		ApproveAsUser:      optionalFlag(a.ApproveAsUser, isFalse(prior.ApproveAsUser)),
 		ProposeReviewRules: optionalFlag(a.ProposeReviewRules, isFalse(prior.ProposeReviewRules)),
+		ReviewModel:        types.StringPointerValue(a.ReviewModel),
+		ReviewEffort:       types.StringPointerValue(a.ReviewEffort),
 		LockVersion:        types.Int64Value(a.LockVersion),
 	}
 }
@@ -329,6 +335,22 @@ func policyFromModel(m appModel, diags *diag.Diagnostics) *client.CredentialPoli
 		return nil
 	}
 	return &client.CredentialPolicy{Credential: m.Credential.ValueString(), WhenSeatsFull: m.WhenSeatsFull.ValueString()}
+}
+
+// reviewModelFromModel is the reviews' model and effort the plan holds, as
+// the client sends them: "" for either is its default, and both "" take the
+// app's choice away. A value still unknown at apply is an error, never read
+// as the default.
+func reviewModelFromModel(m appModel, diags *diag.Diagnostics) *client.ReviewModel {
+	if m.ReviewModel.IsUnknown() {
+		unknownAtApply(diags, "review_model")
+		return nil
+	}
+	if m.ReviewEffort.IsUnknown() {
+		unknownAtApply(diags, "review_effort")
+		return nil
+	}
+	return &client.ReviewModel{Model: m.ReviewModel.ValueString(), Effort: m.ReviewEffort.ValueString()}
 }
 
 func acceptsToSet(accepts []client.Accept, prior types.Set) types.Set {
@@ -516,6 +538,11 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"`propose_review_rules` lets AutoPilot open draft pull requests that add a rule to the `REVIEW.md` of " +
 			"the app's repositories, from how people answered its review findings, for a person to merge or " +
 			"close.\n\n" +
+			"`review_model` and `review_effort` choose the model, and its effort, that AutoPilot's own reviews of " +
+			"the app's repositories run on. They are one choice, and a change to either sends both. `review_model` " +
+			"is a model family, `sonnet` or `opus`, and AutoPilot runs that family's current version, so a new " +
+			"model version needs no Terraform change. Sonnet is the default; Opus, and a higher effort, cost " +
+			"more.\n\n" +
 			"An app with this name that already exists is not taken over, even when its values match: the create " +
 			"fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a " +
 			"gateway's 502, say) before an identical app answered: that attempt may have made the app, and the " +
@@ -1063,6 +1090,47 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					"applies fail: take it out of the configuration until AutoPilot is rolled forward.",
 				Optional: true,
 			},
+			"review_model": schema.StringAttribute{
+				MarkdownDescription: "The model family of AutoPilot's own reviews of this app's repositories: `sonnet` " +
+					"or `opus`. AutoPilot runs the family's current version, so a new model version needs no Terraform " +
+					"change. A versioned name, such as `sonnet-5-5`, is refused, and so is Haiku, which stays the small " +
+					"model a review uses for small work. It covers the reviews AutoPilot runs itself: automatic ones, " +
+					"those asked for with the `autopilot-review` label, the review command or a workflow, and those " +
+					"asked for on AutoPilot's MCP server. A sender's own `review-pr` tasks run on the model they name " +
+					"instead. Left out, reviews run on Sonnet, AutoPilot's default, and removing it from the " +
+					"configuration takes the app back to that. **Opus costs more than Sonnet.** On the organization's " +
+					"Claude seats, where every review from GitHub runs, an Opus review uses up a seat's usage limits " +
+					"faster, and every app shares the seats, so one app's Opus reviews can hold up everyone's work. On " +
+					"Amazon Bedrock, where a review from the MCP server runs when `credential` says so, Opus costs more " +
+					"per token, and that spend counts against AutoPilot's daily cap on Bedrock spend. So keep the " +
+					"default unless Opus finds what Sonnet misses on this app's pull requests. Set together with " +
+					"`review_effort`, as one choice: a change to either sends both. The choice is read when a review is " +
+					"made, so a change reaches only the reviews made after it, and a later ask for a head already " +
+					"reviewed gets that review back, on the model it ran on. Each review's footer names the model it " +
+					"ran on, and the effort when one is set. It needs an AutoPilot that takes model families; an older " +
+					"one refuses it with a 422. An AutoPilot rolled back past the field ignores a stored choice, so " +
+					"every review runs on Sonnet at Claude Code's default again, and refuses every write that sends it, " +
+					"but keeps it. Meanwhile the provider reads the app as choosing none, so a configuration that sets " +
+					"it plans a change on every run and its applies fail: take it out of the configuration until " +
+					"AutoPilot is rolled forward.",
+				Optional:   true,
+				Validators: []validator.String{stringvalidator.OneOf(reviewModels...)},
+			},
+			"review_effort": schema.StringAttribute{
+				MarkdownDescription: "The effort of the main model of this app's reviews (`review_model`), as Claude " +
+					"Code, which the reviews run in, takes it: `low`, `medium`, `high`, `xhigh` or `max`. A higher effort has the model think " +
+					"more before each answer, so it spends more tokens on each turn, whatever the model: it costs more " +
+					"on Bedrock and uses up a seat's limits faster, `xhigh` and `max` most of all. A review's own limits " +
+					"on cost and time stay the same, so a review that spends more on each turn reaches them sooner and " +
+					"stops there. Left out, the model runs at Claude Code's own default for it, and removing it from " +
+					"the configuration takes the app back to that. It goes with either model: set without " +
+					"`review_model`, reviews run on Sonnet at this effort. Claude Code may still cap it lower, " +
+					"by a limit the organization sets for the model; a review's footer names the effort asked for. Set " +
+					"together with `review_model`, as one choice: a change to either sends both. It needs an AutoPilot " +
+					"that knows the field, and is handled as `review_model` is when AutoPilot is rolled back past it.",
+				Optional:   true,
+				Validators: []validator.String{stringvalidator.OneOf(reviewEfforts...)},
+			},
 			"lock_version": schema.Int64Attribute{
 				MarkdownDescription: "The record's version, which AutoPilot raises on every change. Sent as `If-Match` " +
 					"on updates and deletes.",
@@ -1422,6 +1490,12 @@ func (r *appResource) Create(ctx context.Context, req resource.CreateRequest, re
 	if !plan.AutoReview.IsNull() {
 		spec.AutoReview = autoReviewFromModel(ctx, plan, &resp.Diagnostics)
 	}
+	// Sent only when either is set, so an AutoPilot that predates the fields
+	// still takes an app that leaves both out. An effort alone is sent with
+	// review_model null, the default model.
+	if !plan.ReviewModel.IsNull() || !plan.ReviewEffort.IsNull() {
+		spec.ReviewModel = reviewModelFromModel(plan, &resp.Diagnostics)
+	}
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -1485,9 +1559,9 @@ func (r *appResource) Read(ctx context.Context, req resource.ReadRequest, resp *
 // Update sends only what changed. A list removed from the configuration is
 // sent as [], so AutoPilot empties it as the plan says; a credential policy
 // removed is sent as credential null, which takes it away, and so are a
-// worker image, a worker size, automatic reviews and the repositories' daily
-// cap removed. approve_as_user and propose_review_rules removed are sent as
-// false.
+// worker image, a worker size, automatic reviews, the repositories' daily
+// cap and the reviews' model removed. approve_as_user and
+// propose_review_rules removed are sent as false.
 func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, state appModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -1565,6 +1639,12 @@ func (r *appResource) Update(ctx context.Context, req resource.UpdateRequest, re
 	// The same goes for proposals of review rules.
 	if plan.ProposeReviewRules.IsUnknown() || isTrue(plan.ProposeReviewRules) != isTrue(state.ProposeReviewRules) {
 		spec.ProposeReviewRules = proposeReviewRulesFromModel(plan, &resp.Diagnostics)
+	}
+	// The reviews' model and effort are one choice too, so a change to either
+	// sends both; removed, review_model is sent as null with no effort,
+	// which takes the app back to the defaults.
+	if !plan.ReviewModel.Equal(state.ReviewModel) || !plan.ReviewEffort.Equal(state.ReviewEffort) {
+		spec.ReviewModel = reviewModelFromModel(plan, &resp.Diagnostics)
 	}
 	if resp.Diagnostics.HasError() {
 		return

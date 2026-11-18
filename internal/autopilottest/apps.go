@@ -25,7 +25,7 @@ var (
 	maxAccepts         = 20
 	maxDevelopers      = 100
 	maxGitHubLogins    = 100
-	appWritable        = []string{"repos", "accepts", "developers", "github_logins", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory", "auto_review", "review_also_reads", "work_item_projects", "max_reviews_per_day", "approve_as_user", "propose_review_rules"}
+	appWritable        = []string{"repos", "accepts", "developers", "github_logins", "credential", "when_seats_full", "worker_image", "worker_cpu", "worker_memory", "auto_review", "review_also_reads", "work_item_projects", "max_reviews_per_day", "approve_as_user", "propose_review_rules", "review_model", "review_effort"}
 	appReadOnly        = []string{"lock_version", "created_at", "updated_at"}
 	acceptWritable     = []string{"sender", "kinds", "can_decide", "can_auto_merge", "can_decide_own_pr", "approve_up_to"}
 	appCreateFields    = append([]string{"name"}, appWritable...)
@@ -68,7 +68,30 @@ var (
 	// The most an app may set as its repositories' daily cap on the reviews
 	// people ask for from GitHub.
 	maxReviewsPerDay int64 = 200
+	// The model families an app may choose for its reviews, sorted.
+	// AutoPilot runs each family's current version, and refuses a versioned
+	// name such as sonnet-5-5. Never Haiku, the small model a review uses
+	// for small work. Unset, a review runs on Sonnet.
+	reviewModels = []string{"opus", "sonnet"}
+	// The efforts of that model, as Claude Code takes them. Unset, Claude
+	// Code's own default for the model.
+	reviewEfforts = []string{"low", "medium", "high", "xhigh", "max"}
 )
+
+// storedReviewModel is review_model and review_effort as AutoPilot reads
+// what it keeps, for what is given from outside a write (SeedApp,
+// ChangeAppOutOfBand): a model it doesn't run a review on, such as a
+// versioned name, reads as the default, its effort dropped with it, and an
+// effort it doesn't know reads as the model's default.
+func storedReviewModel(model, effort string) (string, string) {
+	if model != "" && !slices.Contains(reviewModels, model) {
+		return "", ""
+	}
+	if !slices.Contains(reviewEfforts, effort) {
+		effort = ""
+	}
+	return model, effort
+}
 
 // readWorkItemProjects reads work_item_projects as AutoPilot does: a list of
 // strings, every item a string before any is read as a project; the first
@@ -614,7 +637,8 @@ type Accept struct {
 // empty workerImage is null (node), a zero workerCPU and workerMemory are
 // null (the worker's own size), and a zero maxReviewsPerDay is null
 // (AutoPilot's default). approveAsUser and proposeReviewRules are false
-// unless set.
+// unless set. An empty reviewModel is null (Sonnet), and an empty
+// reviewEffort null (Claude Code's own default for the model).
 type appRecord struct {
 	name                      string
 	repos                     []string
@@ -630,6 +654,7 @@ type appRecord struct {
 	maxReviewsPerDay          int64
 	approveAsUser             bool
 	proposeReviewRules        bool
+	reviewModel, reviewEffort string
 	lockVersion               int64
 	createdAt, updatedAt      time.Time
 }
@@ -665,7 +690,11 @@ type AppView struct {
 	// ProposeReviewRules lets AutoPilot propose rules for the REVIEW.md of
 	// the app's repositories.
 	ProposeReviewRules bool
-	LockVersion        int64
+	// ReviewModel and ReviewEffort are the model and effort of the app's
+	// reviews; empty is null, the default.
+	ReviewModel  string
+	ReviewEffort string
+	LockVersion  int64
 }
 
 func (rec *appRecord) view() AppView {
@@ -680,6 +709,8 @@ func (rec *appRecord) view() AppView {
 		MaxReviewsPerDay:   rec.maxReviewsPerDay,
 		ApproveAsUser:      rec.approveAsUser,
 		ProposeReviewRules: rec.proposeReviewRules,
+		ReviewModel:        rec.reviewModel,
+		ReviewEffort:       rec.reviewEffort,
 		LockVersion:        rec.lockVersion,
 	}
 }
@@ -746,6 +777,8 @@ func (rec *appRecord) json() map[string]any {
 		"max_reviews_per_day":  nullableInt(rec.maxReviewsPerDay),
 		"approve_as_user":      rec.approveAsUser,
 		"propose_review_rules": rec.proposeReviewRules,
+		"review_model":         nullable(rec.reviewModel),
+		"review_effort":        nullable(rec.reviewEffort),
 		"lock_version":         rec.lockVersion,
 		"created_at":           timestamp(rec.createdAt),
 		"updated_at":           timestamp(rec.updatedAt),
@@ -775,6 +808,7 @@ func (s *Server) SeedApp(v AppView) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
+	model, effort := storedReviewModel(v.ReviewModel, v.ReviewEffort)
 	s.apps[v.Name] = &appRecord{
 		name: v.Name, repos: sortedUniqueFold(v.Repos), accepts: sortAccepts(v.Accepts),
 		developers: sortedUnique(v.Developers), githubLogins: sortLogins(v.GitHubLogins),
@@ -783,6 +817,7 @@ func (s *Server) SeedApp(v AppView) {
 		autoReview: storedAutoReview(v.AutoReview), alsoReads: storedAlsoReads(v.ReviewAlsoReads),
 		workItemProjects: storedWorkItemProjects(v.WorkItemProjects), maxReviewsPerDay: storedReviewsPerDay(v.MaxReviewsPerDay),
 		approveAsUser: v.ApproveAsUser, proposeReviewRules: v.ProposeReviewRules,
+		reviewModel: model, reviewEffort: effort,
 		lockVersion: 1, createdAt: now, updatedAt: now,
 	}
 }
@@ -819,6 +854,7 @@ func (s *Server) ChangeAppOutOfBand(name string, change func(v *AppView)) {
 	rec.maxReviewsPerDay = storedReviewsPerDay(v.MaxReviewsPerDay)
 	rec.approveAsUser = v.ApproveAsUser
 	rec.proposeReviewRules = v.ProposeReviewRules
+	rec.reviewModel, rec.reviewEffort = storedReviewModel(v.ReviewModel, v.ReviewEffort)
 	rec.lockVersion++
 	rec.updatedAt = time.Now()
 }
@@ -905,7 +941,9 @@ func (s *Server) appRoutes(mux *http.ServeMux) {
 // worker_image ("" for null), sizeSent that it sent worker_cpu or
 // worker_memory, which sets both (0 for null), perDaySent that it sent
 // max_reviews_per_day (0 for null), asUserSent that it sent
-// approve_as_user, and rulesSent that it sent propose_review_rules.
+// approve_as_user, rulesSent that it sent propose_review_rules, and
+// reviewModelSent that it sent review_model, which sets both reviewModel and
+// reviewEffort ("" for null).
 type appFields struct {
 	repos      []string
 	accepts    []Accept
@@ -935,12 +973,15 @@ type appFields struct {
 	approveAsUser      bool
 	rulesSent          bool
 	proposeReviewRules bool
+	reviewModelSent    bool
+	reviewModel        string
+	reviewEffort       string
 }
 
 // readAppFields reads an app's writable fields from a body, each in its
 // place, then checks the rules that span fields, in AutoPilot's order: each
 // GitHub login's developer, what reviews also read beside the repositories,
-// the credential policy, and the worker size. A create (creating) that
+// the credential policy, the worker size, and the reviews' model. A create (creating) that
 // leaves out developers or repos has none, so it is held to the first two
 // rules whenever it sends github_logins or review_also_reads; a change is
 // held to them here only when it sends both of the two fields, and
@@ -1140,6 +1181,22 @@ func readAppFields(obj map[string]json.RawMessage, creating bool) (appFields, *r
 			return f, ref
 		}
 	}
+	// The reviews' model is one too: a write that sends review_model sets
+	// both fields, and review_effort means nothing without it. Each is read
+	// in its place, and the two are checked together below.
+	rawEffort, sentEffort := obj["review_effort"]
+	rawModel, sentModel := obj["review_model"]
+	var reviewModel, reviewEffort string
+	if sentEffort {
+		if reviewEffort, ref = oneOrNull(rawEffort, "/review_effort", reviewEfforts); ref != nil {
+			return f, ref
+		}
+	}
+	if sentModel {
+		if reviewModel, ref = oneOrNull(rawModel, "/review_model", reviewModels); ref != nil {
+			return f, ref
+		}
+	}
 	if sentWhen {
 		if when, ref = oneOrNull(rawWhen, "/when_seats_full", whenSeatsFull); ref != nil {
 			return f, ref
@@ -1222,6 +1279,11 @@ func readAppFields(obj map[string]json.RawMessage, creating bool) (appFields, *r
 			return f, invalid("/worker_memory", "is MiB that Fargate allows with worker_cpu, at most 16 GB")
 		}
 		f.sizeSent, f.workerCPU, f.workerMemory = true, cpu, memory
+	}
+	if sentModel {
+		f.reviewModelSent, f.reviewModel, f.reviewEffort = true, reviewModel, reviewEffort
+	} else if sentEffort {
+		return f, invalid("/review_effort", "is sent with review_model: a write that sends review_model sets both")
 	}
 	return f, nil
 }
@@ -1330,7 +1392,8 @@ func (rec *appRecord) holds(f appFields) bool {
 		(f.workItemProjects == nil || slices.Equal(f.workItemProjects, rec.workItemProjects)) &&
 		(!f.perDaySent || f.maxReviewsPerDay == rec.maxReviewsPerDay) &&
 		(!f.asUserSent || f.approveAsUser == rec.approveAsUser) &&
-		(!f.rulesSent || f.proposeReviewRules == rec.proposeReviewRules)
+		(!f.rulesSent || f.proposeReviewRules == rec.proposeReviewRules) &&
+		(!f.reviewModelSent || (f.reviewModel == rec.reviewModel && f.reviewEffort == rec.reviewEffort))
 }
 
 // repoOwner names the app other than except that owns repo, matched without
@@ -1403,7 +1466,8 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 			existing.workerImage == f.workerImage && existing.workerCPU == f.workerCPU && existing.workerMemory == f.workerMemory &&
 			sameAutoReview(existing.autoReview, f.autoReview) && slices.Equal(existing.alsoReads, alsoReads) &&
 			slices.Equal(existing.workItemProjects, projects) && existing.maxReviewsPerDay == f.maxReviewsPerDay &&
-			existing.approveAsUser == f.approveAsUser && existing.proposeReviewRules == f.proposeReviewRules
+			existing.approveAsUser == f.approveAsUser && existing.proposeReviewRules == f.proposeReviewRules &&
+			existing.reviewModel == f.reviewModel && existing.reviewEffort == f.reviewEffort
 		if !same {
 			return 0, nil, &refusal{http.StatusConflict, "name_taken", "an app with this name exists with other fields", "/name"}
 		}
@@ -1417,7 +1481,8 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 		workerImage: f.workerImage, workerCPU: f.workerCPU, workerMemory: f.workerMemory,
 		autoReview: f.autoReview, alsoReads: alsoReads,
 		workItemProjects: projects, maxReviewsPerDay: f.maxReviewsPerDay, approveAsUser: f.approveAsUser,
-		proposeReviewRules: f.proposeReviewRules, lockVersion: 1, createdAt: now, updatedAt: now}
+		proposeReviewRules: f.proposeReviewRules, reviewModel: f.reviewModel, reviewEffort: f.reviewEffort,
+		lockVersion: 1, createdAt: now, updatedAt: now}
 	s.apps[name] = rec
 	return http.StatusCreated, rec.json(), nil
 }
@@ -1545,6 +1610,9 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 	}
 	if f.rulesSent && f.proposeReviewRules != rec.proposeReviewRules {
 		rec.proposeReviewRules, changed = f.proposeReviewRules, true
+	}
+	if f.reviewModelSent && (f.reviewModel != rec.reviewModel || f.reviewEffort != rec.reviewEffort) {
+		rec.reviewModel, rec.reviewEffort, changed = f.reviewModel, f.reviewEffort, true
 	}
 	if changed {
 		rec.lockVersion++

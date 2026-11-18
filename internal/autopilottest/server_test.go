@@ -1545,8 +1545,8 @@ func TestReviewAlsoReads_Kept(t *testing.T) {
 // An app's fields are read in sorted order, as AutoPilot reads them (this
 // fake still reads repos first), so a body with two wrong names the first;
 // the rules that span fields come after every field, in AutoPilot's order:
-// GitHub logins, what reviews also read, the credential policy, then the
-// worker size.
+// GitHub logins, what reviews also read, the credential policy, the worker
+// size, then the reviews' model.
 func TestAppFields_ReadInOrder(t *testing.T) {
 	s := New(t)
 	unpaired := []any{map[string]any{"login": "alice", "developer": "alice@example.org"}}
@@ -1579,6 +1579,15 @@ func TestAppFields_ReadInOrder(t *testing.T) {
 		{map[string]any{"max_reviews_per_day": 0, "propose_review_rules": 1}, "/max_reviews_per_day"},
 		{map[string]any{"propose_review_rules": 1, "review_also_reads": "x"}, "/propose_review_rules"},
 		{map[string]any{"github_logins": unpaired, "propose_review_rules": 1}, "/propose_review_rules"},
+		// review_effort and review_model come after review_also_reads and
+		// before when_seats_full, and before the rules that span fields; the
+		// pair's own rule comes after the worker size's.
+		{map[string]any{"review_also_reads": "x", "review_effort": "bogus"}, "/review_also_reads"},
+		{map[string]any{"review_effort": "bogus", "review_model": "bogus"}, "/review_effort"},
+		{map[string]any{"review_model": "bogus", "when_seats_full": "bogus"}, "/review_model"},
+		{map[string]any{"credential": "seat_first", "review_model": "haiku-4-5"}, "/review_model"},
+		{map[string]any{"credential": "seat_first", "review_effort": "high"}, "/when_seats_full"},
+		{map[string]any{"review_effort": "high", "worker_cpu": 1024}, "/worker_memory"},
 	}
 	for _, c := range cases {
 		body := map[string]any{"name": "billing"}
@@ -1927,6 +1936,121 @@ func TestProposeReviewRules(t *testing.T) {
 	s.ChangeAppOutOfBand("seeded", func(v *AppView) { v.ProposeReviewRules = false })
 	if v, _ := s.App("seeded"); v.ProposeReviewRules || v.LockVersion != 2 {
 		t.Errorf("changed out of band: propose_review_rules = %v, lock_version %d", v.ProposeReviewRules, v.LockVersion)
+	}
+}
+
+// The reviews' model is one, as AutoPilot takes it: a write that sends
+// review_model sets both fields, so an effort it leaves out is null, and
+// review_effort sent alone is refused. Each takes only its own values or
+// null: review_model is a family, never a versioned name, and haiku-4-5 is
+// never a review's model. An effort goes with any model, null included. A
+// create with them is a retry only with the same.
+func TestReviewModel_Rules(t *testing.T) {
+	s := New(t)
+	refused := []struct {
+		fields map[string]any
+		field  string
+	}{
+		{map[string]any{"review_model": "haiku-4-5"}, "/review_model"},
+		{map[string]any{"review_model": "haiku"}, "/review_model"},
+		{map[string]any{"review_model": "sonnet-5-5"}, "/review_model"},
+		{map[string]any{"review_model": "opus-5-5"}, "/review_model"},
+		{map[string]any{"review_model": "Opus"}, "/review_model"},
+		{map[string]any{"review_model": 1}, "/review_model"},
+		{map[string]any{"review_model": "opus", "review_effort": "extreme"}, "/review_effort"},
+		{map[string]any{"review_model": "opus", "review_effort": "HIGH"}, "/review_effort"},
+		{map[string]any{"review_model": nil, "review_effort": true}, "/review_effort"},
+		{map[string]any{"review_effort": "high"}, "/review_effort"},
+		{map[string]any{"review_effort": nil}, "/review_effort"},
+	}
+	for _, c := range refused {
+		body := map[string]any{"name": "billing"}
+		for k, v := range c.fields {
+			body[k] = v
+		}
+		st, answer := call(t, s, http.MethodPost, "/v1/admin/apps", "", body)
+		expect(t, mustJSON(c.fields), st, http.StatusUnprocessableEntity, answer)
+		if answer["field"] != c.field {
+			t.Errorf("%s: field = %v, want %s", mustJSON(c.fields), answer["field"], c.field)
+		}
+	}
+
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "plain"})
+	expect(t, "none", st, http.StatusCreated, body)
+	for _, k := range []string{"review_model", "review_effort"} {
+		if v, ok := body[k]; !ok || v != nil {
+			t.Errorf("%s = %v (sent %v), want null", k, v, ok)
+		}
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{
+		"name": "billing", "review_model": "opus", "review_effort": "high",
+	})
+	expect(t, "opus at high", st, http.StatusCreated, body)
+	if body["review_model"] != "opus" || body["review_effort"] != "high" {
+		t.Errorf("created %v", body)
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{
+		"name": "billing", "review_model": "opus", "review_effort": "high",
+	})
+	expect(t, "the same create again", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "review_model": "opus"})
+	expect(t, "a create with another effort", st, http.StatusConflict, body)
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing"})
+	expect(t, "a create without them", st, http.StatusConflict, body)
+
+	// A change that sends review_model alone takes the effort back to null.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"review_model": "opus"})
+	expect(t, "the model alone", st, http.StatusOK, body)
+	if body["review_model"] != "opus" || body["review_effort"] != nil || body["lock_version"] != float64(2) {
+		t.Errorf("changed to %v", body)
+	}
+	// A change that sends neither keeps them.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"developers": []string{"alice@example.org"}})
+	expect(t, "another field", st, http.StatusOK, body)
+	if body["review_model"] != "opus" || body["lock_version"] != float64(3) {
+		t.Errorf("a change without the model took it: %v", body)
+	}
+	// The default model at an effort.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"review_model": nil, "review_effort": "max"})
+	expect(t, "the default model at max", st, http.StatusOK, body)
+	if body["review_model"] != nil || body["review_effort"] != "max" || body["lock_version"] != float64(4) {
+		t.Errorf("changed to %v", body)
+	}
+	// A repeat one version behind of the change the record holds is that
+	// change; another is stale. A value it can't take is refused first.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"review_model": nil, "review_effort": "max"})
+	expect(t, "a repeat one version behind", st, http.StatusOK, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"review_model": nil})
+	expect(t, "another change one version behind", st, http.StatusConflict, body)
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"review_effort": "max"})
+	expect(t, "the effort alone, one version behind", st, http.StatusUnprocessableEntity, body)
+	// null alone takes both back to the defaults.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "4", map[string]any{"review_model": nil})
+	expect(t, "null", st, http.StatusOK, body)
+	if body["review_model"] != nil || body["review_effort"] != nil || body["lock_version"] != float64(5) {
+		t.Errorf("taken away: %v", body)
+	}
+
+	// What is given from outside a write is kept as AutoPilot reads it: a
+	// model it doesn't run a review on, a versioned name among them, reads
+	// as the default, its effort dropped with it, and an effort it doesn't
+	// know as the model's default.
+	for _, c := range []struct{ model, effort, wantModel, wantEffort string }{
+		{"sonnet", "xhigh", "sonnet", "xhigh"},
+		{"", "low", "", "low"},
+		{"haiku-4-5", "max", "", ""},
+		{"opus-5-5", "high", "", ""},
+		{"opus-6", "high", "", ""},
+		{"opus", "extreme", "opus", ""},
+	} {
+		s.SeedApp(AppView{Name: "seeded", ReviewModel: c.model, ReviewEffort: c.effort})
+		if v, _ := s.App("seeded"); v.ReviewModel != c.wantModel || v.ReviewEffort != c.wantEffort {
+			t.Errorf("seeded %q, %q: read %q, %q, want %q, %q", c.model, c.effort, v.ReviewModel, v.ReviewEffort, c.wantModel, c.wantEffort)
+		}
+	}
+	s.ChangeAppOutOfBand("seeded", func(v *AppView) { v.ReviewModel, v.ReviewEffort = "haiku-4-5", "low" })
+	if v, _ := s.App("seeded"); v.ReviewModel != "" || v.ReviewEffort != "" || v.LockVersion != 2 {
+		t.Errorf("changed out of band: %q, %q, lock_version %d", v.ReviewModel, v.ReviewEffort, v.LockVersion)
 	}
 }
 

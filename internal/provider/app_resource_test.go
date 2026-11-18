@@ -6896,3 +6896,464 @@ func TestAttributeFor_AppFlags(t *testing.T) {
 		}
 	}
 }
+
+// reviewModelHCL is the reviews' model and effort as configuration, each
+// left out when "".
+func reviewModelHCL(model, effort string) string {
+	var b strings.Builder
+	if model != "" {
+		fmt.Fprintf(&b, "  review_model  = %q\n", model)
+	}
+	if effort != "" {
+		fmt.Fprintf(&b, "  review_effort = %q\n", effort)
+	}
+	return b.String()
+}
+
+// checkReviewModel checks the model and effort the fake holds for an app.
+func (env *testEnv) checkReviewModel(name, model, effort string) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		if env.live() {
+			return nil
+		}
+		if v, _ := env.fake.App(name); v.ReviewModel != model || v.ReviewEffort != effort {
+			return fmt.Errorf("AutoPilot holds %q at %q, want %q at %q", v.ReviewModel, v.ReviewEffort, model, effort)
+		}
+		return nil
+	}
+}
+
+// The reviews' model and effort are set, changed and taken away. They are
+// one choice, so a change to either sends both: review_model always, null
+// for the default, and review_effort when set. Removing both sends
+// review_model null alone. The plan after each shows nothing.
+func TestApp_reviewModel(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	config := func(model, effort string) string { return appConfig(env, name, reviewModelHCL(model, effort)) }
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config("opus", "high"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "review_model", "opus"),
+					resource.TestCheckResourceAttr(appRes, "review_effort", "high"),
+					env.checkReviewModel(name, "opus", "high"),
+					func(*terraform.State) error {
+						if env.live() {
+							return nil
+						}
+						for _, r := range env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps") {
+							if body := requestBody(t, r); body["name"] == name &&
+								(body["review_model"] != "opus" || body["review_effort"] != "high") {
+								return fmt.Errorf("the create sent %v", body)
+							}
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: config("opus", "high"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// A change to the effort alone sends both.
+				Config: config("opus", "xhigh"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "review_effort", "xhigh"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					lastAppPatch(t, env, name, map[string]any{"review_model": "opus", "review_effort": "xhigh"}),
+				),
+			},
+			{
+				// The effort taken out goes back to the model's default.
+				Config: config("opus", ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "review_model", "opus"),
+					resource.TestCheckNoResourceAttr(appRes, "review_effort"),
+					lastAppPatch(t, env, name, map[string]any{"review_model": "opus"}),
+					env.checkReviewModel(name, "opus", ""),
+				),
+			},
+			{
+				// An effort without a model is the default model at that
+				// effort, sent with review_model null.
+				Config: config("", "low"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "review_model"),
+					resource.TestCheckResourceAttr(appRes, "review_effort", "low"),
+					lastAppPatch(t, env, name, map[string]any{"review_model": nil, "review_effort": "low"}),
+					env.checkReviewModel(name, "", "low"),
+				),
+			},
+			{
+				Config: config("", "low"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: config("sonnet", ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "review_model", "sonnet"),
+					resource.TestCheckNoResourceAttr(appRes, "review_effort"),
+					lastAppPatch(t, env, name, map[string]any{"review_model": "sonnet"}),
+				),
+			},
+			{
+				// Both taken out go back to the defaults.
+				Config: config("", ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "review_model"),
+					resource.TestCheckNoResourceAttr(appRes, "review_effort"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "6"),
+					lastAppPatch(t, env, name, map[string]any{"review_model": nil}),
+					env.checkReviewModel(name, "", ""),
+				),
+			},
+			{
+				Config: config("", ""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A create that leaves both out sends neither, one that sets only the
+// effort sends it with review_model null, and a change to another argument
+// leaves them out, so the app keeps them.
+func TestApp_reviewModelNotSentWhenUnchanged(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	plain, effortOnly, name := randName(), randName(), randName()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, plain, "")},
+			{
+				Config: appConfig(env, effortOnly, `  review_effort = "medium"`),
+				Check: func(*terraform.State) error {
+					for _, r := range env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps") {
+						body := requestBody(t, r)
+						_, model := body["review_model"]
+						_, effort := body["review_effort"]
+						switch body["name"] {
+						case plain:
+							if model || effort {
+								return fmt.Errorf("the create sent the reviews' model: %v", body)
+							}
+						case effortOnly:
+							if !model || body["review_model"] != nil || body["review_effort"] != "medium" {
+								return fmt.Errorf("the create sent %v", body)
+							}
+						}
+					}
+					return nil
+				},
+			},
+		},
+	})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: appConfig(env, name, reviewModelHCL("opus", "max"))},
+			{
+				Config: appConfig(env, name, reviewModelHCL("opus", "max")+`  developers = ["someone@example.com"]`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, name, map[string]any{"developers": []any{"someone@example.com"}}),
+					env.checkReviewModel(name, "opus", "max"),
+				),
+			},
+		},
+	})
+}
+
+// A model or effort changed outside Terraform shows as a change, and the
+// apply puts the configured pair back, both sent; one set outside Terraform
+// on an app that configures none is taken away.
+func TestApp_reviewModelChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	cases := []struct {
+		model, effort               string
+		outsideModel, outsideEffort string
+		sent                        map[string]any
+	}{
+		{"opus", "high", "sonnet", "", map[string]any{"review_model": "opus", "review_effort": "high"}},
+		{"opus", "high", "opus", "low", map[string]any{"review_model": "opus", "review_effort": "high"}},
+		{"", "medium", "opus", "medium", map[string]any{"review_model": nil, "review_effort": "medium"}},
+		{"", "", "opus", "max", map[string]any{"review_model": nil}},
+	}
+	for _, c := range cases {
+		name := randName()
+		config := appConfig(env, name, reviewModelHCL(c.model, c.effort))
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() {
+						env.fake.ChangeAppOutOfBand(name, func(v *autopilottest.AppView) {
+							v.ReviewModel, v.ReviewEffort = c.outsideModel, c.outsideEffort
+						})
+					},
+					Config: config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: resource.ComposeAggregateTestCheckFunc(
+						lastAppPatch(t, env, name, c.sent),
+						env.checkReviewModel(name, c.model, c.effort),
+					),
+				},
+				{Config: config, PlanOnly: true},
+			},
+		})
+	}
+}
+
+// An imported app's model and effort are read into state, so a
+// configuration that sets the same plans nothing.
+func TestApp_importWithReviewModel(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{Name: name, ReviewModel: "opus", ReviewEffort: "high"})
+	config := appConfig(env, name, reviewModelHCL("opus", "high"))
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config, ResourceName: appRes, ImportState: true, ImportStateId: name, ImportStatePersist: true},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// A create for a name AutoPilot already holds is told apart by the model
+// and effort too, since AutoPilot compares them with the other fields.
+func TestApp_reviewModelDecidesWhetherARecordIsTheSame(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{Name: name, ReviewModel: "opus", ReviewEffort: "high"})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:      appConfig(env, name, ""),
+				ExpectError: expectErr("An app with this name already exists ... values that differ from this configuration"),
+			},
+			{
+				Config:      appConfig(env, name, reviewModelHCL("opus", "")),
+				ExpectError: expectErr("An app with this name already exists ... values that differ from this configuration"),
+			},
+			{
+				Config:      appConfig(env, name, reviewModelHCL("opus", "high")),
+				ExpectError: expectErr("An app with this name already exists ... exactly these values"),
+			},
+		},
+	})
+	if v, _ := env.fake.App(name); v.LockVersion != 1 || v.ReviewModel != "opus" || v.ReviewEffort != "high" {
+		t.Errorf("the existing app was changed: lock_version %d, %q at %q", v.LockVersion, v.ReviewModel, v.ReviewEffort)
+	}
+}
+
+// A create and a change whose answers are lost are sent again, with the
+// model and effort: AutoPilot answers the repeat of the create with the app
+// it made, and the repeat one version behind of the change with 200, so
+// neither is taken for someone else's.
+func TestApp_reviewModelLostAnswers(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	path := "/v1/admin/apps/" + name
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPost, "/v1/admin/apps") },
+				Config:    appConfig(env, name, reviewModelHCL("opus", "high")),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "review_model", "opus"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "1"),
+					func(*terraform.State) error {
+						posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")
+						if len(posts) != 2 || posts[0].Status != http.StatusCreated || posts[1].Status != http.StatusOK {
+							return fmt.Errorf("want a 201 whose answer was lost, then a 200 for the same create; got %d creates", len(posts))
+						}
+						return nil
+					},
+				),
+			},
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPatch, path) },
+				Config:    appConfig(env, name, reviewModelHCL("", "high")),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "review_model"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					lastAppPatch(t, env, name, map[string]any{"review_model": nil, "review_effort": "high"}),
+					func(*terraform.State) error {
+						patches := env.fake.RequestsMatching(http.MethodPatch, path)
+						if len(patches) != 2 || patches[1].Status != http.StatusOK || patches[1].Header.Get("If-Match") != `"1"` {
+							return fmt.Errorf("want a change whose answer was lost, then the same change answered 200; got %d changes", len(patches))
+						}
+						return nil
+					},
+					env.checkReviewModel(name, "", "high"),
+				),
+			},
+		},
+	})
+}
+
+// A model or effort AutoPilot would refuse fails the plan: a versioned
+// name, Haiku, and a family spelled in another case among them.
+func TestApp_reviewModelPlanTimeValidation(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	var steps []resource.TestStep
+	for _, body := range []string{
+		reviewModelHCL("sonnet-5-5", ""),
+		reviewModelHCL("opus-5-5", ""),
+		reviewModelHCL("haiku-4-5", ""),
+		reviewModelHCL("haiku", ""),
+		reviewModelHCL("Opus", ""),
+		reviewModelHCL("sonnet-4-5", "high"),
+		reviewModelHCL("opus", "extreme"),
+		reviewModelHCL("", "HIGH"),
+		reviewModelHCL("", "none"),
+	} {
+		steps = append(steps, resource.TestStep{
+			Config:      appConfig(env, name, body),
+			PlanOnly:    true,
+			ExpectError: expectErr("value must be one of"),
+		})
+	}
+	runTest(t, resource.TestCase{Steps: steps})
+}
+
+// A model or effort somehow still unknown at apply is an error, never sent
+// as the default; none of either takes the app's choice away.
+func TestUnknownReviewModelIsAnError(t *testing.T) {
+	var diags diag.Diagnostics
+	m := appModel{ReviewModel: types.StringUnknown(), ReviewEffort: types.StringNull()}
+	if got := reviewModelFromModel(m, &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown review_model gave %v, %v", got, diags)
+	}
+	diags = nil
+	m = appModel{ReviewModel: types.StringValue("opus"), ReviewEffort: types.StringUnknown()}
+	if got := reviewModelFromModel(m, &diags); got != nil || !diags.HasError() {
+		t.Errorf("unknown review_effort gave %v, %v", got, diags)
+	}
+	diags = nil
+	m = appModel{ReviewModel: types.StringNull(), ReviewEffort: types.StringValue("high")}
+	if got := reviewModelFromModel(m, &diags); got == nil || *got != (client.ReviewModel{Effort: "high"}) || diags.HasError() {
+		t.Errorf("an effort alone gave %v, %v", got, diags)
+	}
+	m = appModel{ReviewModel: types.StringNull(), ReviewEffort: types.StringNull()}
+	if got := reviewModelFromModel(m, &diags); got == nil || *got != (client.ReviewModel{}) || diags.HasError() {
+		t.Errorf("no choice gave %v, %v; it takes the app's choice away", got, diags)
+	}
+}
+
+// An AutoPilot that predates review_model and review_effort takes an app
+// that leaves both out, and plans nothing after. Rolled back past them,
+// AutoPilot reads as the app choosing none: a configuration that still sets
+// either is refused, one that takes them out applies other changes and
+// plans nothing, and once AutoPilot is rolled forward what it kept shows as
+// a change and is taken away.
+func TestApp_reviewModelWithAnOlderAutoPilot(t *testing.T) {
+	base := newTestEnv(t)
+	base.requireFake(t)
+	env, older := olderAutoPilot(t, base, "review_model", "review_effort")
+
+	older.Store(true)
+	plain := appConfig(env, randName(), "")
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: plain},
+			{Config: plain, PlanOnly: true},
+		},
+	})
+	for _, body := range []string{reviewModelHCL("opus", ""), reviewModelHCL("", "high")} {
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{{
+				// A create that sets either is refused before anything is
+				// made; an effort alone goes with review_model null.
+				Config:      appConfig(env, randName(), body),
+				ExpectError: expectErr("review_model ... doesn't know this field"),
+			}},
+		})
+	}
+
+	older.Store(false)
+	name := randName()
+	config := func(extra, dev string) string {
+		return appConfig(env, name, fmt.Sprintf("  developers = %s\n%s", hcl(dev), extra))
+	}
+	both := reviewModelHCL("opus", "high")
+	alice, bob := randLogin(), randLogin()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config(both, alice)},
+			{
+				// Rolled back, a configuration that sets them is refused.
+				PreConfig:   func() { older.Store(true) },
+				Config:      config(both, alice),
+				ExpectError: expectErr("review_model ... doesn't know this field"),
+			},
+			{
+				// Taken out, the app reads as choosing none, so nothing shows
+				// as a change.
+				Config: config("", alice),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Other changes apply, and nothing is sent for them.
+				Config: config("", bob),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "review_model"),
+					resource.TestCheckNoResourceAttr(appRes, "review_effort"),
+					lastAppPatch(t, env, name, map[string]any{"developers": []any{bob}}),
+					env.checkReviewModel(name, "opus", "high"),
+				),
+			},
+			{Config: config("", bob), PlanOnly: true},
+			{
+				// Rolled forward, what AutoPilot kept is taken away.
+				PreConfig: func() { older.Store(false) },
+				Config:    config("", bob),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					lastAppPatch(t, env, name, map[string]any{"review_model": nil}),
+					env.checkReviewModel(name, "", ""),
+				),
+			},
+			{Config: config("", bob), PlanOnly: true},
+		},
+	})
+}
+
+// A refusal AutoPilot names either field in points at its attribute.
+func TestAttributeFor_ReviewModel(t *testing.T) {
+	for pointer, want := range map[string]string{
+		"/review_model":  "review_model",
+		"/review_effort": "review_effort",
+	} {
+		if got := attributeFor(pointer, appAPIFields); got != want {
+			t.Errorf("%s: attribute %q, want %q", pointer, got, want)
+		}
+	}
+}

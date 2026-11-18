@@ -1672,6 +1672,104 @@ func TestGetApp_ProposeReviewRules(t *testing.T) {
 	}
 }
 
+// The reviews' model and effort are sent as one: review_model always, null
+// for the default, and review_effort only when set, so an effort left out
+// is null. Nil sends neither, so an AutoPilot that predates the fields still
+// takes the app.
+func TestUpdateApp_SendsTheReviewModelAsOne(t *testing.T) {
+	var bodies []string
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 2})
+	}))
+	ctx := context.Background()
+	for _, spec := range []AppSpec{
+		{},
+		{ReviewModel: &ReviewModel{Model: "opus", Effort: "high"}},
+		{ReviewModel: &ReviewModel{Model: "opus"}},
+		{ReviewModel: &ReviewModel{Effort: "xhigh"}},
+		{ReviewModel: &ReviewModel{}},
+	} {
+		if _, err := c.UpdateApp(ctx, "billing", spec, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := c.CreateApp(ctx, "billing", AppSpec{ReviewModel: &ReviewModel{Effort: "low"}}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		`{}`,
+		`{"review_effort":"high","review_model":"opus"}`,
+		`{"review_model":"opus"}`,
+		`{"review_effort":"xhigh","review_model":null}`,
+		`{"review_model":null}`,
+		`{"name":"billing","review_effort":"low","review_model":null}`,
+	}
+	for i := range want {
+		if bodies[i] != want[i] {
+			t.Errorf("body %d = %s\nwant      %s", i, bodies[i], want[i])
+		}
+	}
+	if (AppSpec{ReviewModel: &ReviewModel{}}).Empty() {
+		t.Error("a choice taken away sends review_model null")
+	}
+}
+
+// An app read back holds a change's review model only when both of its
+// fields match, none being null.
+func TestAppSpec_ReviewModelReflectedIn(t *testing.T) {
+	str := func(s string) *string { return &s }
+	opusHigh := &App{ReviewModel: str("opus"), ReviewEffort: str("high")}
+	cases := []struct {
+		spec AppSpec
+		app  *App
+		want bool
+	}{
+		{AppSpec{ReviewModel: &ReviewModel{Model: "opus", Effort: "high"}}, opusHigh, true},
+		{AppSpec{ReviewModel: &ReviewModel{Model: "opus"}}, opusHigh, false},
+		{AppSpec{ReviewModel: &ReviewModel{Model: "sonnet", Effort: "high"}}, opusHigh, false},
+		{AppSpec{ReviewModel: &ReviewModel{Effort: "high"}}, opusHigh, false},
+		{AppSpec{ReviewModel: &ReviewModel{Effort: "high"}}, &App{ReviewEffort: str("high")}, true},
+		{AppSpec{ReviewModel: &ReviewModel{}}, opusHigh, false},
+		{AppSpec{ReviewModel: &ReviewModel{}}, &App{}, true},
+		{AppSpec{}, opusHigh, true},
+	}
+	for i, c := range cases {
+		if got := c.spec.reflectedIn(c.app); got != c.want {
+			t.Errorf("case %d: reflectedIn = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// An answer without review_model and review_effort, from an AutoPilot that
+// predates them, or with null, reads as none; one with them reads as it is.
+func TestGetApp_ReviewModel(t *testing.T) {
+	for i, a := range []struct {
+		answer        map[string]any
+		model, effort string
+	}{
+		{map[string]any{"name": "billing", "lock_version": 1}, "", ""},
+		{map[string]any{"name": "billing", "lock_version": 1, "review_model": nil, "review_effort": nil}, "", ""},
+		{map[string]any{"name": "billing", "lock_version": 1, "review_model": "opus", "review_effort": nil}, "opus", ""},
+		{map[string]any{"name": "billing", "lock_version": 1, "review_model": nil, "review_effort": "max"}, "", "max"},
+	} {
+		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRecord(w, http.StatusOK, a.answer)
+		}))
+		app, err := c.GetApp(context.Background(), "billing")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if deref(app.ReviewModel) != a.model || deref(app.ReviewEffort) != a.effort {
+			t.Errorf("answer %d: review_model = %v, review_effort = %v, want %q, %q", i, app.ReviewModel, app.ReviewEffort, a.model, a.effort)
+		}
+		if (a.model == "") != (app.ReviewModel == nil) || (a.effort == "") != (app.ReviewEffort == nil) {
+			t.Errorf("answer %d: none should read as nil", i)
+		}
+	}
+}
+
 // A sender's right to send urgent tasks is sent as set, false included, and
 // not at all when nil, so an AutoPilot that predates the field still takes
 // the sender.
