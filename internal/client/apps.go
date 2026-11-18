@@ -12,8 +12,9 @@ import (
 // credential policy, the worker its tasks run in, its automatic reviews, the
 // other repositories and the work tracker projects its reviews also read,
 // its repositories' daily cap on the reviews people ask for from GitHub,
-// whether its reviews' approvals may go as a code owner user, and whether
-// AutoPilot may propose rules for its repositories' REVIEW.md.
+// whether its reviews' approvals may go as a code owner user, whether
+// AutoPilot may propose rules for its repositories' REVIEW.md, and the model
+// and effort its reviews run on.
 type App struct {
 	Name       string   `json:"name"`
 	Repos      []string `json:"repos"`
@@ -61,10 +62,18 @@ type App struct {
 	// rule to the REVIEW.md of the app's repositories, from how people
 	// answered its review findings. False when the AutoPilot predates the
 	// field.
-	ProposeReviewRules bool   `json:"propose_review_rules"`
-	LockVersion        int64  `json:"lock_version"`
-	CreatedAt          string `json:"created_at"`
-	UpdatedAt          string `json:"updated_at"`
+	ProposeReviewRules bool `json:"propose_review_rules"`
+	// ReviewModel is the main model of AutoPilot's own reviews of the app's
+	// repositories, "sonnet-5-5" or "opus-5-5", or nil for AutoPilot's
+	// default, sonnet-5-5 (or when the AutoPilot predates the field).
+	ReviewModel *string `json:"review_model"`
+	// ReviewEffort is that model's effort, "low", "medium", "high", "xhigh"
+	// or "max", or nil for Claude Code's own default for the model (or when
+	// the AutoPilot predates the field).
+	ReviewEffort *string `json:"review_effort"`
+	LockVersion  int64   `json:"lock_version"`
+	CreatedAt    string  `json:"created_at"`
+	UpdatedAt    string  `json:"updated_at"`
 }
 
 // AutoEvents are the pull_request actions an app's automatic reviews may
@@ -182,9 +191,24 @@ type WorkerSize struct {
 	Memory int64
 }
 
+// ReviewModel is the model and effort of AutoPilot's own reviews of an app's
+// repositories. AutoPilot takes it as one, as it does the credential policy:
+// a write that sends review_model sets review_effort too, so an effort left
+// out is null, and review_effort sent alone is refused. Unlike
+// when_seats_full, an effort goes with any model, the default included.
+type ReviewModel struct {
+	// Model is "sonnet-5-5" or "opus-5-5", or "" for AutoPilot's default
+	// (sent as null).
+	Model string
+	// Effort is "low", "medium", "high", "xhigh" or "max", or "" for Claude
+	// Code's own default for the model (not sent).
+	Effort string
+}
+
 // AppSpec is what a create or a change sends. A nil list is not sent at all;
 // an empty, non-nil list is sent as []. A nil Policy, WorkerImage, Size,
-// MaxReviewsPerDay, ApproveAsUser or ProposeReviewRules is not sent either.
+// MaxReviewsPerDay, ApproveAsUser, ProposeReviewRules or ReviewModel is not
+// sent either.
 type AppSpec struct {
 	Repos        []string
 	Accepts      []Accept
@@ -222,6 +246,11 @@ type AppSpec struct {
 	// Nil is not sent, so an AutoPilot that predates the field still takes
 	// the app.
 	ProposeReviewRules *bool
+	// ReviewModel is the model and effort of the app's reviews, sent as one:
+	// review_model always (null for the default) and review_effort when set.
+	// Nil is not sent, so an AutoPilot that predates the fields still takes
+	// the app.
+	ReviewModel *ReviewModel
 }
 
 func (s AppSpec) fields() Fields {
@@ -287,6 +316,12 @@ func (s AppSpec) fields() Fields {
 	}
 	if s.ProposeReviewRules != nil {
 		f["propose_review_rules"] = *s.ProposeReviewRules
+	}
+	if s.ReviewModel != nil {
+		f["review_model"] = nullableString(s.ReviewModel.Model)
+		if s.ReviewModel.Effort != "" {
+			f["review_effort"] = s.ReviewModel.Effort
+		}
 	}
 	return f
 }
@@ -465,6 +500,9 @@ func (s AppSpec) reflectedIn(app *App) bool {
 		return false
 	}
 	if s.ProposeReviewRules != nil && app.ProposeReviewRules != *s.ProposeReviewRules {
+		return false
+	}
+	if s.ReviewModel != nil && (deref(app.ReviewModel) != s.ReviewModel.Model || deref(app.ReviewEffort) != s.ReviewModel.Effort) {
 		return false
 	}
 	return true

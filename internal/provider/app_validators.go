@@ -234,6 +234,13 @@ func (emailValidator) ValidateString(_ context.Context, req validator.StringRequ
 // The worker images an app's tasks may run in.
 var workerImages = []string{"node", "ruby", "ruby-browser", "python", "go"}
 
+// The main models an app's reviews may run on, as AutoPilot takes them:
+// never haiku-4-5, the small model a review uses for small work.
+var reviewModels = []string{"sonnet-5-5", "opus-5-5"}
+
+// The efforts of that model, as the Claude Code AutoPilot runs takes them.
+var reviewEfforts = []string{"low", "medium", "high", "xhigh", "max"}
+
 // workerSizes is the memory, in MiB, that AWS Fargate allows with each CPU
 // size, in CPU units, an app's workers may have: at most 4 vCPU and 16 GB.
 var workerSizes = map[int64][]int64{

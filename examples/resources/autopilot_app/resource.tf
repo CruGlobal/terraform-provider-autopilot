@@ -128,6 +128,14 @@ resource "autopilot_app" "infrastructure" {
   # GitHub App then never approves or requests changes here itself. It does
   # nothing unless the service has that user's token.
   approve_as_user = true
+
+  # Run this app's reviews on Opus at high effort, since a missed finding in
+  # infrastructure costs more than the review. Sonnet is the default. Opus
+  # uses up the Claude seats' limits faster and costs more per token on
+  # Bedrock, and a higher effort costs more on either model, so choose them
+  # only where the reviews need it.
+  review_model  = "opus-5-5"
+  review_effort = "high"
 }
 
 resource "autopilot_app" "payments" {

@@ -246,6 +246,32 @@ the examples, and the generated docs. Things worth knowing:
   it does for every field. Its proposals' kind, `propose-review-rules`, is
   one only AutoPilot's service sends: no sender's `kinds` and no `accepts`
   entry may name it.
+- An app's `review_model` and `review_effort` are the model and effort of
+  AutoPilot's own reviews of the app's repositories (automatic, label,
+  command, workflow and MCP; a sender's own `review-pr` tasks name their
+  own). `review_model` is `sonnet-5-5` or `opus-5-5`, never `haiku-4-5`,
+  and `null` is `sonnet-5-5`; `review_effort` is `low`, `medium`, `high`,
+  `xhigh` or `max`, and `null` is Claude Code's own default for the model.
+  They are one choice, as the credential policy is: AutoPilot sets both
+  from a write that sends `review_model` (a `review_effort` left out is
+  null) and refuses `review_effort` alone, even as `null`. Unlike
+  `when_seats_full`, an effort goes with any model, `null` included, so
+  the plan checks only each value (`reviewModels` and `reviewEfforts` in
+  `app_validators.go`). The provider sends both on a change to either
+  (`AppSpec.ReviewModel`): `review_model` always, as `null` for the
+  default, and `review_effort` only when set. So removing both sends
+  `review_model: null` alone, and an effort alone goes with
+  `review_model: null`. Like `max_reviews_per_day`, each is optional with
+  no default, read back as null when AutoPilot answers `null` or leaves the
+  field out, and neither is sent while both are unset, so an older
+  AutoPilot still takes an app that leaves them out. The docs say plainly
+  that Sonnet is the default, that Opus uses a seat's limits faster and
+  costs more per token on Bedrock, and that a higher effort costs more on
+  either. The fake reads them where AutoPilot's sorted order puts them,
+  `review_effort` then `review_model`, after `review_also_reads` and before
+  `when_seats_full`, checks the pair after the worker size, and reads a
+  stored model it doesn't run a review on as none, its effort dropped with
+  it, and a stored effort it doesn't know as none (`storedReviewModel`).
 - A sender's `may_send_urgent` lets its tasks be urgent: while AutoPilot's
   limit on running tasks is reached, they start before every queued task
   that isn't, and they don't wait for the day's spend under the daily cap
