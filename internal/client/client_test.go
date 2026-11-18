@@ -1640,8 +1640,8 @@ func TestUpdateApp_SendsTheReviewModelAsOne(t *testing.T) {
 	ctx := context.Background()
 	for _, spec := range []AppSpec{
 		{},
-		{ReviewModel: &ReviewModel{Model: "opus-5-5", Effort: "high"}},
-		{ReviewModel: &ReviewModel{Model: "opus-5-5"}},
+		{ReviewModel: &ReviewModel{Model: "opus", Effort: "high"}},
+		{ReviewModel: &ReviewModel{Model: "opus"}},
 		{ReviewModel: &ReviewModel{Effort: "xhigh"}},
 		{ReviewModel: &ReviewModel{}},
 	} {
@@ -1654,8 +1654,8 @@ func TestUpdateApp_SendsTheReviewModelAsOne(t *testing.T) {
 	}
 	want := []string{
 		`{}`,
-		`{"review_effort":"high","review_model":"opus-5-5"}`,
-		`{"review_model":"opus-5-5"}`,
+		`{"review_effort":"high","review_model":"opus"}`,
+		`{"review_model":"opus"}`,
 		`{"review_effort":"xhigh","review_model":null}`,
 		`{"review_model":null}`,
 		`{"name":"billing","review_effort":"low","review_model":null}`,
@@ -1674,15 +1674,15 @@ func TestUpdateApp_SendsTheReviewModelAsOne(t *testing.T) {
 // fields match, none being null.
 func TestAppSpec_ReviewModelReflectedIn(t *testing.T) {
 	str := func(s string) *string { return &s }
-	opusHigh := &App{ReviewModel: str("opus-5-5"), ReviewEffort: str("high")}
+	opusHigh := &App{ReviewModel: str("opus"), ReviewEffort: str("high")}
 	cases := []struct {
 		spec AppSpec
 		app  *App
 		want bool
 	}{
-		{AppSpec{ReviewModel: &ReviewModel{Model: "opus-5-5", Effort: "high"}}, opusHigh, true},
-		{AppSpec{ReviewModel: &ReviewModel{Model: "opus-5-5"}}, opusHigh, false},
-		{AppSpec{ReviewModel: &ReviewModel{Model: "sonnet-5-5", Effort: "high"}}, opusHigh, false},
+		{AppSpec{ReviewModel: &ReviewModel{Model: "opus", Effort: "high"}}, opusHigh, true},
+		{AppSpec{ReviewModel: &ReviewModel{Model: "opus"}}, opusHigh, false},
+		{AppSpec{ReviewModel: &ReviewModel{Model: "sonnet", Effort: "high"}}, opusHigh, false},
 		{AppSpec{ReviewModel: &ReviewModel{Effort: "high"}}, opusHigh, false},
 		{AppSpec{ReviewModel: &ReviewModel{Effort: "high"}}, &App{ReviewEffort: str("high")}, true},
 		{AppSpec{ReviewModel: &ReviewModel{}}, opusHigh, false},
@@ -1705,7 +1705,7 @@ func TestGetApp_ReviewModel(t *testing.T) {
 	}{
 		{map[string]any{"name": "billing", "lock_version": 1}, "", ""},
 		{map[string]any{"name": "billing", "lock_version": 1, "review_model": nil, "review_effort": nil}, "", ""},
-		{map[string]any{"name": "billing", "lock_version": 1, "review_model": "opus-5-5", "review_effort": nil}, "opus-5-5", ""},
+		{map[string]any{"name": "billing", "lock_version": 1, "review_model": "opus", "review_effort": nil}, "opus", ""},
 		{map[string]any{"name": "billing", "lock_version": 1, "review_model": nil, "review_effort": "max"}, "", "max"},
 	} {
 		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

@@ -130,11 +130,12 @@ resource "autopilot_app" "infrastructure" {
   approve_as_user = true
 
   # Run this app's reviews on Opus at high effort, since a missed finding in
-  # infrastructure costs more than the review. Sonnet is the default. Opus
-  # uses up the Claude seats' limits faster and costs more per token on
-  # Bedrock, and a higher effort costs more on either model, so choose them
-  # only where the reviews need it.
-  review_model  = "opus-5-5"
+  # infrastructure costs more than the review. AutoPilot runs the current
+  # Opus version, so a new model version needs no change here. Sonnet is the
+  # default. Opus uses up the Claude seats' limits faster and costs more per
+  # token on Bedrock, and a higher effort costs more on either model, so
+  # choose them only where the reviews need it.
+  review_model  = "opus"
   review_effort = "high"
 }
 

@@ -249,8 +249,10 @@ the examples, and the generated docs. Things worth knowing:
 - An app's `review_model` and `review_effort` are the model and effort of
   AutoPilot's own reviews of the app's repositories (automatic, label,
   command, workflow and MCP; a sender's own `review-pr` tasks name their
-  own). `review_model` is `sonnet-5-5` or `opus-5-5`, never `haiku-4-5`,
-  and `null` is `sonnet-5-5`; `review_effort` is `low`, `medium`, `high`,
+  own). `review_model` is a model family, `sonnet` or `opus`, and `null`
+  is Sonnet. AutoPilot runs the family's current version, so a new model
+  version needs no change here. It refuses Haiku and any versioned name,
+  such as `sonnet-5-5`. `review_effort` is `low`, `medium`, `high`,
   `xhigh` or `max`, and `null` is Claude Code's own default for the model.
   They are one choice, as the credential policy is: AutoPilot sets both
   from a write that sends `review_model` (a `review_effort` left out is
@@ -265,13 +267,15 @@ the examples, and the generated docs. Things worth knowing:
   no default, read back as null when AutoPilot answers `null` or leaves the
   field out, and neither is sent while both are unset, so an older
   AutoPilot still takes an app that leaves them out. The docs say plainly
-  that Sonnet is the default, that Opus uses a seat's limits faster and
-  costs more per token on Bedrock, and that a higher effort costs more on
-  either. The fake reads them where AutoPilot's sorted order puts them,
-  `review_effort` then `review_model`, after `review_also_reads` and before
+  that AutoPilot runs the family's current version, that Sonnet is the
+  default, that Opus uses a seat's limits faster and costs more per token
+  on Bedrock, and that a higher effort costs more on either. The fake
+  reads them where AutoPilot's sorted order puts them, `review_effort`
+  then `review_model`, after `review_also_reads` and before
   `when_seats_full`, checks the pair after the worker size, and reads a
-  stored model it doesn't run a review on as none, its effort dropped with
-  it, and a stored effort it doesn't know as none (`storedReviewModel`).
+  stored model it doesn't run a review on, a versioned name among them, as
+  none, its effort dropped with it, and a stored effort it doesn't know as
+  none (`storedReviewModel`).
 - A sender's `may_send_urgent` lets its tasks be urgent: while AutoPilot's
   limit on running tasks is reached, they start before every queued task
   that isn't, and they don't wait for the day's spend under the daily cap

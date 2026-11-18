@@ -6403,18 +6403,18 @@ func TestApp_reviewModel(t *testing.T) {
 		CheckDestroy: checkAppsGone(t, env),
 		Steps: []resource.TestStep{
 			{
-				Config: config("opus-5-5", "high"),
+				Config: config("opus", "high"),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(appRes, "review_model", "opus-5-5"),
+					resource.TestCheckResourceAttr(appRes, "review_model", "opus"),
 					resource.TestCheckResourceAttr(appRes, "review_effort", "high"),
-					env.checkReviewModel(name, "opus-5-5", "high"),
+					env.checkReviewModel(name, "opus", "high"),
 					func(*terraform.State) error {
 						if env.live() {
 							return nil
 						}
 						for _, r := range env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps") {
 							if body := requestBody(t, r); body["name"] == name &&
-								(body["review_model"] != "opus-5-5" || body["review_effort"] != "high") {
+								(body["review_model"] != "opus" || body["review_effort"] != "high") {
 								return fmt.Errorf("the create sent %v", body)
 							}
 						}
@@ -6423,31 +6423,31 @@ func TestApp_reviewModel(t *testing.T) {
 				),
 			},
 			{
-				Config: config("opus-5-5", "high"),
+				Config: config("opus", "high"),
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
 				},
 			},
 			{
 				// A change to the effort alone sends both.
-				Config: config("opus-5-5", "xhigh"),
+				Config: config("opus", "xhigh"),
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
 				},
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(appRes, "review_effort", "xhigh"),
 					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
-					lastAppPatch(t, env, name, map[string]any{"review_model": "opus-5-5", "review_effort": "xhigh"}),
+					lastAppPatch(t, env, name, map[string]any{"review_model": "opus", "review_effort": "xhigh"}),
 				),
 			},
 			{
 				// The effort taken out goes back to the model's default.
-				Config: config("opus-5-5", ""),
+				Config: config("opus", ""),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(appRes, "review_model", "opus-5-5"),
+					resource.TestCheckResourceAttr(appRes, "review_model", "opus"),
 					resource.TestCheckNoResourceAttr(appRes, "review_effort"),
-					lastAppPatch(t, env, name, map[string]any{"review_model": "opus-5-5"}),
-					env.checkReviewModel(name, "opus-5-5", ""),
+					lastAppPatch(t, env, name, map[string]any{"review_model": "opus"}),
+					env.checkReviewModel(name, "opus", ""),
 				),
 			},
 			{
@@ -6468,11 +6468,11 @@ func TestApp_reviewModel(t *testing.T) {
 				},
 			},
 			{
-				Config: config("sonnet-5-5", ""),
+				Config: config("sonnet", ""),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(appRes, "review_model", "sonnet-5-5"),
+					resource.TestCheckResourceAttr(appRes, "review_model", "sonnet"),
 					resource.TestCheckNoResourceAttr(appRes, "review_effort"),
-					lastAppPatch(t, env, name, map[string]any{"review_model": "sonnet-5-5"}),
+					lastAppPatch(t, env, name, map[string]any{"review_model": "sonnet"}),
 				),
 			},
 			{
@@ -6531,12 +6531,12 @@ func TestApp_reviewModelNotSentWhenUnchanged(t *testing.T) {
 	})
 	runTest(t, resource.TestCase{
 		Steps: []resource.TestStep{
-			{Config: appConfig(env, name, reviewModelHCL("opus-5-5", "max"))},
+			{Config: appConfig(env, name, reviewModelHCL("opus", "max"))},
 			{
-				Config: appConfig(env, name, reviewModelHCL("opus-5-5", "max")+`  developers = ["someone@example.com"]`),
+				Config: appConfig(env, name, reviewModelHCL("opus", "max")+`  developers = ["someone@example.com"]`),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					lastAppPatch(t, env, name, map[string]any{"developers": []any{"someone@example.com"}}),
-					env.checkReviewModel(name, "opus-5-5", "max"),
+					env.checkReviewModel(name, "opus", "max"),
 				),
 			},
 		},
@@ -6554,10 +6554,10 @@ func TestApp_reviewModelChangedOutsideTerraformIsPutBack(t *testing.T) {
 		outsideModel, outsideEffort string
 		sent                        map[string]any
 	}{
-		{"opus-5-5", "high", "sonnet-5-5", "", map[string]any{"review_model": "opus-5-5", "review_effort": "high"}},
-		{"opus-5-5", "high", "opus-5-5", "low", map[string]any{"review_model": "opus-5-5", "review_effort": "high"}},
-		{"", "medium", "opus-5-5", "medium", map[string]any{"review_model": nil, "review_effort": "medium"}},
-		{"", "", "opus-5-5", "max", map[string]any{"review_model": nil}},
+		{"opus", "high", "sonnet", "", map[string]any{"review_model": "opus", "review_effort": "high"}},
+		{"opus", "high", "opus", "low", map[string]any{"review_model": "opus", "review_effort": "high"}},
+		{"", "medium", "opus", "medium", map[string]any{"review_model": nil, "review_effort": "medium"}},
+		{"", "", "opus", "max", map[string]any{"review_model": nil}},
 	}
 	for _, c := range cases {
 		name := randName()
@@ -6592,8 +6592,8 @@ func TestApp_importWithReviewModel(t *testing.T) {
 	env := newTestEnv(t)
 	env.requireFake(t)
 	name := randName()
-	env.fake.SeedApp(autopilottest.AppView{Name: name, ReviewModel: "opus-5-5", ReviewEffort: "high"})
-	config := appConfig(env, name, reviewModelHCL("opus-5-5", "high"))
+	env.fake.SeedApp(autopilottest.AppView{Name: name, ReviewModel: "opus", ReviewEffort: "high"})
+	config := appConfig(env, name, reviewModelHCL("opus", "high"))
 	runTest(t, resource.TestCase{
 		Steps: []resource.TestStep{
 			{Config: config, ResourceName: appRes, ImportState: true, ImportStateId: name, ImportStatePersist: true},
@@ -6613,7 +6613,7 @@ func TestApp_reviewModelDecidesWhetherARecordIsTheSame(t *testing.T) {
 	env := newTestEnv(t)
 	env.requireFake(t)
 	name := randName()
-	env.fake.SeedApp(autopilottest.AppView{Name: name, ReviewModel: "opus-5-5", ReviewEffort: "high"})
+	env.fake.SeedApp(autopilottest.AppView{Name: name, ReviewModel: "opus", ReviewEffort: "high"})
 	runTest(t, resource.TestCase{
 		Steps: []resource.TestStep{
 			{
@@ -6621,16 +6621,16 @@ func TestApp_reviewModelDecidesWhetherARecordIsTheSame(t *testing.T) {
 				ExpectError: expectErr("An app with this name already exists ... values that differ from this configuration"),
 			},
 			{
-				Config:      appConfig(env, name, reviewModelHCL("opus-5-5", "")),
+				Config:      appConfig(env, name, reviewModelHCL("opus", "")),
 				ExpectError: expectErr("An app with this name already exists ... values that differ from this configuration"),
 			},
 			{
-				Config:      appConfig(env, name, reviewModelHCL("opus-5-5", "high")),
+				Config:      appConfig(env, name, reviewModelHCL("opus", "high")),
 				ExpectError: expectErr("An app with this name already exists ... exactly these values"),
 			},
 		},
 	})
-	if v, _ := env.fake.App(name); v.LockVersion != 1 || v.ReviewModel != "opus-5-5" || v.ReviewEffort != "high" {
+	if v, _ := env.fake.App(name); v.LockVersion != 1 || v.ReviewModel != "opus" || v.ReviewEffort != "high" {
 		t.Errorf("the existing app was changed: lock_version %d, %q at %q", v.LockVersion, v.ReviewModel, v.ReviewEffort)
 	}
 }
@@ -6648,9 +6648,9 @@ func TestApp_reviewModelLostAnswers(t *testing.T) {
 		Steps: []resource.TestStep{
 			{
 				PreConfig: func() { env.fake.DropNextResponse(http.MethodPost, "/v1/admin/apps") },
-				Config:    appConfig(env, name, reviewModelHCL("opus-5-5", "high")),
+				Config:    appConfig(env, name, reviewModelHCL("opus", "high")),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(appRes, "review_model", "opus-5-5"),
+					resource.TestCheckResourceAttr(appRes, "review_model", "opus"),
 					resource.TestCheckResourceAttr(appRes, "lock_version", "1"),
 					func(*terraform.State) error {
 						posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")
@@ -6682,18 +6682,20 @@ func TestApp_reviewModelLostAnswers(t *testing.T) {
 	})
 }
 
-// A model or effort AutoPilot would refuse fails the plan, haiku-4-5
-// included.
+// A model or effort AutoPilot would refuse fails the plan: a versioned
+// name, Haiku, and a family spelled in another case among them.
 func TestApp_reviewModelPlanTimeValidation(t *testing.T) {
 	env := newTestEnv(t)
 	name := randName()
 	var steps []resource.TestStep
 	for _, body := range []string{
+		reviewModelHCL("sonnet-5-5", ""),
+		reviewModelHCL("opus-5-5", ""),
 		reviewModelHCL("haiku-4-5", ""),
-		reviewModelHCL("opus", ""),
-		reviewModelHCL("Opus-5-5", ""),
+		reviewModelHCL("haiku", ""),
+		reviewModelHCL("Opus", ""),
 		reviewModelHCL("sonnet-4-5", "high"),
-		reviewModelHCL("opus-5-5", "extreme"),
+		reviewModelHCL("opus", "extreme"),
 		reviewModelHCL("", "HIGH"),
 		reviewModelHCL("", "none"),
 	} {
@@ -6715,7 +6717,7 @@ func TestUnknownReviewModelIsAnError(t *testing.T) {
 		t.Errorf("unknown review_model gave %v, %v", got, diags)
 	}
 	diags = nil
-	m = appModel{ReviewModel: types.StringValue("opus-5-5"), ReviewEffort: types.StringUnknown()}
+	m = appModel{ReviewModel: types.StringValue("opus"), ReviewEffort: types.StringUnknown()}
 	if got := reviewModelFromModel(m, &diags); got != nil || !diags.HasError() {
 		t.Errorf("unknown review_effort gave %v, %v", got, diags)
 	}
@@ -6749,7 +6751,7 @@ func TestApp_reviewModelWithAnOlderAutoPilot(t *testing.T) {
 			{Config: plain, PlanOnly: true},
 		},
 	})
-	for _, body := range []string{reviewModelHCL("opus-5-5", ""), reviewModelHCL("", "high")} {
+	for _, body := range []string{reviewModelHCL("opus", ""), reviewModelHCL("", "high")} {
 		runTest(t, resource.TestCase{
 			Steps: []resource.TestStep{{
 				// A create that sets either is refused before anything is
@@ -6765,7 +6767,7 @@ func TestApp_reviewModelWithAnOlderAutoPilot(t *testing.T) {
 	config := func(extra, dev string) string {
 		return appConfig(env, name, fmt.Sprintf("  developers = %s\n%s", hcl(dev), extra))
 	}
-	both := reviewModelHCL("opus-5-5", "high")
+	both := reviewModelHCL("opus", "high")
 	alice, bob := randLogin(), randLogin()
 	runTest(t, resource.TestCase{
 		Steps: []resource.TestStep{
@@ -6791,7 +6793,7 @@ func TestApp_reviewModelWithAnOlderAutoPilot(t *testing.T) {
 					resource.TestCheckNoResourceAttr(appRes, "review_model"),
 					resource.TestCheckNoResourceAttr(appRes, "review_effort"),
 					lastAppPatch(t, env, name, map[string]any{"developers": []any{bob}}),
-					env.checkReviewModel(name, "opus-5-5", "high"),
+					env.checkReviewModel(name, "opus", "high"),
 				),
 			},
 			{Config: config("", bob), PlanOnly: true},

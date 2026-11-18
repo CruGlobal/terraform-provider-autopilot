@@ -63,9 +63,9 @@ type App struct {
 	// answered its review findings. False when the AutoPilot predates the
 	// field.
 	ProposeReviewRules bool `json:"propose_review_rules"`
-	// ReviewModel is the main model of AutoPilot's own reviews of the app's
-	// repositories, "sonnet-5-5" or "opus-5-5", or nil for AutoPilot's
-	// default, sonnet-5-5 (or when the AutoPilot predates the field).
+	// ReviewModel is the model family of AutoPilot's own reviews of the
+	// app's repositories, "sonnet" or "opus", or nil for AutoPilot's
+	// default, Sonnet (or when the AutoPilot predates the field).
 	ReviewModel *string `json:"review_model"`
 	// ReviewEffort is that model's effort, "low", "medium", "high", "xhigh"
 	// or "max", or nil for Claude Code's own default for the model (or when
@@ -197,7 +197,7 @@ type WorkerSize struct {
 // out is null, and review_effort sent alone is refused. Unlike
 // when_seats_full, an effort goes with any model, the default included.
 type ReviewModel struct {
-	// Model is "sonnet-5-5" or "opus-5-5", or "" for AutoPilot's default
+	// Model is the family "sonnet" or "opus", or "" for AutoPilot's default
 	// (sent as null).
 	Model string
 	// Effort is "low", "medium", "high", "xhigh" or "max", or "" for Claude

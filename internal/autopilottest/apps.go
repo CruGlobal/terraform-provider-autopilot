@@ -65,10 +65,11 @@ var (
 	// The most an app may set as its repositories' daily cap on the reviews
 	// people ask for from GitHub.
 	maxReviewsPerDay int64 = 200
-	// The main models an app may choose for its reviews, sorted: never
-	// haiku-4-5, the small model a review uses for small work. Unset, a
-	// review runs on sonnet-5-5.
-	reviewModels = []string{"opus-5-5", "sonnet-5-5"}
+	// The model families an app may choose for its reviews, sorted.
+	// AutoPilot runs each family's current version, and refuses a versioned
+	// name such as sonnet-5-5. Never Haiku, the small model a review uses
+	// for small work. Unset, a review runs on Sonnet.
+	reviewModels = []string{"opus", "sonnet"}
 	// The efforts of that model, as Claude Code takes them. Unset, Claude
 	// Code's own default for the model.
 	reviewEfforts = []string{"low", "medium", "high", "xhigh", "max"}
@@ -76,9 +77,9 @@ var (
 
 // storedReviewModel is review_model and review_effort as AutoPilot reads
 // what it keeps, for what is given from outside a write (SeedApp,
-// ChangeAppOutOfBand): a model it doesn't run a review on reads as the
-// default, its effort dropped with it, and an effort it doesn't know reads
-// as the model's default.
+// ChangeAppOutOfBand): a model it doesn't run a review on, such as a
+// versioned name, reads as the default, its effort dropped with it, and an
+// effort it doesn't know reads as the model's default.
 func storedReviewModel(model, effort string) (string, string) {
 	if model != "" && !slices.Contains(reviewModels, model) {
 		return "", ""
@@ -606,7 +607,7 @@ type Accept struct {
 // empty workerImage is null (node), a zero workerCPU and workerMemory are
 // null (the worker's own size), and a zero maxReviewsPerDay is null
 // (AutoPilot's default). approveAsUser and proposeReviewRules are false
-// unless set. An empty reviewModel is null (sonnet-5-5), and an empty
+// unless set. An empty reviewModel is null (Sonnet), and an empty
 // reviewEffort null (Claude Code's own default for the model).
 type appRecord struct {
 	name                      string

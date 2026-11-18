@@ -1817,8 +1817,9 @@ func TestProposeReviewRules(t *testing.T) {
 // The reviews' model is one, as AutoPilot takes it: a write that sends
 // review_model sets both fields, so an effort it leaves out is null, and
 // review_effort sent alone is refused. Each takes only its own values or
-// null, and haiku-4-5 is never a review's model. An effort goes with any
-// model, null included. A create with them is a retry only with the same.
+// null: review_model is a family, never a versioned name, and haiku-4-5 is
+// never a review's model. An effort goes with any model, null included. A
+// create with them is a retry only with the same.
 func TestReviewModel_Rules(t *testing.T) {
 	s := New(t)
 	refused := []struct {
@@ -1826,11 +1827,13 @@ func TestReviewModel_Rules(t *testing.T) {
 		field  string
 	}{
 		{map[string]any{"review_model": "haiku-4-5"}, "/review_model"},
-		{map[string]any{"review_model": "opus"}, "/review_model"},
-		{map[string]any{"review_model": "Opus-5-5"}, "/review_model"},
+		{map[string]any{"review_model": "haiku"}, "/review_model"},
+		{map[string]any{"review_model": "sonnet-5-5"}, "/review_model"},
+		{map[string]any{"review_model": "opus-5-5"}, "/review_model"},
+		{map[string]any{"review_model": "Opus"}, "/review_model"},
 		{map[string]any{"review_model": 1}, "/review_model"},
-		{map[string]any{"review_model": "opus-5-5", "review_effort": "extreme"}, "/review_effort"},
-		{map[string]any{"review_model": "opus-5-5", "review_effort": "HIGH"}, "/review_effort"},
+		{map[string]any{"review_model": "opus", "review_effort": "extreme"}, "/review_effort"},
+		{map[string]any{"review_model": "opus", "review_effort": "HIGH"}, "/review_effort"},
 		{map[string]any{"review_model": nil, "review_effort": true}, "/review_effort"},
 		{map[string]any{"review_effort": "high"}, "/review_effort"},
 		{map[string]any{"review_effort": nil}, "/review_effort"},
@@ -1855,31 +1858,31 @@ func TestReviewModel_Rules(t *testing.T) {
 		}
 	}
 	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{
-		"name": "billing", "review_model": "opus-5-5", "review_effort": "high",
+		"name": "billing", "review_model": "opus", "review_effort": "high",
 	})
-	expect(t, "opus-5-5 at high", st, http.StatusCreated, body)
-	if body["review_model"] != "opus-5-5" || body["review_effort"] != "high" {
+	expect(t, "opus at high", st, http.StatusCreated, body)
+	if body["review_model"] != "opus" || body["review_effort"] != "high" {
 		t.Errorf("created %v", body)
 	}
 	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{
-		"name": "billing", "review_model": "opus-5-5", "review_effort": "high",
+		"name": "billing", "review_model": "opus", "review_effort": "high",
 	})
 	expect(t, "the same create again", st, http.StatusOK, body)
-	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "review_model": "opus-5-5"})
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "review_model": "opus"})
 	expect(t, "a create with another effort", st, http.StatusConflict, body)
 	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing"})
 	expect(t, "a create without them", st, http.StatusConflict, body)
 
 	// A change that sends review_model alone takes the effort back to null.
-	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"review_model": "opus-5-5"})
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"review_model": "opus"})
 	expect(t, "the model alone", st, http.StatusOK, body)
-	if body["review_model"] != "opus-5-5" || body["review_effort"] != nil || body["lock_version"] != float64(2) {
+	if body["review_model"] != "opus" || body["review_effort"] != nil || body["lock_version"] != float64(2) {
 		t.Errorf("changed to %v", body)
 	}
 	// A change that sends neither keeps them.
 	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"developers": []string{"alice@example.org"}})
 	expect(t, "another field", st, http.StatusOK, body)
-	if body["review_model"] != "opus-5-5" || body["lock_version"] != float64(3) {
+	if body["review_model"] != "opus" || body["lock_version"] != float64(3) {
 		t.Errorf("a change without the model took it: %v", body)
 	}
 	// The default model at an effort.
@@ -1904,14 +1907,16 @@ func TestReviewModel_Rules(t *testing.T) {
 	}
 
 	// What is given from outside a write is kept as AutoPilot reads it: a
-	// model it doesn't run a review on reads as the default, its effort
-	// dropped with it, and an effort it doesn't know as the model's default.
+	// model it doesn't run a review on, a versioned name among them, reads
+	// as the default, its effort dropped with it, and an effort it doesn't
+	// know as the model's default.
 	for _, c := range []struct{ model, effort, wantModel, wantEffort string }{
-		{"sonnet-5-5", "xhigh", "sonnet-5-5", "xhigh"},
+		{"sonnet", "xhigh", "sonnet", "xhigh"},
 		{"", "low", "", "low"},
 		{"haiku-4-5", "max", "", ""},
+		{"opus-5-5", "high", "", ""},
 		{"opus-6", "high", "", ""},
-		{"opus-5-5", "extreme", "opus-5-5", ""},
+		{"opus", "extreme", "opus", ""},
 	} {
 		s.SeedApp(AppView{Name: "seeded", ReviewModel: c.model, ReviewEffort: c.effort})
 		if v, _ := s.App("seeded"); v.ReviewModel != c.wantModel || v.ReviewEffort != c.wantEffort {

@@ -533,8 +533,10 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"the app's repositories, from how people answered its review findings, for a person to merge or " +
 			"close.\n\n" +
 			"`review_model` and `review_effort` choose the model, and its effort, that AutoPilot's own reviews of " +
-			"the app's repositories run on. They are one choice, and a change to either sends both. Sonnet is the " +
-			"default; Opus, and a higher effort, cost more.\n\n" +
+			"the app's repositories run on. They are one choice, and a change to either sends both. `review_model` " +
+			"is a model family, `sonnet` or `opus`, and AutoPilot runs that family's current version, so a new " +
+			"model version needs no Terraform change. Sonnet is the default; Opus, and a higher effort, cost " +
+			"more.\n\n" +
 			"An app with this name that already exists is not taken over, even when its values match: the create " +
 			"fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a " +
 			"gateway's 502, say) before an identical app answered: that attempt may have made the app, and the " +
@@ -1052,26 +1054,28 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 				Optional: true,
 			},
 			"review_model": schema.StringAttribute{
-				MarkdownDescription: "The main model of AutoPilot's own reviews of this app's repositories: `sonnet-5-5` " +
-					"or `opus-5-5`. It covers the reviews AutoPilot runs itself: automatic ones, those asked for with " +
-					"the `autopilot-review` label, the review command or a workflow, and those asked for on AutoPilot's " +
-					"MCP server. A sender's own `review-pr` tasks run on the model they name instead. Left out, reviews " +
-					"run on `sonnet-5-5`, AutoPilot's default, and removing it from the configuration takes the app " +
-					"back to that. `haiku-4-5` is refused: it stays the small model a review uses for small work, never " +
-					"its main one. **Opus costs more than Sonnet.** On the organization's Claude seats, where every " +
-					"review from GitHub runs, an Opus review uses up a seat's usage limits faster, and every app shares " +
-					"the seats, so one app's Opus reviews can hold up everyone's work. On Amazon Bedrock, where a review " +
-					"from the MCP server runs when `credential` says so, Opus costs more per token, and that spend " +
-					"counts against AutoPilot's daily cap on Bedrock spend. So keep the default unless Opus finds what " +
-					"Sonnet misses on this app's pull requests. Set together with `review_effort`, as one choice: a " +
-					"change to either sends both. The choice is read when a review is made, so a change reaches only " +
-					"the reviews made after it, and a later ask for a head already reviewed gets that review back, on " +
-					"the model it ran on. Each review's footer names the model it ran on, and the effort when one is " +
-					"set. It needs an AutoPilot that knows the field; an older one refuses it with a 422. An AutoPilot " +
-					"rolled back past the field ignores a stored choice, so every review runs on `sonnet-5-5` at Claude " +
-					"Code's default again, and refuses every write that sends it, but keeps it. Meanwhile the provider " +
-					"reads the app as choosing none, so a configuration that sets it plans a change on every run and " +
-					"its applies fail: take it out of the configuration until AutoPilot is rolled forward.",
+				MarkdownDescription: "The model family of AutoPilot's own reviews of this app's repositories: `sonnet` " +
+					"or `opus`. AutoPilot runs the family's current version, so a new model version needs no Terraform " +
+					"change. A versioned name, such as `sonnet-5-5`, is refused, and so is Haiku, which stays the small " +
+					"model a review uses for small work. It covers the reviews AutoPilot runs itself: automatic ones, " +
+					"those asked for with the `autopilot-review` label, the review command or a workflow, and those " +
+					"asked for on AutoPilot's MCP server. A sender's own `review-pr` tasks run on the model they name " +
+					"instead. Left out, reviews run on Sonnet, AutoPilot's default, and removing it from the " +
+					"configuration takes the app back to that. **Opus costs more than Sonnet.** On the organization's " +
+					"Claude seats, where every review from GitHub runs, an Opus review uses up a seat's usage limits " +
+					"faster, and every app shares the seats, so one app's Opus reviews can hold up everyone's work. On " +
+					"Amazon Bedrock, where a review from the MCP server runs when `credential` says so, Opus costs more " +
+					"per token, and that spend counts against AutoPilot's daily cap on Bedrock spend. So keep the " +
+					"default unless Opus finds what Sonnet misses on this app's pull requests. Set together with " +
+					"`review_effort`, as one choice: a change to either sends both. The choice is read when a review is " +
+					"made, so a change reaches only the reviews made after it, and a later ask for a head already " +
+					"reviewed gets that review back, on the model it ran on. Each review's footer names the model it " +
+					"ran on, and the effort when one is set. It needs an AutoPilot that takes model families; an older " +
+					"one refuses it with a 422. An AutoPilot rolled back past the field ignores a stored choice, so " +
+					"every review runs on Sonnet at Claude Code's default again, and refuses every write that sends it, " +
+					"but keeps it. Meanwhile the provider reads the app as choosing none, so a configuration that sets " +
+					"it plans a change on every run and its applies fail: take it out of the configuration until " +
+					"AutoPilot is rolled forward.",
 				Optional:   true,
 				Validators: []validator.String{stringvalidator.OneOf(reviewModels...)},
 			},
@@ -1083,7 +1087,7 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					"on cost and time stay the same, so a review that spends more on each turn reaches them sooner and " +
 					"stops there. Left out, the model runs at Claude Code's own default for it, and removing it from " +
 					"the configuration takes the app back to that. It goes with either model: set without " +
-					"`review_model`, reviews run on `sonnet-5-5` at this effort. Claude Code may still cap it lower, " +
+					"`review_model`, reviews run on Sonnet at this effort. Claude Code may still cap it lower, " +
 					"by a limit the organization sets for the model; a review's footer names the effort asked for. Set " +
 					"together with `review_model`, as one choice: a change to either sends both. It needs an AutoPilot " +
 					"that knows the field, and is handled as `review_model` is when AutoPilot is rolled back past it.",
