@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.11.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.10.0...v0.11.0) (2026-11-19)
+
+
+### Added
+
+* **app:** add auto_review.bots, the bot accounts whose pull requests an app's automatic reviews take ([#35](https://github.com/CruGlobal/terraform-provider-autopilot/issues/35)) ([45713f6](https://github.com/CruGlobal/terraform-provider-autopilot/commit/45713f6f66c6842d016b8bfd30dba2c00d41c76d))
+* **app:** add auto_review.own_prs, how the review gate treats AutoPilot's own pull requests ([#32](https://github.com/CruGlobal/terraform-provider-autopilot/issues/32)) ([2b17528](https://github.com/CruGlobal/terraform-provider-autopilot/commit/2b175283c00a8349dac4e0bc7010e381235c9aec))
+* **app:** add review_model and review_effort, the model and effort of an app's reviews ([#33](https://github.com/CruGlobal/terraform-provider-autopilot/issues/33)) ([11698f2](https://github.com/CruGlobal/terraform-provider-autopilot/commit/11698f2ff3584ed4520628cf361ff5ea62a1c03c))
+
 ## [0.10.0](https://github.com/CruGlobal/terraform-provider-autopilot/compare/v0.9.0...v0.10.0) (2026-11-17)
 
 
