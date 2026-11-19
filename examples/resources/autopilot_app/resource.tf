@@ -64,8 +64,8 @@ resource "autopilot_app" "billing" {
 
   # Review each pull request into the default branch when it is opened or
   # marked ready, with no label, as the app's own service identity. Drafts
-  # wait until they are ready, and bots' and forks' pull requests are
-  # skipped.
+  # wait until they are ready, and forks' pull requests are skipped, as are
+  # bots' unless bots lists them.
   auto_review = {
     events      = ["opened", "ready_for_review"]
     max_per_day = 50
@@ -168,5 +168,15 @@ resource "autopilot_app" "payments" {
     # review them instead, and "wait", the default, waits for a writer's
     # approval. Needs an AutoPilot release that knows own_prs.
     own_prs = "pass"
+    # Review Renovate's pull requests as a person's, so their check goes by
+    # that review instead of waiting for a writer. Listing a bot trusts
+    # whoever can make it open a pull request: its code, such as a package
+    # version it picked, runs in the review's install and checks, without
+    # the Sidekiq Pro key or the repositories in review_also_reads. Listing
+    # github-actions[bot] would trust every writer's workflow, and listing
+    # Dependabot has its pull requests reviewed instead of passing the gate
+    # with none. Never list an AutoPilot GitHub App, this environment's or
+    # another's. Needs an AutoPilot release that knows bots.
+    bots = ["renovate[bot]"]
   }
 }

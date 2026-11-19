@@ -2842,7 +2842,7 @@ func TestApp_autoReviewLifecycle(t *testing.T) {
 
 // checkAutoReview reads the app from AutoPilot, the fake or a live one, and
 // checks its automatic reviews there (nil for none). own_prs left out of want
-// is wait.
+// is wait, and bots left out none.
 func (env *testEnv) checkAutoReview(t *testing.T, name string, want *client.AutoReview) error {
 	app, err := env.apiClient(t).GetApp(context.Background(), name)
 	if err != nil {
@@ -2858,7 +2858,7 @@ func (env *testEnv) checkAutoReview(t *testing.T, name string, want *client.Auto
 	if !slices.Equal(got.Events, want.Events) || !slices.Equal(got.Workflows, want.Workflows) ||
 		got.MaxPerDay != want.MaxPerDay || got.CanDecide != want.CanDecide ||
 		got.CanDecideOwnPR != want.CanDecideOwnPR || got.ApproveUpTo != want.ApproveUpTo || got.Gate != want.Gate ||
-		got.OwnPRsOrWait() != want.OwnPRsOrWait() {
+		got.OwnPRsOrWait() != want.OwnPRsOrWait() || !slices.Equal(got.Bots, want.Bots) {
 		return fmt.Errorf("auto_review = %+v at AutoPilot, want %+v", *got, *want)
 	}
 	return nil
@@ -3344,7 +3344,7 @@ func autoReviewConfig(events, workflows types.Set) autoReviewModel {
 	return autoReviewModel{
 		Events: events, Workflows: workflows, MaxPerDay: types.Int64Null(), CanDecide: types.BoolNull(),
 		CanDecideOwnPR: types.BoolNull(), ApproveUpTo: types.StringNull(), Gate: types.BoolNull(),
-		OwnPRs: types.StringNull(),
+		OwnPRs: types.StringNull(), Bots: types.SetNull(types.StringType),
 	}
 }
 
@@ -4783,6 +4783,544 @@ func TestApp_autoReviewOwnPRsWithAnOlderAutoPilot(t *testing.T) {
 					func(*terraform.State) error {
 						if v, _ := env.fake.App(name); v.AutoReview == nil || v.AutoReview.OwnPRs != "wait" {
 							return fmt.Errorf("auto_review = %+v, want own_prs wait", v.AutoReview)
+						}
+						return nil
+					},
+				),
+			},
+			{Config: config("", bob), PlanOnly: true},
+		},
+	})
+}
+
+// The bots tests list, sorted as AutoPilot keeps them: capitals first.
+const (
+	dependabot = "Dependabot[bot]"
+	renovate   = "renovate[bot]"
+)
+
+// Bots are none unless set: listed, they read back and plan nothing in any
+// order or listed twice; a change to another field keeps them; beside the
+// gate and own_prs they need nothing; null or [] is none again and plans
+// nothing after; and removing auto_review turns everything off.
+func TestApp_autoReviewBotsLifecycle(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	every := []string{"opened", "ready_for_review", "synchronize"}
+	config := func(auto string) string { return appConfig(env, name, auto) }
+	update := resource.ConfigPlanChecks{
+		PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+	}
+	empty := resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(`  auto_review = {}`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.bots.#", "0"),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{Events: []string{"opened", "ready_for_review"}, MaxPerDay: 50})
+					},
+				),
+			},
+			{
+				Config:           config(fmt.Sprintf(`  auto_review = { bots = %s }`, hcl(renovate, dependabot))),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.bots.#", "2"),
+					resource.TestCheckTypeSetElemAttr(appRes, "auto_review.bots.*", renovate),
+					resource.TestCheckTypeSetElemAttr(appRes, "auto_review.bots.*", dependabot),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{
+							Events: []string{"opened", "ready_for_review"}, MaxPerDay: 50, Bots: []string{dependabot, renovate},
+						})
+					},
+				),
+			},
+			{
+				// In another order, or one listed twice, they plan nothing.
+				Config:           config(fmt.Sprintf(`  auto_review = { bots = %s }`, hcl(dependabot, renovate, dependabot))),
+				ConfigPlanChecks: empty,
+			},
+			{
+				// A change to another field sends them too.
+				Config:           config(fmt.Sprintf(`  auto_review = { bots = %s, max_per_day = 10 }`, hcl(renovate))),
+				ConfigPlanChecks: update,
+				Check: func(*terraform.State) error {
+					return env.checkAutoReview(t, name, &client.AutoReview{
+						Events: []string{"opened", "ready_for_review"}, MaxPerDay: 10, Bots: []string{renovate},
+					})
+				},
+			},
+			{
+				// Beside the gate and own_prs, which they don't change.
+				Config:           config(gatedAutoReview(fmt.Sprintf(`own_prs = "review", bots = %s, `, hcl(renovate)))),
+				ConfigPlanChecks: update,
+				Check: func(*terraform.State) error {
+					return env.checkAutoReview(t, name, &client.AutoReview{
+						Events: every, MaxPerDay: 50, CanDecide: true, Gate: true, OwnPRs: "review", Bots: []string{renovate},
+					})
+				},
+			},
+			{
+				// null is the default, none.
+				Config:           config(gatedAutoReview(`bots = null, `)),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.bots.#", "0"),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{Events: every, MaxPerDay: 50, CanDecide: true, Gate: true})
+					},
+				),
+			},
+			{
+				// [] is the same as null, and as leaving it out.
+				Config:           config(gatedAutoReview(`bots = [], `)),
+				ConfigPlanChecks: empty,
+			},
+			{
+				Config:           config(gatedAutoReview("")),
+				ConfigPlanChecks: empty,
+			},
+			{
+				Config: config(fmt.Sprintf(`  auto_review = { bots = %s }`, hcl(dependabot))),
+			},
+			{
+				Config:           config(""),
+				ConfigPlanChecks: update,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(appRes, "auto_review"),
+					func(*terraform.State) error { return env.checkAutoReview(t, name, nil) },
+				),
+			},
+		},
+	})
+}
+
+// Bots are sent sorted and each once, and only when there are some: an
+// auto_review with none, left out or [], sends no bots field, so an
+// AutoPilot that predates the field still takes it.
+func TestApp_autoReviewBotsSent(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	lastBody := func() string {
+		patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name)
+		return mustJSON(t, requestBody(t, patches[len(patches)-1]))
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config: appConfig(env, name, `  auto_review = { bots = [] }`),
+				Check: func(*terraform.State) error {
+					post := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")[0]
+					auto, _ := requestBody(t, post)["auto_review"].(map[string]any)
+					if _, sent := auto["bots"]; sent || auto == nil {
+						return fmt.Errorf("auto_review = %v, want it without bots", auto)
+					}
+					return nil
+				},
+			},
+			{
+				Config: appConfig(env, name, fmt.Sprintf(`  auto_review = { bots = %s }`, hcl(renovate, dependabot))),
+				Check: func(*terraform.State) error {
+					want := `{"auto_review":{"approve_up_to":null,"bots":["` + dependabot + `","` + renovate + `"],"can_decide":false,` +
+						`"can_decide_own_pr":false,"events":["opened","ready_for_review"],"max_per_day":50}}`
+					if got := lastBody(); got != want {
+						return fmt.Errorf("body = %s, want %s", got, want)
+					}
+					return nil
+				},
+			},
+			{
+				Config: appConfig(env, name, `  auto_review = { max_per_day = 10 }`),
+				Check: func(*terraform.State) error {
+					want := `{"auto_review":{"approve_up_to":null,"can_decide":false,"can_decide_own_pr":false,` +
+						`"events":["opened","ready_for_review"],"max_per_day":10}}`
+					if got := lastBody(); got != want {
+						return fmt.Errorf("body = %s, want %s", got, want)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// The plan refuses what AutoPilot refuses in bots, before anything is sent:
+// a login that isn't an App's slug and [bot], two that differ only in case,
+// and more than 20.
+func TestApp_autoReviewBotsRefusedAtPlan(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	var many []string
+	for i := range 21 {
+		many = append(many, fmt.Sprintf("bot-%02d[bot]", i))
+	}
+	cases := []struct{ bots, err string }{
+		{hcl("renovate"), "must be a bot's exact login"},
+		{hcl("Copilot"), "must be a bot's exact login"},
+		{hcl("renovate[BOT]"), "must be a bot's exact login"},
+		{hcl("*[bot]"), "must be a bot's exact login"},
+		{hcl("[bot]"), "must be a bot's exact login"},
+		{hcl("-renovate[bot]"), "must be a bot's exact login"},
+		{hcl("reno_vate[bot]"), "must be a bot's exact login"},
+		{hcl(" renovate[bot]"), "must be a bot's exact login"},
+		{hcl(strings.Repeat("a", 101) + "[bot]"), "must be a bot's exact login"},
+		{hcl(renovate, "Renovate[bot]"), "Repeated bots"},
+		{hcl(many...), "set must contain at most 20 elements"},
+	}
+	for _, c := range cases {
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{
+					Config:      appConfig(env, randName(), "  auto_review = { bots = "+c.bots+" }"),
+					ExpectError: expectErr(c.err),
+				},
+			},
+		})
+	}
+	if posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps"); len(posts) != 0 {
+		t.Errorf("%d creates were sent", len(posts))
+	}
+}
+
+// botLoginPattern is AutoPilot's own rule for a bot an app may list: an
+// App's slug, a letter or digit then letters, digits and -, at most 100,
+// and [bot].
+func TestBotLoginPattern(t *testing.T) {
+	good := []string{
+		"renovate[bot]", "dependabot[bot]", "Dependabot[bot]", "github-actions[bot]", "a[bot]", "0[bot]", "a-[bot]",
+		"a--b[bot]", strings.Repeat("a", 100) + "[bot]",
+	}
+	for _, s := range good {
+		if !botLoginPattern.MatchString(s) {
+			t.Errorf("%q refused", s)
+		}
+	}
+	bad := []string{
+		"", "renovate", "Copilot", "[bot]", "-a[bot]", "a_b[bot]", "a.b[bot]", "a b[bot]", "*[bot]", "a*[bot]",
+		"renovate[BOT]", "renovate[Bot]", "renovate[bot] ", " renovate[bot]", "renovate[bot]\n", "renovate[bot][bot]",
+		"renovate(bot)", "renovate[bot]x", strings.Repeat("a", 101) + "[bot]", "renovaté[bot]",
+	}
+	for _, s := range bad {
+		if botLoginPattern.MatchString(s) {
+			t.Errorf("%q taken", s)
+		}
+	}
+}
+
+// AutoPilot refuses its own App's bot once GitHub has named the App to it,
+// which the plan can't know: the refusal names the field and says why.
+func TestApp_autoReviewBotsOwnAppRefusedByAutoPilot(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	env.fake.SetOwnAppSlug("autopilot-example")
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			Config:      appConfig(env, randName(), fmt.Sprintf(`  auto_review = { bots = %s }`, hcl(renovate, "autopilot-example[bot]"))),
+			ExpectError: expectErr("Error creating AutoPilot app ... is AutoPilot's own App, whose pull requests own_prs decides"),
+		}},
+	})
+	if v := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps"); len(v) != 1 || v[0].Status != http.StatusUnprocessableEntity {
+		t.Errorf("want one create, refused; got %d", len(v))
+	}
+}
+
+// Bots not known until apply: the plan waits, and the apply checks them
+// then, before anything is sent.
+func TestApp_autoReviewBotsNotKnownYet(t *testing.T) {
+	env := newTestEnv(t)
+	name := randName()
+	config := func(bots string) string {
+		return env.providerConfig() + fmt.Sprintf(`
+resource "terraform_data" "bots" {
+  input = %s
+}
+
+resource "autopilot_app" "test" {
+  name        = %q
+  auto_review = { bots = terraform_data.bots.output }
+}
+`, bots, name)
+	}
+	runTest(t, resource.TestCase{
+		CheckDestroy: checkAppsGone(t, env),
+		Steps: []resource.TestStep{
+			{
+				Config: config(hcl(renovate)),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.bots.#", "1"),
+					func(*terraform.State) error {
+						return env.checkAutoReview(t, name, &client.AutoReview{
+							Events: []string{"opened", "ready_for_review"}, MaxPerDay: 50, Bots: []string{renovate},
+						})
+					},
+				),
+			},
+			{
+				Config:      config(hcl(renovate, "Renovate[bot]")),
+				ExpectError: expectErr("Repeated bots"),
+			},
+			{
+				Config:      config(hcl("renovate")),
+				ExpectError: expectErr("must be a bot's exact login"),
+			},
+		},
+	})
+	if env.fake != nil {
+		if patches := env.fake.RequestsMatching(http.MethodPatch, "/v1/admin/apps/"+name); len(patches) != 0 {
+			t.Errorf("%d changes were sent", len(patches))
+		}
+	}
+}
+
+// Bots changed outside Terraform show as a change, and the apply puts them
+// back as the configuration says.
+func TestApp_autoReviewBotsChangedOutsideTerraformIsPutBack(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	cases := []struct {
+		config  string
+		outside func(v *autopilottest.AppView)
+		want    []string
+	}{
+		{
+			`  auto_review = {}`,
+			func(v *autopilottest.AppView) { v.AutoReview.Bots = []string{"github-actions[bot]"} },
+			nil,
+		},
+		{
+			fmt.Sprintf(`  auto_review = { bots = %s }`, hcl(renovate)),
+			func(v *autopilottest.AppView) { v.AutoReview.Bots = []string{renovate, "github-actions[bot]"} },
+			[]string{renovate},
+		},
+		{
+			fmt.Sprintf(`  auto_review = { bots = %s }`, hcl(renovate)),
+			func(v *autopilottest.AppView) { v.AutoReview.Bots = []string{"Renovate[bot]"} },
+			[]string{renovate},
+		},
+	}
+	for _, c := range cases {
+		name := randName()
+		config := appConfig(env, name, c.config)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{
+					PreConfig: func() { env.fake.ChangeAppOutOfBand(name, c.outside) },
+					Config:    config,
+					ConfigPlanChecks: resource.ConfigPlanChecks{
+						PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+					},
+					Check: func(*terraform.State) error {
+						if v, _ := env.fake.App(name); v.AutoReview == nil || !slices.Equal(v.AutoReview.Bots, c.want) {
+							return fmt.Errorf("auto_review = %+v, not put back", v.AutoReview)
+						}
+						return nil
+					},
+				},
+				{Config: config, PlanOnly: true},
+			},
+		})
+	}
+}
+
+// An imported app's bots are read into state, so a configuration that lists
+// the same in another order plans nothing, and one that lists none takes
+// them away.
+func TestApp_importWithAutoReviewBots(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{
+		Name:       name,
+		AutoReview: &autopilottest.AutoReview{Events: []string{"opened"}, MaxPerDay: 50, Bots: []string{dependabot, renovate}},
+	})
+	same := appConfig(env, name, fmt.Sprintf(`  auto_review = { events = ["opened"], bots = %s }`, hcl(renovate, dependabot)))
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:             same,
+				ResourceName:       appRes,
+				ImportState:        true,
+				ImportStateId:      name,
+				ImportStatePersist: true,
+			},
+			{
+				Config: same,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: appConfig(env, name, `  auto_review = { events = ["opened"] }`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					if v, _ := env.fake.App(name); v.AutoReview == nil || len(v.AutoReview.Bots) != 0 {
+						return fmt.Errorf("auto_review = %+v, want no bots", v.AutoReview)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// A create for a name AutoPilot already holds is told apart by the bots
+// too, since AutoPilot compares them with the other fields.
+func TestApp_autoReviewBotsDecidesWhetherARecordIsTheSame(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	env.fake.SeedApp(autopilottest.AppView{
+		Name:       name,
+		AutoReview: &autopilottest.AutoReview{Events: []string{"opened", "ready_for_review"}, MaxPerDay: 50, Bots: []string{renovate}},
+	})
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				Config:      appConfig(env, name, `  auto_review = {}`),
+				ExpectError: expectErr("An app with this name already exists ... values that differ from this configuration"),
+			},
+			{
+				Config:      appConfig(env, name, fmt.Sprintf(`  auto_review = { bots = %s }`, hcl(renovate, dependabot))),
+				ExpectError: expectErr("An app with this name already exists ... values that differ from this configuration"),
+			},
+			{
+				Config:      appConfig(env, name, fmt.Sprintf(`  auto_review = { bots = %s }`, hcl(renovate))),
+				ExpectError: expectErr("An app with this name already exists ... exactly these values"),
+			},
+		},
+	})
+	if v, _ := env.fake.App(name); v.LockVersion != 1 || v.AutoReview == nil || !slices.Equal(v.AutoReview.Bots, []string{renovate}) {
+		t.Errorf("the existing app was changed: lock_version %d, auto_review %+v", v.LockVersion, v.AutoReview)
+	}
+}
+
+// A create that lists bots, and a change that takes them away, whose answers
+// are lost are sent again and taken as the provider's own.
+func TestApp_autoReviewBotsLostAnswers(t *testing.T) {
+	env := newTestEnv(t)
+	env.requireFake(t)
+	name := randName()
+	path := "/v1/admin/apps/" + name
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPost, "/v1/admin/apps") },
+				Config:    appConfig(env, name, fmt.Sprintf(`  auto_review = { bots = %s }`, hcl(renovate))),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.bots.#", "1"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "1"),
+					func(*terraform.State) error {
+						posts := env.fake.RequestsMatching(http.MethodPost, "/v1/admin/apps")
+						if len(posts) != 2 || posts[0].Status != http.StatusCreated || posts[1].Status != http.StatusOK {
+							return fmt.Errorf("want a 201 whose answer was lost, then a 200 for the same create; got %d creates", len(posts))
+						}
+						return nil
+					},
+				),
+			},
+			{
+				PreConfig: func() { env.fake.DropNextResponse(http.MethodPatch, path) },
+				Config:    appConfig(env, name, `  auto_review = {}`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.bots.#", "0"),
+					resource.TestCheckResourceAttr(appRes, "lock_version", "2"),
+					func(*terraform.State) error {
+						patches := env.fake.RequestsMatching(http.MethodPatch, path)
+						if len(patches) != 2 || patches[1].Status != http.StatusOK || patches[1].Header.Get("If-Match") != `"1"` {
+							return fmt.Errorf("want a change whose answer was lost, then the same change answered 200; got %d changes", len(patches))
+						}
+						if v, _ := env.fake.App(name); v.AutoReview == nil || len(v.AutoReview.Bots) != 0 {
+							return fmt.Errorf("auto_review = %+v, want no bots", v.AutoReview)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// An AutoPilot that predates bots takes an auto_review that lists none, left
+// out or [], and plans nothing after, since its answer without the field
+// reads as none. Rolled back past it, AutoPilot reads as listing none: a
+// configuration that still lists some is refused, one that takes them out
+// applies other changes and plans nothing, and once AutoPilot is rolled
+// forward what it kept shows as a change and is taken away.
+func TestApp_autoReviewBotsWithAnOlderAutoPilot(t *testing.T) {
+	base := newTestEnv(t)
+	base.requireFake(t)
+	env, older := olderAutoPilot(t, base, "auto_review/bots")
+
+	older.Store(true)
+	for _, auto := range []string{`  auto_review = {}`, `  auto_review = { bots = [] }`, `  auto_review = { bots = null }`} {
+		config := appConfig(env, randName(), auto)
+		runTest(t, resource.TestCase{
+			Steps: []resource.TestStep{
+				{Config: config},
+				{Config: config, PlanOnly: true},
+			},
+		})
+	}
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{{
+			// A create that lists some is refused before anything is made.
+			Config:      appConfig(env, randName(), fmt.Sprintf(`  auto_review = { bots = %s }`, hcl(renovate))),
+			ExpectError: expectErr("auto_review ... doesn't know this field"),
+		}},
+	})
+
+	older.Store(false)
+	name := randName()
+	config := func(bots, dev string) string {
+		return appConfig(env, name, fmt.Sprintf("  developers = %s\n  auto_review = { %s }", hcl(dev), bots))
+	}
+	listed := "bots = " + hcl(renovate)
+	alice, bob := randLogin(), randLogin()
+	runTest(t, resource.TestCase{
+		Steps: []resource.TestStep{
+			{Config: config(listed, alice)},
+			{
+				// Rolled back, a configuration that lists some is refused.
+				PreConfig:   func() { older.Store(true) },
+				Config:      config(listed, alice),
+				ExpectError: expectErr("auto_review ... doesn't know this field"),
+			},
+			{
+				// Taken out, the app reads as listing none, so nothing shows
+				// as a change.
+				Config: config("", alice),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				// Other changes apply, and nothing is sent for it.
+				Config: config("", bob),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.bots.#", "0"),
+					lastAppPatch(t, env, name, map[string]any{"developers": []any{bob}}),
+				),
+			},
+			{Config: config("", bob), PlanOnly: true},
+			{
+				// Rolled forward, what AutoPilot kept is taken away.
+				PreConfig: func() { older.Store(false) },
+				Config:    config("", bob),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(appRes, plancheck.ResourceActionUpdate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(appRes, "auto_review.bots.#", "0"),
+					func(*terraform.State) error {
+						if v, _ := env.fake.App(name); v.AutoReview == nil || len(v.AutoReview.Bots) != 0 {
+							return fmt.Errorf("auto_review = %+v, want no bots", v.AutoReview)
 						}
 						return nil
 					},

@@ -983,7 +983,7 @@ func TestAutoReview_Kept(t *testing.T) {
 	expect(t, "every default", st, http.StatusOK, body)
 	want := map[string]any{
 		"events": []any{"opened", "ready_for_review"}, "workflows": []any{}, "max_per_day": float64(50),
-		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil, "gate": false, "own_prs": "wait",
+		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil, "gate": false, "own_prs": "wait", "bots": []any{},
 	}
 	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
 		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
@@ -1043,7 +1043,7 @@ func TestAutoReview_Gate(t *testing.T) {
 	expect(t, "create with the gate", st, http.StatusCreated, body)
 	want := map[string]any{
 		"events": []any{"opened", "ready_for_review", "synchronize"}, "workflows": []any{}, "max_per_day": float64(50),
-		"can_decide": true, "can_decide_own_pr": false, "approve_up_to": nil, "gate": true, "own_prs": "wait",
+		"can_decide": true, "can_decide_own_pr": false, "approve_up_to": nil, "gate": true, "own_prs": "wait", "bots": []any{},
 	}
 	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
 		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
@@ -1129,7 +1129,7 @@ func TestAutoReview_OwnPRs(t *testing.T) {
 	expect(t, "create with own_prs pass", st, http.StatusCreated, body)
 	want := map[string]any{
 		"events": []any{"opened", "ready_for_review", "synchronize"}, "workflows": []any{}, "max_per_day": float64(50),
-		"can_decide": true, "can_decide_own_pr": false, "approve_up_to": nil, "gate": true, "own_prs": "pass",
+		"can_decide": true, "can_decide_own_pr": false, "approve_up_to": nil, "gate": true, "own_prs": "pass", "bots": []any{},
 	}
 	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
 		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
@@ -1301,7 +1301,7 @@ func TestAutoReview_WorkflowsKept(t *testing.T) {
 	expect(t, "workflows alone", st, http.StatusCreated, body)
 	want := map[string]any{
 		"events": []any{}, "workflows": []any{shared, other, main}, "max_per_day": float64(50),
-		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil, "gate": false, "own_prs": "wait",
+		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil, "gate": false, "own_prs": "wait", "bots": []any{},
 	}
 	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
 		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
@@ -1347,6 +1347,168 @@ func TestAutoReview_WorkflowsKept(t *testing.T) {
 	expect(t, "twenty, one twice", st, http.StatusOK, body)
 	if v, _ = s.App("billing"); v.AutoReview == nil || !slices.Equal(v.AutoReview.Workflows, twenty) {
 		t.Errorf("auto_review = %+v", v.AutoReview)
+	}
+}
+
+// auto_review's bots are refused where AutoPilot refuses them, at the field
+// AutoPilot names: each one at its place, AutoPilot's own App's bot once the
+// service knows its slug, and the list as a whole.
+func TestAutoReview_BotsRefused(t *testing.T) {
+	s := New(t)
+	cases := []struct {
+		auto  map[string]any
+		field string
+	}{
+		{map[string]any{"bots": "renovate[bot]"}, "/auto_review/bots"},
+		{map[string]any{"bots": nil}, "/auto_review/bots"},
+		{map[string]any{"bots": map[string]any{}}, "/auto_review/bots"},
+		{map[string]any{"bots": []any{1}}, "/auto_review/bots/0"},
+		{map[string]any{"bots": []any{"renovate[bot]", nil}}, "/auto_review/bots/1"},
+		// Every item must be a string before any is read as a bot.
+		{map[string]any{"bots": []any{"renovate", 1}}, "/auto_review/bots/1"},
+		// Not an App's slug and [bot]: a person's login, a pattern, a
+		// login GitHub wouldn't name, or space around it.
+		{map[string]any{"bots": []string{"renovate"}}, "/auto_review/bots/0"},
+		{map[string]any{"bots": []string{"Copilot"}}, "/auto_review/bots/0"},
+		{map[string]any{"bots": []string{"[bot]"}}, "/auto_review/bots/0"},
+		{map[string]any{"bots": []string{"*[bot]"}}, "/auto_review/bots/0"},
+		{map[string]any{"bots": []string{"renovate[bot] "}}, "/auto_review/bots/0"},
+		{map[string]any{"bots": []string{"renovate[BOT]"}}, "/auto_review/bots/0"},
+		{map[string]any{"bots": []string{"-renovate[bot]"}}, "/auto_review/bots/0"},
+		{map[string]any{"bots": []string{"reno_vate[bot]"}}, "/auto_review/bots/0"},
+		{map[string]any{"bots": []string{"renovate[bot]\n"}}, "/auto_review/bots/0"},
+		{map[string]any{"bots": []string{strings.Repeat("a", 101) + "[bot]"}}, "/auto_review/bots/0"},
+		// The same bot twice, in another case.
+		{map[string]any{"bots": []string{"renovate[bot]", "Renovate[bot]"}}, "/auto_review/bots/1"},
+		{map[string]any{"bots": []string{"renovate[bot]", "renovate[bot]", "RENOVATE[bot]"}}, "/auto_review/bots/2"},
+		// Read in sorted order: approve_up_to before bots, bots before
+		// can_decide and the checks that span fields.
+		{map[string]any{"bots": []string{"nonsense"}, "approve_up_to": "highest"}, "/auto_review/approve_up_to"},
+		{map[string]any{"bots": []string{"nonsense"}, "can_decide": "yes"}, "/auto_review/bots/0"},
+		{map[string]any{"bots": []string{"nonsense"}, "events": []string{}}, "/auto_review/bots/0"},
+		{map[string]any{"bots": []string{"renovate[bot]"}, "approve_up_to": "low"}, "/auto_review/approve_up_to"},
+	}
+	var many []string
+	for i := range 21 {
+		many = append(many, fmt.Sprintf("bot-%02d[bot]", i))
+	}
+	cases = append(cases, struct {
+		auto  map[string]any
+		field string
+	}{map[string]any{"bots": many}, "/auto_review/bots"})
+	for _, c := range cases {
+		st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": c.auto})
+		expect(t, fmt.Sprintf("auto_review %v", c.auto), st, http.StatusUnprocessableEntity, body)
+		if body["field"] != c.field {
+			t.Errorf("auto_review %v: field = %v (%v), want %s", c.auto, body["field"], body["message"], c.field)
+		}
+	}
+
+	// AutoPilot's own App's bot is taken while the service doesn't know its
+	// slug, and refused, in any case, once it does.
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "early", "auto_review": map[string]any{
+		"bots": []string{"autopilot-example[bot]"},
+	}})
+	expect(t, "its own App's bot while the slug is unknown", st, http.StatusCreated, body)
+	s.SetOwnAppSlug("autopilot-example")
+	for _, own := range []string{"autopilot-example[bot]", "AutoPilot-Example[bot]"} {
+		st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": map[string]any{
+			"bots": []string{"dependabot[bot]", own},
+		}})
+		expect(t, own, st, http.StatusUnprocessableEntity, body)
+		if body["field"] != "/auto_review/bots/1" {
+			t.Errorf("%s: field = %v (%v), want /auto_review/bots/1", own, body["field"], body["message"])
+		}
+	}
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": map[string]any{
+		"bots": []string{"autopilot-example-two[bot]"},
+	}})
+	expect(t, "another App whose slug starts the same", st, http.StatusCreated, body)
+}
+
+// auto_review's bots are kept as sent, sorted, each once, none unless sent,
+// and shown as [] when none; they need no other field; a create with them is
+// a retry only with the same; and kept from outside a write, a login that
+// doesn't read is left out.
+func TestAutoReview_BotsKept(t *testing.T) {
+	s := New(t)
+	shown := func(body map[string]any) string {
+		auto, _ := body["auto_review"].(map[string]any)
+		b, _ := json.Marshal(auto["bots"])
+		return string(b)
+	}
+	st, body := call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": map[string]any{
+		"bots": []string{"renovate[bot]", "Dependabot[bot]", "renovate[bot]"},
+	}})
+	expect(t, "bots", st, http.StatusCreated, body)
+	want := map[string]any{
+		"events": []any{"opened", "ready_for_review"}, "workflows": []any{}, "max_per_day": float64(50),
+		"can_decide": false, "can_decide_own_pr": false, "approve_up_to": nil, "gate": false, "own_prs": "wait",
+		"bots": []any{"Dependabot[bot]", "renovate[bot]"},
+	}
+	if got, _ := json.Marshal(body["auto_review"]); string(got) != mustJSON(want) {
+		t.Errorf("auto_review = %s, want %s", got, mustJSON(want))
+	}
+	if v, _ := s.App("billing"); v.AutoReview == nil || !slices.Equal(v.AutoReview.Bots, []string{"Dependabot[bot]", "renovate[bot]"}) {
+		t.Errorf("auto_review = %+v", v.AutoReview)
+	}
+	// The same create again, in any order, is a retry; other bots, or none,
+	// aren't.
+	st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": map[string]any{
+		"bots": []string{"renovate[bot]", "Dependabot[bot]"},
+	}})
+	expect(t, "the same create again", st, http.StatusOK, body)
+	for _, bots := range [][]string{{"renovate[bot]"}, {"dependabot[bot]", "renovate[bot]"}, nil} {
+		auto := map[string]any{}
+		if bots != nil {
+			auto["bots"] = bots
+		}
+		st, body = call(t, s, http.MethodPost, "/v1/admin/apps", "", map[string]any{"name": "billing", "auto_review": auto})
+		expect(t, fmt.Sprintf("a create with bots %v", bots), st, http.StatusConflict, body)
+	}
+	// Beside the gate and every other field.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "1", map[string]any{"auto_review": map[string]any{
+		"events": []string{"opened", "ready_for_review", "synchronize"}, "can_decide": true, "gate": true,
+		"own_prs": "review", "bots": []string{"renovate[bot]"},
+	}})
+	expect(t, "bots beside the gate", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.AutoReview == nil || !slices.Equal(v.AutoReview.Bots, []string{"renovate[bot]"}) ||
+		!v.AutoReview.Gate || v.LockVersion != 2 || shown(body) != `["renovate[bot]"]` {
+		t.Errorf("auto_review = %+v, lock_version %d", v.AutoReview, v.LockVersion)
+	}
+	// [] is none, the same as left out.
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "2", map[string]any{"auto_review": map[string]any{
+		"bots": []string{},
+	}})
+	expect(t, "bots []", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.AutoReview == nil || len(v.AutoReview.Bots) != 0 || v.LockVersion != 3 || shown(body) != `[]` {
+		t.Errorf("auto_review = %+v, lock_version %d, want no bots shown as []", v.AutoReview, v.LockVersion)
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"auto_review": map[string]any{}})
+	expect(t, "bots left out", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.LockVersion != 3 {
+		t.Errorf("lock_version = %d, want 3: none is what it held", v.LockVersion)
+	}
+	// Twenty, with one sent twice, is twenty.
+	var twenty []string
+	for i := range 20 {
+		twenty = append(twenty, fmt.Sprintf("bot-%02d[bot]", i))
+	}
+	st, body = call(t, s, http.MethodPatch, "/v1/admin/apps/billing", "3", map[string]any{"auto_review": map[string]any{
+		"bots": append(slices.Clone(twenty), twenty[0]),
+	}})
+	expect(t, "twenty, one twice", st, http.StatusOK, body)
+	if v, _ := s.App("billing"); v.AutoReview == nil || !slices.Equal(v.AutoReview.Bots, twenty) {
+		t.Errorf("auto_review = %+v", v.AutoReview)
+	}
+	// Kept from outside a write, a login that doesn't read is left out.
+	s.SeedApp(AppView{Name: "seeded", AutoReview: &AutoReview{
+		Events: []string{"opened"}, MaxPerDay: 50, Bots: []string{"renovate[bot]", "renovate", "Copilot"},
+	}})
+	st, body = call(t, s, http.MethodGet, "/v1/admin/apps/seeded", "", nil)
+	expect(t, "read seeded", st, http.StatusOK, body)
+	if shown(body) != `["renovate[bot]"]` {
+		t.Errorf("bots shown %s, want only renovate[bot]", shown(body))
 	}
 }
 

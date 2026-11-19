@@ -140,10 +140,10 @@ the examples, and the generated docs. Things worth knowing:
   defaults in the schema (`events` `opened` and `ready_for_review`,
   `workflows` none, `max_per_day` 50, the flags false), a change to any
   field sends every one, and removing it sends `null`. The exceptions are
-  `gate` and `own_prs` (below), and `workflows`, sent sorted and each
-  once, and only when it lists some: none is AutoPilot's default, and an
-  AutoPilot that predates the field refuses it, so an app that lists none
-  still works there. `events` is
+  `gate`, `own_prs` and `bots` (below), and `workflows`, sent sorted and
+  each once, and only when it lists some: none is AutoPilot's default, and
+  an AutoPilot that predates the field refuses it, so an app that lists
+  none still works there. `events` is
   some of `opened`, `ready_for_review` and `synchronize`, kept in that
   order: at least one, unless `workflows` lists one, and set in the
   configuration whenever `workflows` lists one (AutoPilot refuses
@@ -205,6 +205,32 @@ the examples, and the generated docs. Things worth knowing:
   AutoPilot's sorted order, after `max_per_day` and before `workflows`, and
   keeps one set from outside a write as `pass` or `review` only with the
   gate, and as `wait` otherwise, as AutoPilot reads a stored one.
+- An app's `auto_review.bots` lists the bots whose pull requests its
+  automatic reviews take, as a person's, gated or not: each the bot's exact
+  login as GitHub names a pull request's author, an App's slug and `[bot]`
+  (`botLoginPattern`, AutoPilot's own pattern, in the provider and the
+  fake), at most 20, and no two that differ only in case
+  (`noCaseRepeatsValidator`), all checked at plan time. Listing a bot trusts
+  whoever can make it open a pull request: its code runs in the review's
+  install and checks, without the Sidekiq Pro key or `review_also_reads`;
+  `github-actions[bot]` trusts every writer's workflow; and a listed
+  Dependabot is reviewed instead of passing the gate with no review. The
+  docs say so plainly, and say never to list an AutoPilot App, this
+  environment's or another's: AutoPilot's own pull requests go by
+  `own_prs` alone, but it can't tell another environment's App from any
+  other bot. AutoPilot refuses its own App's login at
+  `/auto_review/bots/<n>` once GitHub has named the App to it, which the
+  plan can't know; the fake plays that with `SetOwnAppSlug`. AutoPilot
+  keeps the list as sent, sorted and each once, stores it only when it
+  lists one, and shows it in every `auto_review` (`[]` for none). In the
+  schema it is a set handled as `workflows` is: the default none, so an
+  answer of `[]`, or one without the field, plans nothing against a
+  configuration that leaves it out or sets `[]`; sent sorted and each once
+  only when it lists some, never as `[]`, so an app that lists none still
+  works with an AutoPilot that predates the field. The fake reads it in
+  AutoPilot's sorted order, after `approve_up_to` and before `can_decide`,
+  and keeps a list set from outside a write without the logins that don't
+  read, as AutoPilot reads a stored one.
 - An app's `review_also_reads` lists other repositories, `owner/name`, that
   the reviews of the app's own repositories also read, read-only. Each is
   checked step for step with AutoPilot's own rule (`validRepo`, in the

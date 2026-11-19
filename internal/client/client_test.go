@@ -1016,7 +1016,8 @@ func TestGetApp_WithoutGitHubLogins(t *testing.T) {
 // are sent sorted and each once, and only when there are some: never as []
 // or null, which an AutoPilot that predates them would refuse. The gate is
 // sent only when on, never as false, and own_prs only as pass or review,
-// never as wait or empty, for the same reason.
+// never as wait or empty, for the same reason. The bots are sent as the
+// workflows are.
 func TestUpdateApp_SendsAutoReview(t *testing.T) {
 	var bodies []string
 	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1054,6 +1055,10 @@ func TestUpdateApp_SendsAutoReview(t *testing.T) {
 		{AutoReview: &AutoReviewSetting{On: &AutoReview{
 			Events: []string{"opened", "ready_for_review", "synchronize"}, MaxPerDay: 50, CanDecide: true, Gate: true, OwnPRs: "wait",
 		}}},
+		{AutoReview: &AutoReviewSetting{On: &AutoReview{
+			Events: []string{"opened"}, MaxPerDay: 50, Bots: []string{"renovate[bot]", "Dependabot[bot]", "renovate[bot]"},
+		}}},
+		{AutoReview: &AutoReviewSetting{On: &AutoReview{Events: []string{"opened"}, MaxPerDay: 50, Bots: []string{}}}},
 	} {
 		if _, err := c.UpdateApp(ctx, "billing", spec, 1); err != nil {
 			t.Fatal(err)
@@ -1071,6 +1076,8 @@ func TestUpdateApp_SendsAutoReview(t *testing.T) {
 		`{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,"events":["opened","ready_for_review","synchronize"],"gate":true,"max_per_day":50,"own_prs":"pass"}}`,
 		`{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,"events":["opened","ready_for_review","synchronize"],"gate":true,"max_per_day":50,"own_prs":"review"}}`,
 		`{"auto_review":{"approve_up_to":null,"can_decide":true,"can_decide_own_pr":false,"events":["opened","ready_for_review","synchronize"],"gate":true,"max_per_day":50}}`,
+		`{"auto_review":{"approve_up_to":null,"bots":["Dependabot[bot]","renovate[bot]"],"can_decide":false,"can_decide_own_pr":false,"events":["opened"],"max_per_day":50}}`,
+		`{"auto_review":{"approve_up_to":null,"can_decide":false,"can_decide_own_pr":false,"events":["opened"],"max_per_day":50}}`,
 	}
 	if len(bodies) != len(want) {
 		t.Fatalf("%d bodies sent, want %d", len(bodies), len(want))
@@ -1141,6 +1148,15 @@ func TestAppSpec_AutoReviewReflectedIn(t *testing.T) {
 			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide, a.Gate = true, true })}, true},
 		{set(on(func(a *AutoReview) { a.CanDecide, a.Gate = true, true })),
 			&App{AutoReview: on(func(a *AutoReview) { a.CanDecide, a.Gate, a.OwnPRs = true, true, "wait" })}, true},
+		// The bots are compared as the workflows are: in any order, none
+		// nil or empty, and a change of case alone a change.
+		{set(on(func(a *AutoReview) { a.Bots = []string{"renovate[bot]"} })), &App{AutoReview: on(same)}, false},
+		{set(on(same)), &App{AutoReview: on(func(a *AutoReview) { a.Bots = []string{"renovate[bot]"} })}, false},
+		{set(on(func(a *AutoReview) { a.Bots = []string{"renovate[bot]", "dependabot[bot]"} })),
+			&App{AutoReview: on(func(a *AutoReview) { a.Bots = []string{"dependabot[bot]", "renovate[bot]"} })}, true},
+		{set(on(func(a *AutoReview) { a.Bots = []string{"Renovate[bot]"} })),
+			&App{AutoReview: on(func(a *AutoReview) { a.Bots = []string{"renovate[bot]"} })}, false},
+		{set(on(func(a *AutoReview) { a.Bots = []string{} })), &App{AutoReview: on(same)}, true},
 		{set(nil), &App{AutoReview: on(same)}, false},
 		{set(nil), &App{}, true},
 		{AppSpec{}, &App{AutoReview: on(same)}, true},
@@ -1154,9 +1170,9 @@ func TestAppSpec_AutoReviewReflectedIn(t *testing.T) {
 
 // AutoPilot answers auto_review as null for an app without automatic
 // reviews, and an AutoPilot that predates it answers without it: both read
-// as none. A ceiling of null reads as none, and so do workflows left out, as
-// an AutoPilot that predates them answers; a gate left out reads as off, and
-// own_prs left out as wait.
+// as none. A ceiling of null reads as none, and so do workflows and bots
+// left out, as an AutoPilot that predates them answers; a gate left out
+// reads as off, and own_prs left out as wait.
 func TestGetApp_AutoReview(t *testing.T) {
 	answers := []map[string]any{
 		{"name": "billing", "lock_version": 1},
@@ -1179,7 +1195,8 @@ func TestGetApp_AutoReview(t *testing.T) {
 		}
 		if i == 2 && (a.AutoReview == nil || !slices.Equal(a.AutoReview.Events, []string{"opened", "synchronize"}) ||
 			a.AutoReview.MaxPerDay != 10 || !a.AutoReview.CanDecide || a.AutoReview.CanDecideOwnPR || a.AutoReview.ApproveUpTo != "" ||
-			len(a.AutoReview.Workflows) != 0 || a.AutoReview.Gate || a.AutoReview.OwnPRsOrWait() != OwnPRsWait) {
+			len(a.AutoReview.Workflows) != 0 || a.AutoReview.Gate || a.AutoReview.OwnPRsOrWait() != OwnPRsWait ||
+			len(a.AutoReview.Bots) != 0) {
 			t.Errorf("auto_review = %+v", a.AutoReview)
 		}
 	}
@@ -1225,6 +1242,23 @@ func TestGetApp_AutoReview(t *testing.T) {
 		}
 		if a.AutoReview == nil || a.AutoReview.OwnPRs != own || a.AutoReview.OwnPRsOrWait() != own {
 			t.Errorf("auto_review = %+v, want own_prs %s", a.AutoReview, own)
+		}
+	}
+	// The bots read as answered; an AutoPilot that predates them leaves
+	// them out, which reads as none.
+	for _, bots := range [][]string{{"dependabot[bot]", "renovate[bot]"}, {}} {
+		c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRecord(w, http.StatusOK, map[string]any{"name": "billing", "lock_version": 1, "auto_review": map[string]any{
+				"events": []string{"opened"}, "workflows": []string{}, "max_per_day": 50, "can_decide": false,
+				"can_decide_own_pr": false, "approve_up_to": nil, "gate": false, "own_prs": "wait", "bots": bots,
+			}})
+		}))
+		a, err := c.GetApp(context.Background(), "billing")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.AutoReview == nil || !slices.Equal(a.AutoReview.Bots, bots) {
+			t.Errorf("auto_review = %+v, want bots %v", a.AutoReview, bots)
 		}
 	}
 }

@@ -55,6 +55,12 @@ var (
 	// OIDC token names the workflow a job ran (job_workflow_ref): the
 	// repository, the file straight in .github/workflows, and a branch.
 	workflowRefPattern = regexp.MustCompile(`^([A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100})/(\.github/workflows/[A-Za-z0-9._-]{1,200}\.ya?ml)@refs/heads/([A-Za-z0-9._/-]{1,200})$`)
+	// The most bots an app may list whose pull requests its automatic
+	// reviews take.
+	maxAutoBots = 20
+	// A bot an app's automatic reviews may list, by its login as GitHub
+	// names a pull request's author: an App's slug and [bot].
+	botLoginPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,99}\[bot\]$`)
 	// The most repositories an app's reviews may also read.
 	maxAlsoReads = 5
 	// A repository's owner and name, as GitHub spells them (validRepo).
@@ -295,7 +301,8 @@ func workflowKey(text string) (key string, ok bool) {
 // ceiling (null), and no Workflows (nil or empty) is none. Gate adds a check
 // run of their own that decides, so a ruleset can require it. OwnPRs is how
 // that check treats AutoPilot's own pull requests: wait, pass or review, and
-// empty is wait.
+// empty is wait. Bots are the bots whose pull requests they take, by login;
+// none (nil or empty) is none.
 type AutoReview struct {
 	Events         []string
 	Workflows      []string
@@ -305,6 +312,7 @@ type AutoReview struct {
 	ApproveUpTo    string
 	Gate           bool
 	OwnPRs         string
+	Bots           []string
 }
 
 // ownPRs is how the gate treats AutoPilot's own pull requests, as AutoPilot
@@ -323,6 +331,7 @@ func cloneAutoReview(a *AutoReview) *AutoReview {
 	out := *a
 	out.Events = slices.Clone(a.Events)
 	out.Workflows = slices.Clone(a.Workflows)
+	out.Bots = slices.Clone(a.Bots)
 	return &out
 }
 
@@ -332,8 +341,10 @@ func cloneAutoReview(a *AutoReview) *AutoReview {
 // those it can't read; they are also sorted and kept once each here, as any
 // write AutoPilot takes keeps them); none at all with no event and no
 // workflow; the own pull request's toggle and the gate only with
-// can_decide; and own_prs pass or review only with the gate, and otherwise
-// wait.
+// can_decide; own_prs pass or review only with the gate, and otherwise
+// wait; and the bots' logins it reads (AutoPilot only leaves out those that
+// don't read; they are also sorted and kept once each here, as for the
+// workflows).
 func storedAutoReview(a *AutoReview) *AutoReview {
 	if a == nil {
 		return nil
@@ -357,6 +368,12 @@ func storedAutoReview(a *AutoReview) *AutoReview {
 	out.CanDecideOwnPR = a.CanDecide && a.CanDecideOwnPR
 	out.Gate = a.CanDecide && a.Gate
 	out.OwnPRs = out.ownPRs()
+	out.Bots = []string{}
+	for _, b := range sortedUnique(a.Bots) {
+		if botLoginPattern.MatchString(b) {
+			out.Bots = append(out.Bots, b)
+		}
+	}
 	return out
 }
 
@@ -371,11 +388,12 @@ func sameAutoReview(x, y *AutoReview) bool {
 	}
 	return slices.Equal(x.Events, y.Events) && slices.Equal(x.Workflows, y.Workflows) && x.MaxPerDay == y.MaxPerDay &&
 		x.CanDecide == y.CanDecide && x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo &&
-		x.Gate == y.Gate && x.ownPRs() == y.ownPRs()
+		x.Gate == y.Gate && x.ownPRs() == y.ownPRs() && slices.Equal(x.Bots, y.Bots)
 }
 
 // autoReviewJSON is automatic reviews as AutoPilot shows them: every field,
-// the gate included when off and own_prs when wait, or null for none.
+// the gate included when off, own_prs when wait and the bots when none, or
+// null for none.
 func autoReviewJSON(a *AutoReview) any {
 	if a == nil {
 		return nil
@@ -383,7 +401,7 @@ func autoReviewJSON(a *AutoReview) any {
 	return map[string]any{
 		"events": slices.Clone(a.Events), "workflows": orEmpty(slices.Clone(a.Workflows)), "max_per_day": a.MaxPerDay,
 		"can_decide": a.CanDecide, "can_decide_own_pr": a.CanDecideOwnPR, "approve_up_to": nullable(a.ApproveUpTo),
-		"gate": a.Gate, "own_prs": a.ownPRs(),
+		"gate": a.Gate, "own_prs": a.ownPRs(), "bots": orEmpty(slices.Clone(a.Bots)),
 	}
 }
 
@@ -391,19 +409,22 @@ func autoReviewJSON(a *AutoReview) any {
 // object whose fields are read in sorted order, each left out at its
 // default; the events kept once each, in autoEvents' order, and none only
 // beside a workflow, which needs them sent; the workflows as
-// readAutoWorkflows reads them; can_decide_own_pr and approve_up_to only
-// with can_decide; the gate only with can_decide and every event, or a
-// workflow; and own_prs anything but wait only with the gate, checked in that
-// order before the events.
-func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
+// readAutoWorkflows reads them, and the bots as readAutoBots does, slug
+// being AutoPilot's own App's ("" while it doesn't know it); can_decide_own_pr
+// and approve_up_to only with can_decide; the gate only with can_decide and
+// every event, or a workflow; and own_prs anything but wait only with the
+// gate, checked in that order before the events.
+func readAutoReview(raw json.RawMessage, slug string) (*AutoReview, *refusal) {
 	if string(raw) == "null" {
 		return nil, nil
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
-		return nil, invalid("/auto_review", "is an object with events, workflows, max_per_day, can_decide, can_decide_own_pr, approve_up_to, gate and own_prs, or null")
+		return nil, invalid("/auto_review", "is an object with events, workflows, max_per_day, can_decide, can_decide_own_pr, approve_up_to, gate, own_prs and bots, or null")
 	}
-	out := AutoReview{Events: slices.Clone(defaultAutoEvents), Workflows: []string{}, MaxPerDay: defaultAutoPerDay, OwnPRs: "wait"}
+	out := AutoReview{
+		Events: slices.Clone(defaultAutoEvents), Workflows: []string{}, MaxPerDay: defaultAutoPerDay, OwnPRs: "wait", Bots: []string{},
+	}
 	_, eventsSent := obj["events"]
 	keys := make([]string, 0, len(obj))
 	for k := range obj {
@@ -468,6 +489,10 @@ func readAutoReview(raw json.RawMessage) (*AutoReview, *refusal) {
 				return nil, invalid(at, "is wait, pass or review")
 			}
 			out.OwnPRs = *own
+		case "bots":
+			if out.Bots, ref = readAutoBots(obj[k], slug); ref != nil {
+				return nil, ref
+			}
 		default:
 			if !plainKey.MatchString(k) {
 				at = "/auto_review"
@@ -545,6 +570,48 @@ func readAutoWorkflows(raw json.RawMessage) ([]string, *refusal) {
 	kept := sortedUnique(list)
 	if len(kept) > maxAutoWorkflows {
 		return nil, invalid(at, "lists at most 20 workflows")
+	}
+	return kept, nil
+}
+
+// readAutoBots reads auto_review's bots as AutoPilot does: a list of
+// strings, each refused at its place when it isn't a bot's login, an App's
+// slug and [bot] (botLoginPattern); when it is AutoPilot's own App's, by
+// slug, once the service knows it ("" while it doesn't); or when it names
+// one already listed in another case. Then kept as sent, sorted, each once,
+// and at most maxAutoBots.
+func readAutoBots(raw json.RawMessage, slug string) ([]string, *refusal) {
+	const at = "/auto_review/bots"
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil || items == nil {
+		return nil, invalid(at, "is a list of bot logins")
+	}
+	list := make([]string, 0, len(items))
+	for i, item := range items {
+		var login *string
+		if err := json.Unmarshal(item, &login); err != nil || login == nil {
+			return nil, invalid(at+"/"+itoa(i), "is not a string")
+		}
+		list = append(list, *login)
+	}
+	seen := map[string]string{}
+	for i, login := range list {
+		if !botLoginPattern.MatchString(login) {
+			return nil, invalid(at+"/"+itoa(i),
+				"a bot is its exact login as GitHub names a pull request's author: an App's slug and [bot], such as dependabot[bot]")
+		}
+		key := strings.ToLower(login)
+		if slug != "" && key == strings.ToLower(slug+"[bot]") {
+			return nil, invalid(at+"/"+itoa(i), "is AutoPilot's own App, whose pull requests own_prs decides")
+		}
+		if other, dup := seen[key]; dup && other != login {
+			return nil, invalid(at+"/"+itoa(i), "names a bot already in the list, in another case")
+		}
+		seen[key] = login
+	}
+	kept := sortedUnique(list)
+	if len(kept) > maxAutoBots {
+		return nil, invalid(at, "lists at most 20 bots")
 	}
 	return kept, nil
 }
@@ -859,6 +926,16 @@ func (s *Server) ChangeAppOutOfBand(name string, change func(v *AppView)) {
 	rec.updatedAt = time.Now()
 }
 
+// SetOwnAppSlug plays a copy of AutoPilot that GitHub has named its own
+// App's slug to, so auto_review.bots refuses that App's bot (slug and
+// [bot]). Empty, the default, plays one that doesn't know it yet, which
+// takes it.
+func (s *Server) SetOwnAppSlug(slug string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ownAppSlug = slug
+}
+
 // RemoveApp removes an app, as a delete from outside would.
 func (s *Server) RemoveApp(name string) {
 	s.mu.Lock()
@@ -986,7 +1063,7 @@ type appFields struct {
 // rules whenever it sends github_logins or review_also_reads; a change is
 // held to them here only when it sends both of the two fields, and
 // otherwise against the record.
-func readAppFields(obj map[string]json.RawMessage, creating bool) (appFields, *refusal) {
+func readAppFields(obj map[string]json.RawMessage, creating bool, slug string) (appFields, *refusal) {
 	var f appFields
 	if raw, ok := obj["repos"]; ok {
 		repos, ref := stringList(raw, "/repos")
@@ -1123,7 +1200,7 @@ func readAppFields(obj map[string]json.RawMessage, creating bool) (appFields, *r
 		f.asUserSent = true
 	}
 	if raw, ok := obj["auto_review"]; ok {
-		auto, ref := readAutoReview(raw)
+		auto, ref := readAutoReview(raw, slug)
 		if ref != nil {
 			return f, ref
 		}
@@ -1448,7 +1525,7 @@ func (s *Server) createApp(r *http.Request) (int, map[string]any, *refusal) {
 	// Each GitHub login's developer is one of the app's developers, and what
 	// its reviews also read is of its repositories' owner: a create that
 	// sends no developers, or no repos, has none (readAppFields).
-	f, ref := readAppFields(obj, true)
+	f, ref := readAppFields(obj, true, s.ownAppSlug)
 	if ref != nil {
 		return 0, nil, ref
 	}
@@ -1519,7 +1596,7 @@ func (s *Server) patchApp(r *http.Request) (map[string]any, *refusal) {
 	// pair is checked against the record below. (AutoPilot reads the body
 	// before it finds a change two or more versions behind stale; this fake
 	// finds it stale first.)
-	f, ref := readAppFields(obj, false)
+	f, ref := readAppFields(obj, false, s.ownAppSlug)
 	if ref != nil {
 		return nil, ref
 	}

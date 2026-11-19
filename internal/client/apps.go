@@ -84,9 +84,9 @@ var AutoEvents = []string{"opened", "ready_for_review", "synchronize"}
 // requests into the default branch of the app's repositories on its own,
 // with no label, as the app's own service identity, and a GitHub Actions
 // workflow it lists may ask for one. AutoPilot takes it as one setting: a
-// write sends every field (the workflows only when there are some, the gate
-// only when it is on, and own_prs only when it isn't wait), and a field it
-// leaves out is AutoPilot's default, not what was kept.
+// write sends every field (the workflows and the bots only when there are
+// some, the gate only when it is on, and own_prs only when it isn't wait),
+// and a field it leaves out is AutoPilot's default, not what was kept.
 type AutoReview struct {
 	// Events are the actions that start one: some of AutoEvents. Empty only
 	// with Workflows.
@@ -119,6 +119,11 @@ type AutoReview struct {
 	// requests: OwnPRsWait, OwnPRsPass or OwnPRsReview. Empty when the
 	// AutoPilot predates the field, which is the same as OwnPRsWait.
 	OwnPRs string `json:"own_prs"`
+	// Bots are the bots whose pull requests they take, as a person's, each
+	// by its exact login as GitHub names a pull request's author: an App's
+	// slug and [bot], such as renovate[bot]. Empty (or nil, when the
+	// AutoPilot predates the field) is none.
+	Bots []string `json:"bots"`
 }
 
 // How the gate's check treats AutoPilot's own pull requests: OwnPRsWait, the
@@ -358,13 +363,14 @@ func (s AppSpec) fields() Fields {
 // an accepts entry's flags, the knobs are sent even when off: every
 // AutoPilot that takes auto_review knows those five fields, and the body
 // then says exactly what the plan does, not what AutoPilot's defaults would.
-// The workflows, the gate and own_prs are the exceptions: the workflows sent
-// sorted and each once, and only when there are some, never as [] or null;
-// the gate only when it is on, never as false; and own_prs only when it is
-// pass or review, never as wait. AutoPilot's default for each is none, off
-// or wait, which a write that leaves it out gets, and an AutoPilot that
-// predates one refuses the field, so an app that lists no workflow, has no
-// gate and leaves own_prs at wait still works with it.
+// The workflows, the bots, the gate and own_prs are the exceptions: the
+// workflows and the bots sent sorted and each once, and only when there are
+// some, never as [] or null; the gate only when it is on, never as false;
+// and own_prs only when it is pass or review, never as wait. AutoPilot's
+// default for each is none, off or wait, which a write that leaves it out
+// gets, and an AutoPilot that predates one refuses the field, so an app that
+// lists no workflow and no bot, has no gate and leaves own_prs at wait still
+// works with it.
 func autoReviewBody(a AutoReview) map[string]any {
 	body := map[string]any{
 		"events":            normalizeEvents(a.Events),
@@ -381,6 +387,9 @@ func autoReviewBody(a AutoReview) map[string]any {
 	}
 	if own := a.OwnPRsOrWait(); own != OwnPRsWait {
 		body["own_prs"] = own
+	}
+	if bots := sortedUnique(a.Bots); len(bots) > 0 {
+		body["bots"] = bots
 	}
 	return body
 }
@@ -412,8 +421,8 @@ func normalizeEvents(events []string) []string {
 }
 
 // sameAutoReview reports whether two settings of automatic reviews are the
-// same, nil being none. No workflows, nil or empty, is the same either way,
-// and so is own_prs wait, sent or answered, or left out.
+// same, nil being none. No workflows or bots, nil or empty, is the same
+// either way, and so is own_prs wait, sent or answered, or left out.
 func sameAutoReview(x, y *AutoReview) bool {
 	if x == nil || y == nil {
 		return x == y
@@ -421,7 +430,8 @@ func sameAutoReview(x, y *AutoReview) bool {
 	return slices.Equal(normalizeEvents(x.Events), normalizeEvents(y.Events)) &&
 		slices.Equal(sortedUnique(x.Workflows), sortedUnique(y.Workflows)) && x.MaxPerDay == y.MaxPerDay &&
 		x.CanDecide == y.CanDecide && x.CanDecideOwnPR == y.CanDecideOwnPR && x.ApproveUpTo == y.ApproveUpTo &&
-		x.Gate == y.Gate && x.OwnPRsOrWait() == y.OwnPRsOrWait()
+		x.Gate == y.Gate && x.OwnPRsOrWait() == y.OwnPRsOrWait() &&
+		slices.Equal(sortedUnique(x.Bots), sortedUnique(y.Bots))
 }
 
 // Empty reports whether the spec would send nothing.

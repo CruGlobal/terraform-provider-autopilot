@@ -38,6 +38,11 @@ var (
 	// A work tracker project's identifier, in AutoPilot's own pattern: a
 	// capital letter, then capital letters and digits, at most 10 characters.
 	projectPattern = regexp.MustCompile(`^[A-Z][A-Z0-9]{0,9}$`)
+	// A bot an app's automatic reviews may list, in AutoPilot's own pattern:
+	// its exact login as GitHub names a pull request's author, an App's slug
+	// (a letter or digit, then letters, digits and -, at most 100 in all)
+	// and [bot].
+	botLoginPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,99}\[bot\]$`)
 )
 
 // The most repositories an app's reviews may also read, the most work
@@ -280,7 +285,8 @@ func setOrNull(values []string, prior types.Set) types.Set {
 // noCaseRepeatsValidator refuses a set holding two values that differ only in
 // case. AutoPilot matches repositories without regard to case and keeps them
 // unique that way, so it would keep only one of them and the configuration
-// would differ from it on every plan.
+// would differ from it on every plan. It compares an app's bots the same way,
+// and refuses two that differ only in case.
 type noCaseRepeatsValidator struct{ what string }
 
 func (v noCaseRepeatsValidator) Description(context.Context) string {
