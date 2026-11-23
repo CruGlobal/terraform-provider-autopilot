@@ -79,8 +79,8 @@ var (
 	// name such as sonnet-5-5. Never Haiku, the small model a review uses
 	// for small work. Unset, a review runs on Sonnet.
 	reviewModels = []string{"opus", "sonnet"}
-	// The efforts of that model, as Claude Code takes them. Unset, Claude
-	// Code's own default for the model.
+	// The efforts of that model, as Claude Code takes them. Unset, xhigh
+	// with no model set, otherwise Claude Code's own default for the model.
 	reviewEfforts = []string{"low", "medium", "high", "xhigh", "max"}
 )
 
@@ -705,7 +705,8 @@ type Accept struct {
 // null (the worker's own size), and a zero maxReviewsPerDay is null
 // (AutoPilot's default). approveAsUser and proposeReviewRules are false
 // unless set. An empty reviewModel is null (Sonnet), and an empty
-// reviewEffort null (Claude Code's own default for the model).
+// reviewEffort null (xhigh with no model, otherwise Claude Code's own
+// default for the model).
 type appRecord struct {
 	name                      string
 	repos                     []string

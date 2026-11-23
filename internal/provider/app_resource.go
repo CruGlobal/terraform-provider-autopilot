@@ -547,8 +547,8 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 			"`review_model` and `review_effort` choose the model, and its effort, that AutoPilot's own reviews of " +
 			"the app's repositories run on. They are one choice, and a change to either sends both. `review_model` " +
 			"is a model family, `sonnet` or `opus`, and AutoPilot runs that family's current version, so a new " +
-			"model version needs no Terraform change. Sonnet is the default; Opus, and a higher effort, cost " +
-			"more.\n\n" +
+			"model version needs no Terraform change. Sonnet at `xhigh` effort is the default; Opus, and a higher " +
+			"effort, cost more.\n\n" +
 			"An app with this name that already exists is not taken over, even when its values match: the create " +
 			"fails and says to import it. The one exception is a create whose earlier attempt went unanswered (a " +
 			"gateway's 502, say) before an identical app answered: that attempt may have made the app, and the " +
@@ -1180,8 +1180,10 @@ func (r *appResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 					"more before each answer, so it spends more tokens on each turn, whatever the model: it costs more " +
 					"on Bedrock and uses up a seat's limits faster, `xhigh` and `max` most of all. A review's own limits " +
 					"on cost and time stay the same, so a review that spends more on each turn reaches them sooner and " +
-					"stops there. Left out, the model runs at Claude Code's own default for it, and removing it from " +
-					"the configuration takes the app back to that. It goes with either model: set without " +
+					"stops there. Left out, with `review_model` left out too, reviews run on Sonnet at `xhigh`, " +
+					"AutoPilot's default; left out with a `review_model` set, the model runs at Claude Code's own " +
+					"default for it, `medium`, a lighter review. Removing it from the configuration takes the app back " +
+					"to those defaults. It goes with either model: set without " +
 					"`review_model`, reviews run on Sonnet at this effort. Claude Code may still cap it lower, " +
 					"by a limit the organization sets for the model; a review's footer names the effort asked for. Set " +
 					"together with `review_model`, as one choice: a change to either sends both. It needs an AutoPilot " +
