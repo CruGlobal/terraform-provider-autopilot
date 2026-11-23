@@ -68,8 +68,9 @@ type App struct {
 	// default, Sonnet (or when the AutoPilot predates the field).
 	ReviewModel *string `json:"review_model"`
 	// ReviewEffort is that model's effort, "low", "medium", "high", "xhigh"
-	// or "max", or nil for Claude Code's own default for the model (or when
-	// the AutoPilot predates the field).
+	// or "max", or nil for the default: xhigh when ReviewModel is nil too,
+	// otherwise Claude Code's own default for the model (or when the
+	// AutoPilot predates the field).
 	ReviewEffort *string `json:"review_effort"`
 	LockVersion  int64   `json:"lock_version"`
 	CreatedAt    string  `json:"created_at"`
@@ -232,8 +233,9 @@ type ReviewModel struct {
 	// Model is the family "sonnet" or "opus", or "" for AutoPilot's default
 	// (sent as null).
 	Model string
-	// Effort is "low", "medium", "high", "xhigh" or "max", or "" for Claude
-	// Code's own default for the model (not sent).
+	// Effort is "low", "medium", "high", "xhigh" or "max", or "" for the
+	// default (not sent): xhigh with no Model, otherwise Claude Code's own
+	// default for the model.
 	Effort string
 }
 

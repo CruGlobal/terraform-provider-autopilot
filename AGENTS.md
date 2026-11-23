@@ -299,10 +299,12 @@ the examples, and the generated docs. Things worth knowing:
   AutoPilot's own reviews of the app's repositories (automatic, label,
   command, workflow and MCP; a sender's own `review-pr` tasks name their
   own). `review_model` is a model family, `sonnet` or `opus`, and `null`
-  is Sonnet. AutoPilot runs the family's current version, so a new model
+  is Sonnet, at `xhigh` when `review_effort` is null too. AutoPilot runs the family's current version, so a new model
   version needs no change here. It refuses Haiku and any versioned name,
   such as `sonnet-5-5`. `review_effort` is `low`, `medium`, `high`,
-  `xhigh` or `max`, and `null` is Claude Code's own default for the model.
+  `xhigh` or `max`, and `null` is Claude Code's own default for the model
+  when `review_model` is set, or AutoPilot's default, `xhigh`, when both
+  are null.
   They are one choice, as the credential policy is: AutoPilot sets both
   from a write that sends `review_model` (a `review_effort` left out is
   null) and refuses `review_effort` alone, even as `null`. Unlike
@@ -316,9 +318,10 @@ the examples, and the generated docs. Things worth knowing:
   no default, read back as null when AutoPilot answers `null` or leaves the
   field out, and neither is sent while both are unset, so an older
   AutoPilot still takes an app that leaves them out. The docs say plainly
-  that AutoPilot runs the family's current version, that Sonnet is the
-  default, that Opus uses a seat's limits faster and costs more per token
-  on Bedrock, and that a higher effort costs more on either. The fake
+  that AutoPilot runs the family's current version, that Sonnet at
+  `xhigh` is the default, that Opus uses a seat's limits faster and costs
+  more per token on Bedrock, and that a higher effort costs more on
+  either. The fake
   reads them where AutoPilot's sorted order puts them, `review_effort`
   then `review_model`, after `review_also_reads` and before
   `when_seats_full`, checks the pair after the worker size, and reads a
